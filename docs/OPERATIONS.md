@@ -107,6 +107,22 @@ python -m trading_office.cli reconcile --market crypto --close-orphans
 partial that is smaller than the venue's `amount_to_precision` step is skipped instead of
 rounded up.
 
+### Kill switch (daily loss / loss streak)
+
+Every new entry first asks `guard_state()`: the realised P&L of the current market day
+(against `max_daily_loss_pct`, default 2 %) and the trailing loss streak (against
+`max_consecutive_losses`, default 4). When either is exceeded the engine refuses new
+entries, keeps managing what is open, and writes the reason to the ledger.
+
+```sh
+curl -s localhost:8000/api/engine/kill-switch?market=crypto
+curl -s -X POST localhost:8000/api/engine/resume -H 'content-type: application/json' -d '{"market":"crypto"}'
+```
+
+`/api/engine/resume` (and the **Resume trading** button) records `guard_resumed_day` in
+`state/<market>/runtime.json`, so the override applies to *that day only* — a restart does
+not silently re-arm trading.
+
 ## Configuration recipes
 
 **Change risk per trade** — `config/settings.json`:

@@ -63,6 +63,10 @@ defaults) for a market. `reconcile_state` runs the same startup reconciliation t
 does and returns adopted / restored / closed / untracked / blocked positions plus any
 missing stop order — call it before trusting a position list after a restart.
 
+`GET /api/engine/kill-switch` exposes the circuit breaker (daily loss ≥ `max_daily_loss_pct`
+or N consecutive losses); it is evaluated on every scan, so a blocked engine refuses new
+entries until the next day or a `guard_resumed_day` override.
+
 ## Suggested agent loop
 
 1. `market_overview` — is the tape risk-on or risk-off?

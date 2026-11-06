@@ -72,6 +72,7 @@ class EngineStatus:
     open_positions: int = 0
     reconciled: dict[str, Any] = field(default_factory=dict)
     partials: int = 0
+    guard: dict[str, Any] = field(default_factory=dict)
     # live-only broker feeds; None means "the venue did not tell us", never "empty"
     equity_source: str = "local"
 
@@ -92,6 +93,7 @@ class EngineStatus:
             "open_positions": self.open_positions,
             "reconciled": self.reconciled,
             "partials": self.partials,
+            "guard": self.guard,
             "equity_source": self.equity_source,
         }
 
@@ -153,6 +155,7 @@ class TradingEngine:
         self.cost_cfg = costs.CostConfig.for_market(market, self.profile)
         self.gap_cooldowns: dict[str, int] = {}  # symbol -> cycles of entry block left
         self.reconciled: dict[str, Any] = {}  # last startup_sync() report
+        self._guard_resumed_on: str | None = self.state.get_setting("guard_resumed_day")
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
@@ -338,6 +341,11 @@ class TradingEngine:
         bar_time = payload["bar_time"]
         side = payload["action"].lower()
 
+        guard = self.guard_state()
+        if guard["blocked"]:
+            self._skip(symbol, "kill switch: " + "; ".join(guard["reasons"]))
+            return
+
         # ---- duplicate / cooldown checks (before touching any state)
         with self.lock:
             if symbol in self.positions:
@@ -419,6 +427,63 @@ class TradingEngine:
     def _skip(self, symbol: str, reason: str) -> None:
         self.state.append_ledger({"event": "skip", "market": self.market, "symbol": symbol, "reason": reason})
         self._emit({"event": "skip", "market": self.market, "symbol": symbol, "reason": reason})
+
+    # ------------------------------------------------------------------ kill switch
+    def guard_state(self) -> dict[str, Any]:
+        """Daily-loss / consecutive-loss circuit breaker, evaluated from the ledger."""
+        closed = self.state.closed_trades()[-500:]
+        equity = self.broker.equity()
+        day = dt.datetime.now(ZoneInfo(str(self.profile.get("sessions_timezone", "Asia/Jakarta")))).strftime("%Y-%m-%d")
+        today_pnl = 0.0
+        for trade in closed:
+            closed_at = str(trade.get("closed_at") or trade.get("ts") or "")
+            if closed_at.startswith(day) or (not closed_at and False):
+                today_pnl += float(trade.get("pnl") or 0.0)
+        day_start = equity - today_pnl
+        streak = 0
+        for trade in reversed(closed):
+            if float(trade.get("pnl") or 0.0) < 0:
+                streak += 1
+            else:
+                break
+        max_daily = float(self.settings.get("engine.max_daily_loss_pct", 2.0))
+        max_streak = int(self.settings.get("engine.max_consecutive_losses", 4))
+        daily_loss_pct = (-today_pnl / day_start * 100.0) if day_start > 0 and today_pnl < 0 else 0.0
+        resumed_today = self._guard_resumed_on == day
+        reasons = []
+        if not resumed_today:
+            if daily_loss_pct >= max_daily:
+                reasons.append(f"daily loss {daily_loss_pct:.2f}% >= {max_daily:.2f}%")
+            if streak >= max_streak:
+                reasons.append(f"{streak} consecutive losses >= {max_streak}")
+        self.status.guard = {
+            "blocked": bool(reasons),
+            "reasons": reasons,
+            "day": day,
+            "day_pnl": round(today_pnl, 4),
+            "daily_loss_pct": round(daily_loss_pct, 3),
+            "consecutive_losses": streak,
+            "max_daily_loss_pct": max_daily,
+            "max_consecutive_losses": max_streak,
+            "resumed_on": self._guard_resumed_on,
+        }
+        return self.status.guard
+
+    def resume(self) -> dict[str, Any]:
+        """Manual override after a human looked at the day (recorded in the ledger)."""
+        stamp = dt.datetime.now(dt.timezone.utc).isoformat()
+        day = dt.datetime.now(
+            ZoneInfo(str(self.profile.get("sessions_timezone", "Asia/Jakarta")))
+        ).strftime("%Y-%m-%d")
+        self.state.append_ledger(
+            {"event": "guard_resumed", "market": self.market, "at": stamp, "day": day,
+             "guard": self.status.guard}
+        )
+        self.state.set_setting("guard_resumed_day", day)
+        self._guard_resumed_on = day
+        self.status.guard = self.guard_state()
+        self._emit({"event": "guard_resumed", "market": self.market, "at": stamp})
+        return self.status.guard
 
     # ------------------------------------------------------------------ costs
     def cost_check(self, symbol: str, plan) -> dict[str, Any]:

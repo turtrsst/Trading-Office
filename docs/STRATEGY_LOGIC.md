@@ -99,9 +99,19 @@ defences, all in `trading_office/costs.py`:
 | **Cooldown** | After a rejection the symbol is blocked for `gap_cooldown_bars` cycles | crypto 3, IDX 2 sessions |
 | **Gap through a stop** | If a bar gaps past a resting stop, the exit fills at `stop + f × (open − stop)`, `f = gap_fill_fraction` | 0.5 crypto, 0.75 IDX |
 
-The backtest applies the same table, so a gap loss shows up in the equity curve instead
-of being hidden by an optimistic "filled at the stop" assumption, and
-`metrics()["gap_stops"]` counts them.
+The backtest applies the same table, so a gap loss shows up in the equity curve instead of
+being hidden by an optimistic "filled at the stop" assumption,
+`metrics()["gap_stops"]` counts them and each affected trade carries `gap_risk: true`.
+
+**What this does not fix.** A stop is a request, not a promise. A traded instrument can gap
+through the bracket (an IDX suspension, a weekend headline, a liquidation cascade), and the
+fill then happens at the next available price — the loss can exceed the 1 % equity budget of
+that trade. The gap guard makes this *rarer* (no new entries into a shock, no entries in an
+auction or a macro window, cooldown afterwards) and the fill model makes it *visible*
+(fills are interpolated against the gap instead of pretending the stop held), but no
+stop-loss can guarantee the size of a loss. Position size — not the stop — is what bounds
+the damage, which is why `risk_per_trade_pct` is applied to the equity and never to the
+"distance we hope to get".
 
 ---
 

@@ -119,21 +119,33 @@ def test_gap_through_stop_fills_worse_than_the_stop():
     assert good == 100.0  # the gap went our way: the resting order fills at its price
 
 
-def test_backtest_reports_a_gap_shock(tmp_path):
-    """Inject a crash bar: the stop fills worse than its price and the guard fires."""
+def test_no_entry_fills_on_the_wrong_side_of_its_stop(tmp_path):
+    """A gap must never turn a stop into a guaranteed profit (or an unfillable bracket)."""
     from trading_office.backtest import Backtester
 
-    bars = demo.crypto_bars("BTC/USDT:USDT", "15m", 900)
-    shock = dict(bars[400])
-    shock["open"] = shock["open"] * 0.93
-    shock["low"] = shock["low"] * 0.93
-    shock["close"] = shock["close"] * 0.94
-    shock["high"] = shock["high"] * 0.95
-    bars[400] = shock
     settings = Settings.load()
+    bars = [dict(b) for b in demo.crypto_bars("SOL/USDT:USDT", "15m", 700)]
     bt = Backtester(market="crypto", settings=settings)
-    result = bt.run("BTC/USDT:USDT", bars)
-    assert result.cost_report["model"]["latency_ms"] == 400
+    clean = bt.run("SOL/USDT:USDT", bars, htf_factor=8)
+    assert clean.trades
+
+    # crash the bar right after an entry that the clean run took
+    opened = {str(b["time"]): i for i, b in enumerate(bars)}
+    victim = clean.trades[-1]
+    at = opened[str(victim["opened_at"])]
+    crash = [dict(b) for b in bars]
+    shock = crash[at + 1]
+    for key, mult in (("open", 0.92), ("high", 0.93), ("low", 0.91), ("close", 0.92)):
+        shock[key] = shock[key] * mult
+
+    result = Backtester(market="crypto", settings=settings).run("SOL/USDT:USDT", crash, htf_factor=8)
+    for trade in result.trades:
+        long = trade["side"] == "long"
+        # the fill must be on the correct side of the stop the plan approved
+        assert (trade["entry"] > trade["initial_stop"]) if long else (trade["entry"] < trade["initial_stop"]), trade
+    report = result.metrics()["costs"]
+    assert report["entries_cancelled"] >= 1
+    assert report["model"]["latency_ms"] == 400
     assert result.metrics()["avg_entry_slippage_bps"] is not None
 
 
@@ -376,3 +388,48 @@ def test_engine_does_not_fake_a_stop_move_the_venue_refused(tmp_path, settings):
     events = [e["event"] for e in engine.state.ledger(60)]
     assert "stop_move_failed" in events
     assert any("stop not moved" in err for err in engine.status.last_errors)
+
+
+# --------------------------------------------------------------------------- kill switch
+def _close_trade(engine, pnl: float, when: str) -> None:
+    engine.state.append_ledger(
+        {"event": "trade_closed", "market": "crypto", "symbol": "TEST/USDT:USDT", "side": "long",
+         "entry": 100.0, "exit": 100.0 + pnl, "size": 1.0, "pnl": pnl, "closed_at": when}
+    )
+
+
+def test_kill_switch_blocks_after_the_daily_loss_limit(tmp_path, settings):
+    today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+    engine = TradingEngine(market="crypto", settings=settings, symbols=["TEST/USDT:USDT"],
+                           state_dir=tmp_path / "guard")
+    _close_trade(engine, -30.0, f"{today}T10:00:00+00:00")  # -3 % of a 1000 USDT book
+    guard = engine.guard_state()
+    assert guard["blocked"] is True
+    assert any("daily loss" in r for r in guard["reasons"])
+    assert guard["daily_loss_pct"] >= 2.0
+
+    from tests.test_api import _ready_payload
+
+    engine._handle_entry("TEST/USDT:USDT", _ready_payload(settings))
+    assert "TEST/USDT:USDT" not in engine.positions
+    assert engine.status.orders == 0
+    assert any("kill switch" in (e.get("reason") or "") for e in engine.state.ledger(30))
+
+    # a human override re-opens the day, and it survives a restart (same day only)
+    engine.resume()
+    assert engine.guard_state()["blocked"] is False
+    restarted = TradingEngine(market="crypto", settings=settings, symbols=["TEST/USDT:USDT"],
+                             state_dir=tmp_path / "guard")
+    assert restarted.guard_state()["blocked"] is False
+
+
+def test_kill_switch_counts_consecutive_losses(tmp_path, settings):
+    engine = TradingEngine(market="crypto", settings=settings, symbols=["TEST/USDT:USDT"],
+                           state_dir=tmp_path / "streak")
+    today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+    for _ in range(4):
+        _close_trade(engine, -0.5, f"{today}T11:00:00+00:00")
+    guard = engine.guard_state()
+    assert guard["consecutive_losses"] >= 4
+    assert guard["blocked"] is True
+    assert any("consecutive losses" in r for r in guard["reasons"])

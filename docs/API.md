@@ -130,6 +130,8 @@ With `oos = 0` it returns a single `BacktestResult` (`metrics`, `trades`,
 | `POST /api/engine/close-all` | `{"market":"crypto"}` | flatten everything |
 | `POST /api/engine/reconcile` | `{"market":"crypto","adopt":false,"close_orphans":false}` | compare `state/positions.json` with the exchange (the boot-time `startup_sync()`) |
 | `GET /api/cost-model?market=crypto` | — | the fill model: latency, slippage coefficients/caps, gap thresholds, auction windows, partial-TP defaults |
+| `GET /api/engine/kill-switch?market=crypto` | — | daily-loss and consecutive-loss breaker state (`blocked`, `reasons`, `day_pnl`) |
+| `POST /api/engine/resume` | `{"market":"crypto"}` | human override of the breaker for the current day (ledgered) |
 | `GET /api/ledger?market=crypto&limit=120` | — | raw audit trail |
 
 One cycle returns:

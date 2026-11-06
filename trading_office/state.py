@@ -79,6 +79,10 @@ class StateStore:
     def account_path(self) -> Path:
         return self.root / "account.json"
 
+    @property
+    def settings_path(self) -> Path:
+        return self.root / "runtime.json"
+
     # ------------------------------------------------------------------ bar locks
     @staticmethod
     def key(symbol: str, timeframe: str, bar_time: str) -> str:
@@ -152,6 +156,18 @@ class StateStore:
     def closed_trades(self) -> list[dict[str, Any]]:
         return [e for e in self.ledger(limit=100_000) if e.get("event") == "trade_closed"]
 
+    # ------------------------------------------------------------------ small settings
+    def get_setting(self, key: str) -> Any:
+        """Runtime flags that must survive a restart (kill-switch resume, etc.)."""
+        with self._lock:
+            return _read_json(self.settings_path, {}).get(key)
+
+    def set_setting(self, key: str, value: Any) -> None:
+        with self._lock:
+            data = _read_json(self.settings_path, {})
+            data[key] = value
+            _atomic_write(self.settings_path, data)
+
     # ------------------------------------------------------------------ account
     def account(self) -> dict[str, Any]:
         with self._lock:
@@ -164,7 +180,8 @@ class StateStore:
     # ------------------------------------------------------------------ helpers
     def reset(self, *, keep_ledger: bool = True) -> None:
         with self._lock:
-            for path in (self.signals_path, self.positions_path, self.cooldowns_path, self.account_path):
+            for path in (self.signals_path, self.positions_path, self.cooldowns_path,
+                         self.account_path, self.settings_path):
                 if path.exists():
                     path.unlink()
             if not keep_ledger and self.ledger_path.exists():

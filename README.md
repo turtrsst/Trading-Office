@@ -135,6 +135,10 @@ exchange-side brackets for live crypto orders.
   gapped through fills *worse* than the stop, and that loss shows up in the results.
 - Size shrinks (up to 1.75×) while the book is stressed, and the live engine re-prices
   every entry before sending it — a fill that got expensive is deferred, not paid for.
+- A stop can still be **jumped**: a gap through the bracket fills worse than the stop and
+  can lose more than the 1 % per-trade budget. The guard makes it rarer, the fill model
+  makes it visible in the results (`gap_stops`, `gap_risk` per trade), and position size —
+  not the stop — is what bounds the damage.
 - **Crash-safe**: on startup the engine reconciles `state/positions.json` against
   `exchange.fetch_positions()`, restores (or adopts) what really exists, drops ghosts,
   flags positions without a resting stop, and never re-sells a partial (`partial_done`

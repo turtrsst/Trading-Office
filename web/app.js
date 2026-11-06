@@ -594,6 +594,9 @@
       stat("Partials", st.partials, "50% at 2R, reduce-only", st.partials ? "good" : ""),
       stat("Gap blocks", Object.keys(data.gap_cooldowns || {}).length, "black-swan cooldown",
         Object.keys(data.gap_cooldowns || {}).length ? "warn" : ""),
+      stat("Kill switch", st.guard?.blocked ? "OPEN" : "armed",
+        st.guard?.blocked ? (st.guard.reasons || []).join("; ") : "daily loss / loss streak within limits",
+        st.guard?.blocked ? "bad" : "good"),
     ].join("");
 
     renderReconcile(data.status?.reconciled || {}, data.gap_cooldowns || {});
@@ -763,6 +766,7 @@
     $("#eng-cycle").addEventListener("click", () => engineCall("/api/engine/cycle", { market: state.market }));
     $("#eng-flat").addEventListener("click", () => engineCall("/api/engine/close-all", { market: state.market }));
     $("#eng-sync").addEventListener("click", () => engineCall("/api/engine/reconcile", { market: state.market }));
+    $("#eng-resume").addEventListener("click", () => engineCall("/api/engine/resume", { market: state.market }));
     window.addEventListener("resize", () => {
       if (state.analysis && state.tab === "analysis") renderAnalysis(state.analysis);
       if (state.backtest && state.tab === "backtest") renderBacktest(state.backtest);

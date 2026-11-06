@@ -327,6 +327,16 @@ def create_app() -> FastAPI:
         engine = _engine(req.market)
         return engine.startup_sync(adopt_untracked=req.adopt, close_orphans=req.close_orphans)
 
+    @app.get("/api/engine/kill-switch")
+    def engine_kill_switch(market: Literal["crypto", "idx"] = "crypto") -> dict[str, Any]:
+        engine = _engine(market)
+        return engine.guard_state()
+
+    @app.post("/api/engine/resume")
+    def engine_resume(req: EngineRequest) -> dict[str, Any]:
+        engine = _engine(req.market)
+        return engine.resume()
+
     @app.get("/api/cost-model")
     def cost_model_endpoint(market: Literal["crypto", "idx"] = "crypto") -> dict[str, Any]:
         profile = SETTINGS.profile(market)

@@ -96,6 +96,14 @@ class Action:
 
 
 # --------------------------------------------------------------------------- helpers
+#: a stop that is gapped through cannot fill at its own price; the engine/backtester
+#: fills these worse and widens the loss beyond the 1 % risk budget on purpose
+GAP_STOP_NOTE = (
+    "gap risk: a stop is a request, not a promise — a session gap can fill beyond it and "
+    "lose more than the planned risk"
+)
+
+
 def _stop_reason(pos: Position) -> str:
     """Why this exit is a *win* or a *loss* matters when reading the trade list:
     after the 2R partial the stop sits above entry, so "stop loss hit" would be a lie."""

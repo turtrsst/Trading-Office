@@ -275,6 +275,7 @@ class Backtester:
             if e.get("kind") == "entry" and e.get("latency")
         ]
         gaps = [e for e in self.cost_events if e.get("kind") == "gap_guard"]
+        cancelled = [e for e in self.cost_events if e.get("kind") == "entry_cancelled"]
         partials = [e for e in self.cost_events if e.get("kind") == "partial"]
         return {
             "model": self.cost_cfg.to_dict(),
@@ -287,6 +288,8 @@ class Backtester:
             "latency_ms": self.cost_cfg.latency_ms,
             "gap_guards": len(gaps),
             "gap_examples": gaps[:3],
+            "entries_cancelled": len(cancelled),
+            "cancelled_examples": cancelled[:3],
             "partial_fills": len(partials),
             "partial_pnl": round(sum(float(e.get("pnl", 0.0)) for e in partials), 2),
         }
@@ -366,6 +369,27 @@ class Backtester:
                     side="buy" if plan.side == "long" else "sell",
                 )
                 fill_price = latency.fill_price
+                # black-swan veto: if the fill bar already opened through the planned
+                # stop, the setup is invalid — entering here would mean a long whose
+                # stop sits above the market (a guaranteed "profit" on a gap down).
+                through = (
+                    float(next_bar["open"]) <= plan.stop if plan.side == "long"
+                    else float(next_bar["open"]) >= plan.stop
+                )
+                if through:
+                    self.cost_events.append(
+                        {
+                            "kind": "entry_cancelled", "time": str(bar["time"]),
+                            "reason": "open gapped through the planned stop",
+                            "open": round(float(next_bar["open"]), 8), "stop": round(plan.stop, 8),
+                            "side": plan.side,
+                        }
+                    )
+                    result.rejections["entry_gapped_through_stop"] = (
+                        result.rejections.get("entry_gapped_through_stop", 0) + 1
+                    )
+                    pending = None
+                    continue
                 # dynamic slippage: volatility + size against the book
                 spread = self._spread_bps(pending["bar"], pending.get("tick"))
                 notional = fill_price * plan.size
@@ -532,6 +556,7 @@ class Backtester:
                         "partials": len(position.meta.get("partials", [])),
                         "r_multiple": round((pnl + position.realised_pnl) / (rpu * initial_size), 3),
                         "reason": exit_reason,
+                        "gap_risk": exit_reason == "stop loss (gap through)",
                         "entry_reason": " | ".join(position.meta.get("reasons", [])),
                         "opened_at": position.opened_at,
                         "closed_at": str(bar["time"]),
