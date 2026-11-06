@@ -245,7 +245,7 @@ trading_office/
   backtest/engine.py          bar-by-bar backtester + walk-forward
   cli.py                      terminal
 web/                          the web terminal (no build step, no frameworks)
-tests/                        125 unit + API tests, all offline
+tests/                        151 unit + API tests, all offline
 docs/                         strategy logic, API, MCP, operations
 scripts/make_demo_data.py     writes data/*.json for the backtester
 ```
@@ -290,7 +290,7 @@ trading-office doctor     # shows credential presence + whether state/ is sealed
 
 ```sh
 pip install pytest httpx
-python -m pytest -q           # 125 passed, entirely offline
+python -m pytest -q           # 151 passed, entirely offline
 ```
 
 The suite covers indicator maths, each filter's pass/block path, the no-trigger veto, the
