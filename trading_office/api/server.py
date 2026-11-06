@@ -39,6 +39,7 @@ from pydantic import BaseModel, Field
 
 from .. import costs as cost_model
 from .. import indicators as ind
+from .. import secure_state
 from ..backtest import Backtester, walk_forward
 from ..config import Settings
 from ..engine import TradingEngine
@@ -184,6 +185,25 @@ def create_app() -> FastAPI:
             },
             "data_mode": "live" if (_idx_ok() or _crypto_ok()) else "synthetic",
             "config_path": str(SETTINGS.path),
+            # presence only: never the key itself, never a prefix of it
+            "secrets": _secrets_report(),
+            "state_encryption": secure_state.status(),
+        }
+
+    @app.get("/api/security")
+    def security() -> dict[str, Any]:
+        """What is protected and what is not. Deliberately boring: presence, never values."""
+        from .. import env as env_module
+
+        return {
+            "env": env_module.load_env(),
+            "credentials": _secrets_report(),
+            "state_encryption": secure_state.status(),
+            "ignored": [
+                {"prefix": p, "reason": "MetaTrader 5 is not a supported venue here "
+                                        "(Windows-only, no execution path)"}
+                for p in env_module.UNSUPPORTED_PREFIXES
+            ],
         }
 
     @app.get("/api/config")
@@ -547,6 +567,19 @@ def _backtest_data(market: str, symbol: str, bars: int) -> dict[str, Any]:
 
 def _idx_ok() -> bool:
     return IDX.available()
+
+
+def _secrets_report() -> dict[str, Any]:
+    """Presence/length/fingerprint of the credentials the config points at."""
+    from ..env import credential_status
+
+    names = (
+        str(SETTINGS.get("execution.api_key_env", "TO_API_KEY")),
+        str(SETTINGS.get("execution.api_secret_env", "TO_API_SECRET")),
+    )
+    report = credential_status(*names)
+    report["_note"] = "set/via/length/fingerprint only — secrets are never returned"
+    return report
 
 
 def _crypto_ok() -> bool:

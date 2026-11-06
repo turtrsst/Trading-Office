@@ -162,6 +162,11 @@ class Settings:
     # ------------------------------------------------------------------ loading
     @classmethod
     def load(cls, path: str | os.PathLike[str] | None = None) -> "Settings":
+        # .env first: every entry point (serve, engine, backtest, mcp) goes through here,
+        # so one load covers the whole process. Explicit environment variables win.
+        from . import env as _env
+
+        _env.load_env()
         target = Path(path) if path else Path(os.environ.get("TO_CONFIG", DEFAULT_CONFIG_PATH))
         raw = copy.deepcopy(DEFAULTS)
         if target.exists():

@@ -16,3 +16,10 @@ data/*.json
 .DS_Store
 .idea/
 .vscode/
+
+# secrets — never commit a real .env (the template .env.example stays tracked)
+.env
+.env.*
+!.env.example
+*.pem
+*.key

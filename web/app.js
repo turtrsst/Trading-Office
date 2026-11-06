@@ -132,10 +132,35 @@
         ? "Live provider reachable"
         : "Live providers unreachable in this environment — candles and quotes are deterministic synthetic data, labelled on every row.";
       renderProviders(health);
+      renderSecurity(health);
     } catch (err) {
       const pill = $("#source-pill");
       pill.className = "pill down";
       $("#source-text").textContent = "API offline";
+    }
+  }
+
+  function renderSecurity(health) {
+    const badge = $("#state-badge");
+    const text = $("#state-text");
+    if (!badge || !text) return;
+    const sealing = health.state_encryption || {};
+    const keys = Object.values(health.secrets || {})
+      .filter((entry) => entry && typeof entry === "object" && "set" in entry);
+    const loaded = keys.filter((entry) => entry.set).length;
+    if (sealing.encrypted) {
+      badge.className = "health-badge is-live";
+      text.textContent = `encrypted · ${loaded} key(s) loaded`;
+      badge.title = `${sealing.algorithm} via ${sealing.source}. State files are unreadable without the key.`;
+    } else if (sealing.error) {
+      badge.className = "health-badge is-err";
+      text.textContent = "encryption key invalid";
+      badge.title = sealing.error;
+    } else {
+      badge.className = "health-badge is-quiet";
+      text.textContent = loaded ? `${loaded} key(s) loaded` : "plaintext · no API keys";
+      badge.title = "Set TO_STATE_ENCRYPTION_KEY to encrypt state/ at rest; "
+        + "TO_API_KEY / TO_API_SECRET (or CCXT_API_KEY / CCXT_SECRET_KEY) for live execution.";
     }
   }
 
@@ -609,6 +634,8 @@
     cap: 30000,          // 30 s
     timer: null,
     last: null,          // last frame, so a tab switch can repaint without waiting
+    lastAt: 0,           // wall clock of that frame (watchdog compares it)
+    watchdog: null,
     healthy: false,
   };
 
@@ -617,11 +644,53 @@
     return `${proto}//${window.location.host}/api/ws/metrics?market=${encodeURIComponent(state.market)}`;
   }
 
+  // backend states we can prove from frames, not states we hope for
+  const HEALTH = {
+    live: { text: "Healthy", tone: "is-live" },
+    warn: { text: "Reconnecting", tone: "is-warn" },
+    err: { text: "Offline", tone: "is-err" },
+  };
+
+  function setHealth(state, meta) {
+    const badge = $("#server-health");
+    const text = $("#health-text");
+    const metaEl = $("#health-meta");
+    const definition = HEALTH[state];
+    if (!definition) return;
+    if (badge) {
+      badge.classList.remove("is-live", "is-warn", "is-err", "is-quiet");
+      badge.classList.add(definition.tone);
+    }
+    if (text) text.textContent = definition.text;
+    if (metaEl) metaEl.textContent = meta || "";
+    // keep the KPI-sidebar indicator in step: two places, one source of truth
+    const label = $("#ws-status-indicator");
+    const dot = $("#ws-dot");
+    if (label) label.textContent = state === "live" ? "live · websocket" : definition.text.toLowerCase();
+    if (dot) dot.className = "dot " + (state === "live" ? "live" : state === "warn" ? "warn" : "off");
+  }
+
   function setWsStatus(text, tone) {
     const label = $("#ws-status-indicator");
     const dot = $("#ws-dot");
     if (label) label.textContent = text;
     if (dot) dot.className = "dot" + (tone ? " " + tone : "");
+    // a bare tone from the socket layer still has to move the header badge
+    if (tone === "live") setHealth("live", "");
+    else if (tone === "off") setHealth("err", "");
+    else if (tone === "warn" && !WS.healthy) setHealth("warn", "");
+  }
+
+  // a socket that is open but has stopped pushing frames is not healthy: the server can
+  // be alive while its engine thread is wedged, and the badge must not lie about that
+  function watchFrameAge() {
+    clearInterval(WS.watchdog);
+    WS.watchdog = setInterval(() => {
+      if (!WS.healthy || !WS.last || WS.last.transport === "http") return;
+      const age = (Date.now() - WS.lastAt) / 1000;
+      if (age > 5) setHealth("warn", `no frame ${age.toFixed(0)}s`);
+      else setHealth("live", `${age.toFixed(1)}s ago`);
+    }, 1000);
   }
 
   function connectMetricsSocket() {
@@ -641,13 +710,21 @@
       WS.attempts = 0;
       WS.healthy = true;
       setWsStatus("live · websocket", "live");
+      // open is not the same as healthy: wait for the first frame before claiming it
+      setHealth("warn", "waiting for first frame");
+      watchFrameAge();
     };
     sock.onmessage = (event) => {
       let frame;
       try { frame = JSON.parse(event.data); } catch (err) { return; }
-      if (frame.type === "stale") { setWsStatus("stale connection, reconnecting…", "warn"); return; }
+      if (frame.type === "stale") {
+        setWsStatus("stale connection, reconnecting…", "warn");
+        setHealth("warn", "stale frames");
+        return;
+      }
       if (frame.type !== "metrics") return;
       WS.last = frame;
+      WS.lastAt = Date.now();
       renderMetrics(frame);
       // answer the server ping so it knows this tab is alive
       if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ type: "pong", seq: frame.seq }));
@@ -655,12 +732,15 @@
     };
     sock.onclose = (event) => {
       WS.healthy = false;
+      clearInterval(WS.watchdog);
       // a clean close after a market switch is not a failure: just reconnect
       scheduleReconnect(`closed (${event.code || "?"})`);
     };
     sock.onerror = () => {
       WS.healthy = false;
+      clearInterval(WS.watchdog);
       setWsStatus("socket error", "off");
+      setHealth("err", "socket error");
       try { sock.close(); } catch (err) { /* onclose handles the retry */ }
     };
   }
@@ -671,14 +751,19 @@
     const jitter = Math.random() * 400;                 // desync many tabs
     const delay = Math.round(backoff + jitter);
     setWsStatus(`offline · retrying in ${(delay / 1000).toFixed(1)}s`, "warn");
+    setHealth("warn", `retry ${WS.attempts} in ${(delay / 1000).toFixed(1)}s`);
     if (reason) console.warn("[metrics ws]", reason);
     clearTimeout(WS.timer);
     WS.timer = setTimeout(connectMetricsSocket, delay);
     // while the socket is down, keep the cards honest with a single HTTP snapshot
     api(`/api/metrics?market=${state.market}`).then((frame) => {
       WS.last = { ...frame, type: "metrics", transport: "http" };
+      WS.lastAt = Date.now();
       renderMetrics(WS.last);
-    }).catch(() => {});
+      // HTTP answered while the socket is down: the server is up, the stream is not.
+      // That is a real state and the badge says so instead of pretending to be healthy.
+      setHealth("warn", "http fallback");
+    }).catch(() => setHealth("err", "http unreachable"));
   }
 
   function closeMetricsSocket() {

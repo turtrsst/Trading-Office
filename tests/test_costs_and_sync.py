@@ -668,3 +668,101 @@ def test_execution_gate_is_explicit_about_simulation(tmp_path, settings):
                         state_dir=tmp_path / "g2", execute=False)
     assert dry.execution_gate()["simulated"] is True
     assert "dry-run" in dry.execution_gate()["note"]
+
+
+# --------------------------------------------------------------------------- secrets & state at rest
+def test_env_loader_resolves_aliases_without_leaking_values(tmp_path, monkeypatch):
+    from trading_office import env as env_module
+
+    env_file = tmp_path / "custom.env"
+    env_file.write_text(
+        "CCXT_API_KEY=alias-key-value\nCCXT_SECRET_KEY=alias-secret\nMT5_PASSWORD=nope\n",
+        encoding="utf-8",
+    )
+    for name in ("TO_API_KEY", "CCXT_API_KEY", "TO_API_SECRET", "CCXT_SECRET_KEY", "MT5_PASSWORD"):
+        monkeypatch.delenv(name, raising=False)
+
+    report = env_module.load_env(env_file)
+    assert report["found"] is True and report["loaded"] == 3
+    assert "MT5_PASSWORD" in report["unsupported"]  # flagged, not silently accepted
+    # the alias is what the broker will actually use
+    assert env_module.credential("TO_API_KEY") == "alias-key-value"
+    status = env_module.credential_status("TO_API_KEY")
+    assert status["TO_API_KEY"]["set"] is True
+    assert status["TO_API_KEY"]["via"] == "CCXT_API_KEY"
+    assert "alias-key-value" not in str(status)  # never echoed back
+    assert len(status["TO_API_KEY"]["fingerprint"]) == 8
+
+
+def test_unset_credentials_keep_execution_safe(tmp_path, monkeypatch):
+    from trading_office.execution.broker import make_broker
+
+    for name in ("TO_API_KEY", "CCXT_API_KEY", "TO_API_SECRET", "CCXT_SECRET_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    config = {"execution": {"paper": False, "dry_run": False, "api_key_env": "TO_API_KEY",
+                            "api_secret_env": "TO_API_SECRET"}}
+    # live requested without a key: loud failure that names the variables, never a silent
+    # downgrade to paper (a silent downgrade looks like a live bot that never trades)
+    with pytest.raises(RuntimeError) as err:
+        make_broker(config, "crypto", 1000.0, {})
+    assert "TO_API_KEY" in str(err.value) and "TO_API_SECRET" in str(err.value)
+
+    # and the same config resolves once the aliases are present
+    monkeypatch.setenv("CCXT_API_KEY", "k")
+    monkeypatch.setenv("CCXT_SECRET_KEY", "s")
+    from trading_office.env import credential
+
+    assert credential(config["execution"]["api_key_env"]) == "k"
+    assert credential(config["execution"]["api_secret_env"]) == "s"
+
+
+def test_encrypted_state_roundtrip_and_wrong_key_is_fatal(tmp_path, monkeypatch):
+    from cryptography.fernet import Fernet
+
+    from trading_office import secure_state
+    from trading_office.state import StateStore
+
+    monkeypatch.setenv("TO_STATE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    monkeypatch.delenv("TO_STATE_PASSPHRASE", raising=False)
+    secure_state._key._cache = None
+    store = StateStore(tmp_path / "enc")
+    store.lock("BBCA", "1d", "2026-11-06", {"decision": "long"})
+    store.save_position("BBCA", {"symbol": "BBCA", "entry": 9000.0, "size": 100})
+    store.append_ledger({"event": "trade_closed", "symbol": "BBCA", "pnl": 12000})
+
+    raw = store.signals_path.read_bytes()
+    assert secure_state.looks_encrypted(raw) is True
+    assert b'"decision"' not in raw  # the bar lock is not readable on disk
+    assert store.is_locked("BBCA", "1d", "2026-11-06") is True
+    assert store.positions()["BBCA"]["entry"] == 9000.0
+    assert store.ledger(5)[0]["event"] == "trade_closed"
+
+    # a wrong key must raise, never "return an empty book"
+    monkeypatch.setenv("TO_STATE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    secure_state._key._cache = None
+    with pytest.raises(secure_state.StateLocked):
+        store.positions()
+    secure_state._key._cache = None
+
+
+def test_plaintext_state_keeps_working_when_encryption_is_enabled(tmp_path, monkeypatch):
+    from cryptography.fernet import Fernet
+
+    from trading_office import secure_state
+    from trading_office.state import StateStore
+
+    monkeypatch.setenv("TO_STATE_ENCRYPTION_KEY", "")
+    monkeypatch.delenv("TO_STATE_PASSPHRASE", raising=False)
+    secure_state._key._cache = None
+    store = StateStore(tmp_path / "plain")
+    store.save_position("TLKM", {"symbol": "TLKM", "entry": 3200.0, "size": 10})
+    assert not secure_state.looks_encrypted(store.positions_path.read_bytes())
+
+    # switch encryption on: yesterday's plaintext must still load, then be re-sealed
+    monkeypatch.setenv("TO_STATE_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    secure_state._key._cache = None
+    assert store.positions()["TLKM"]["entry"] == 3200.0
+    store.save_position("TLKM", {"symbol": "TLKM", "entry": 3250.0, "size": 10})
+    assert secure_state.looks_encrypted(store.positions_path.read_bytes()) is True
+    assert store.positions()["TLKM"]["entry"] == 3250.0
+    secure_state._key._cache = None

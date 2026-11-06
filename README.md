@@ -177,7 +177,9 @@ exchange-side brackets for live crypto orders.
   second** over a websocket (`/api/ws/metrics`, exponential-backoff reconnect with HTTP
   fallback) in a KPI sidebar (win rate, profit factor, trade count) next to the charts, an
   **active-trades / open-orders table with per-row CLOSE and CANCEL** (inline confirm
-  dialog + toast stack, no `alert()`), audit ledger, and a CLI/MCP reference tab.
+  dialog + toast stack, no `alert()`), a **server-health badge** driven by the websocket
+  lifecycle (Healthy / Reconnecting / Offline, with a 5 s frame watchdog), audit ledger,
+  and a CLI/MCP reference tab.
   Charting is the repo's own canvas module — no CDN, works offline and behind the preview
   proxy.
 - **CLI** — `screen`, `analyse`, `bandar`, `broker`, `foreign`, `ownership`, `actions`,
@@ -243,16 +245,32 @@ trading_office/
   backtest/engine.py          bar-by-bar backtester + walk-forward
   cli.py                      terminal
 web/                          the web terminal (no build step, no frameworks)
-tests/                        97 unit + API tests, all offline
+tests/                        103 unit + API tests, all offline
 docs/                         strategy logic, API, MCP, operations
 scripts/make_demo_data.py     writes data/*.json for the backtester
 ```
+
+## Secrets & state at rest
+
+```bash
+cp .env.example .env      # git-ignored; real env vars win over the file
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# .env: TO_STATE_ENCRYPTION_KEY=…   (or TO_STATE_PASSPHRASE=…)
+trading-office doctor     # shows credential presence + whether state/ is sealed
+```
+
+* `TO_API_KEY` / `TO_API_SECRET` (aliases `CCXT_API_KEY` / `CCXT_SECRET_KEY`) enable live
+  ccxt orders — and only together with `execution.paper=false` + `dry_run=false`.
+* Missing keys raise instead of silently falling back to paper; a wrong state key raises
+  `StateLocked` instead of pretending the book is empty.
+* `MT5_*` variables are reported as **ignored**: MetaTrader 5 is not a supported venue.
+* `GET /api/security` returns presence, source and an 8-char fingerprint — never a secret.
 
 ## Tests
 
 ```sh
 pip install pytest httpx
-python -m pytest -q           # 97 passed, entirely offline
+python -m pytest -q           # 103 passed, entirely offline
 ```
 
 The suite covers indicator maths, each filter's pass/block path, the no-trigger veto, the

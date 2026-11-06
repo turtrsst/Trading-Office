@@ -26,11 +26,14 @@ from typing import Any, Iterable
 
 
 def _atomic_write(path: Path, payload: Any) -> None:
+    """Write JSON atomically, encrypting at rest when a key is configured."""
+    from . import secure_state
+
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2, ensure_ascii=False, default=str)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(secure_state.dump_json(payload))
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
@@ -38,13 +41,17 @@ def _atomic_write(path: Path, payload: Any) -> None:
 
 
 def _read_json(path: Path, default: Any) -> Any:
+    from . import secure_state
+
     if not path.exists():
         return default
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except (json.JSONDecodeError, OSError):
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError:
         return default
+    # StateLocked propagates on purpose: a wrong key must stop the bot, never look empty.
+    return secure_state.load_json(raw, default)
 
 
 @dataclass
@@ -188,15 +195,22 @@ class StateStore:
     # ------------------------------------------------------------------ ledger
     def append_ledger(self, event: dict[str, Any]) -> None:
         with self._lock:
+            from . import secure_state
+
             event = {"ts": dt.datetime.now(dt.timezone.utc).isoformat(), **event}
             self.root.mkdir(parents=True, exist_ok=True)
-            with open(self.ledger_path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+            with open(self.ledger_path, "ab") as fh:
+                fh.write(secure_state.encrypt_bytes(
+                    (json.dumps(event, ensure_ascii=False, default=str) + "\n").encode("utf-8")
+                ))
 
     def ledger(self, limit: int = 200) -> list[dict[str, Any]]:
+        from . import secure_state
+
         if not self.ledger_path.exists():
             return []
-        lines = self.ledger_path.read_text(encoding="utf-8").splitlines()
+        raw = secure_state.decrypt_bytes(self.ledger_path.read_bytes())
+        lines = raw.decode("utf-8", errors="replace").splitlines()
         out = []
         for line in lines[-limit:]:
             try:

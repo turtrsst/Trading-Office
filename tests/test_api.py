@@ -298,3 +298,25 @@ def test_cancel_order_endpoint_is_honest_on_paper(client):
     body = client.post("/api/order/cancel", json={"market": "crypto", "order_id": "abc"}).json()
     assert body["ok"] is False
     assert "paper" in body["reason"]
+
+
+def test_security_endpoint_reports_presence_not_secrets(client, monkeypatch):
+    from trading_office import env as env_module
+
+    for name in ("TO_API_KEY", "CCXT_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CCXT_API_KEY", "super-secret-value")
+
+    body = client.get("/api/security").json()
+    assert body["credentials"]["TO_API_KEY"]["set"] is True
+    assert body["credentials"]["TO_API_KEY"]["via"] == "CCXT_API_KEY"
+    assert "super-secret-value" not in str(body)
+    assert body["state_encryption"]["encrypted"] in (True, False)
+    ignored = {row["prefix"] for row in body["ignored"]}
+    assert "MT5_" in ignored
+
+
+def test_health_reports_encryption_and_secret_presence(client):
+    body = client.get("/api/health").json()
+    assert "secrets" in body and "state_encryption" in body
+    assert "set" in body["secrets"]["TO_API_KEY"]

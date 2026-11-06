@@ -626,8 +626,12 @@ def make_broker(config: dict[str, Any], market: str, equity: float, profile: dic
     exec_cfg = config.get("execution", {})
     live = not bool(exec_cfg.get("paper", True)) and not bool(exec_cfg.get("dry_run", True))
     if market == "crypto" and live:
-        api_key = os.environ.get(str(exec_cfg.get("api_key_env", "TO_API_KEY")), "")
-        api_secret = os.environ.get(str(exec_cfg.get("api_secret_env", "TO_API_SECRET")), "")
+        # resolved through trading_office.env so aliases (CCXT_API_KEY, …) work and the
+        # lookup happens in exactly one place
+        from ..env import credential
+
+        api_key = credential(exec_cfg.get("api_key_env", "TO_API_KEY"))
+        api_secret = credential(exec_cfg.get("api_secret_env", "TO_API_SECRET"))
         if not api_key or not api_secret:
             raise RuntimeError(
                 "live trading requested but TO_API_KEY / TO_API_SECRET are not set; "

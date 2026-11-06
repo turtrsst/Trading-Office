@@ -152,6 +152,7 @@ With `oos = 0` it returns a single `BacktestResult` (`metrics`, `trades`,
 | `GET /api/cost-model?market=crypto` | — | the fill model: latency, slippage coefficients/caps, gap thresholds, auction windows, partial-TP defaults |
 | `GET /api/metrics?market=crypto&limit=200` | — | `status`, parallel `timestamps`/`equity`/`drawdown`, `series[{ts,equity,peak,drawdown_pct}]`, `performance`, `kpi{win_rate, profit_factor, total_trades, max_drawdown_pct, net_profit_pct, equity}` |
 | `WS /api/ws/metrics?market=crypto` | — | the same JSON as `/api/metrics` pushed once per second with `{type:"metrics", seq}`; the client answers `{"type":"pong"}` and is dropped after 3 unanswered cycles |
+| `GET /api/security` | — | `.env` status, credential presence (`set/via/length/fingerprint`, never the value), state encryption mode, and the variable prefixes that are deliberately ignored |
 | `POST /api/trade/close` | `{"market":"crypto","symbol":"BTC/USDT:USDT"}` | close **one** position; refuses symbols the engine does not hold (`{ok, closed, orders_cancelled, gate}`) |
 | `POST /api/order/cancel` | `{"market":"crypto","order_id":"…","symbol":"…"}` | cancel one resting order (`{ok, reason}`); the paper broker has none, so it answers honestly |
 | `GET /api/performance?market=crypto` | — | profit factor, max drawdown, win rate, net profit % of the live/paper book |

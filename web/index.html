@@ -233,6 +233,27 @@
         </div>
       </div>
 
+      <div class="terminal-header">
+        <div class="th-title">
+          <h2>Trading Office</h2>
+          <span class="muted small">Multi-gateway algorithmic terminal · IDX &amp; crypto perpetuals</span>
+        </div>
+        <div class="th-badges">
+          <div class="health-badge is-warn" id="server-health"
+               title="Driven by the metrics websocket lifecycle: open, error, close, and stale frames">
+            <span class="dot" id="health-dot"></span>
+            <span class="hb-k">Server</span>
+            <b id="health-text">Connecting…</b>
+            <span class="hb-meta" id="health-meta"></span>
+          </div>
+          <div class="health-badge is-quiet" id="state-badge"
+               title="Whether the state directory is encrypted at rest (TO_STATE_ENCRYPTION_KEY)">
+            <span class="hb-k">State</span>
+            <b id="state-text">checking…</b>
+          </div>
+        </div>
+      </div>
+
       <div class="stat-strip" id="eng-stats"></div>
 
       <div class="stat-strip" id="eng-perf"></div>

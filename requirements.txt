@@ -7,6 +7,10 @@ pydantic>=2.5
 ccxt>=4.2            # crypto perpetual futures (public reads + live execution)
 # pandas is optional: pandas users can call trading_office.indicators on DataFrames
 
+# Secrets & state at rest (both optional, both degrade to a plaintext fallback)
+python-dotenv>=1.0    # .env support; the loader also has a built-in parser
+cryptography>=42      # Fernet encryption for state/ when TO_STATE_ENCRYPTION_KEY is set
+
 # Agent surface
 mcp>=2.3             # MCP server (stdio + streamable HTTP)
 

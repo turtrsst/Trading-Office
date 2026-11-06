@@ -39,7 +39,26 @@ python -m trading_office.cli doctor
 | one cycle, for cron | `python -m trading_office.engine --market idx --cycles 1` |
 | backtest | `python -m trading_office.cli backtest --market idx --symbol BBCA --oos 0.35` |
 
-Health probe: `GET /api/health` (returns `ok`, provider availability and execution mode).
+Health probe: `GET /api/health` (returns `ok`, provider availability, execution mode,
+credential *presence* and the state-encryption mode).
+
+## Server health badge (web terminal)
+
+The Live Engine tab carries a header badge driven by the metrics websocket lifecycle. Four
+states, and each one is something the browser can actually prove:
+
+| Badge | When | What it means |
+| --- | --- | --- |
+| **Healthy** (green) | a `type:"metrics"` frame arrived in the last 5 s | the stream and the process are both alive |
+| **Reconnecting** (amber, pulsing) | socket opening, closed, stale, or no frame for > 5 s | the page is alive but it is working from a stale/HTTP snapshot |
+| **Offline** (red) | socket error, or the HTTP fallback also failed | nothing is reachable |
+| **State** badge | `/api/health` | `plaintext` or `encrypted · N key(s) loaded` |
+
+`onopen` alone is **not** healthy: a socket can be open while the engine thread is wedged,
+so the badge waits for a real frame and a 1 Hz watchdog downgrades it after 5 silent
+seconds. While the socket is down the page polls `/api/metrics` over HTTP and the badge
+reads `Reconnecting · http fallback` — the server being up and the *stream* being down are
+two different facts and the badge does not merge them.
 
 ## Execution modes
 
@@ -214,6 +233,42 @@ Adjust the model per market in `profiles.<market>.execution_costs` (`latency_ms`
 `slippage_base_bps`, `atr_mult` = k_slip, `impact_coeff`, `max_slippage_bps`,
 `shock_atr_mult`, `shock_slippage_mult`, `gap_reject_atr`, `gap_reject_spread_mult`,
 `gap_fill_fraction`, `gap_cooldown_bars`, `max_risk_multiplier`, `auction_windows`).
+
+## Secrets: `.env`, credentials, and state at rest
+
+Three secrets matter and each has exactly one home:
+
+| Secret | Variable | What it unlocks |
+| --- | --- | --- |
+| Exchange API key | `TO_API_KEY` (alias `CCXT_API_KEY`) | live ccxt orders, only when `execution.paper=false` **and** `execution.dry_run=false` |
+| Exchange API secret | `TO_API_SECRET` (alias `CCXT_SECRET_KEY`) | same |
+| State encryption key | `TO_STATE_ENCRYPTION_KEY` (or `TO_STATE_PASSPHRASE`) | encrypts `state/` at rest |
+
+```bash
+cp .env.example .env      # .env is git-ignored, .env.example is tracked
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# put the result in .env as TO_STATE_ENCRYPTION_KEY=…
+trading-office doctor     # shows presence, source and whether state is sealed
+```
+
+Details that are easy to get wrong:
+
+* **Real environment variables win over `.env`.** A systemd unit or `docker run -e` can
+  override the file without touching it.
+* **Missing credentials do not silently downgrade.** If `settings.json` asks for live
+  trading and no key resolves, `make_broker` raises and names the variables. A quiet
+  fallback to paper is worse than a crash: it looks like a live bot that never trades.
+* **`MT5_*` / `METAQUOTES_*` are ignored and reported as ignored.** MetaTrader 5 is
+  Windows-only and there is no MT5 execution path in this codebase; accepting the
+  variable would imply a venue that cannot exist here.
+* **A wrong encryption key stops the bot.** `StateLocked` is raised, not swallowed. The
+  dangerous alternative — treating an undecryptable `positions.json` as "no positions" —
+  would re-enter symbols already owned and re-fire bar locks it "forgot".
+* **Turning encryption on later is safe.** Files are detected by content (Fernet tokens,
+  not an extension), so a plaintext state directory keeps loading and is re-encrypted as
+  it is rewritten. Ledger lines are appended encrypted once a key is present.
+* `GET /api/security` and `doctor` report `set` / `via` / `length` / an 8-character
+  fingerprint. No endpoint returns a secret or a prefix of it.
 
 ## Manual controls (CLOSE / CANCEL)
 

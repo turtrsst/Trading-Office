@@ -334,10 +334,16 @@ def cmd_crypto(args: argparse.Namespace, settings: Settings) -> int:
     return cmd_screen(args, settings)
 
 
+DEFAULT_SYMBOL = {"crypto": "BTC/USDT:USDT", "idx": "BBCA"}
+
+
 def cmd_backtest(args: argparse.Namespace, settings: Settings) -> int:
     from .backtest import walk_forward
     from .api.server import _backtest_data
 
+    # `--market idx` used to keep the crypto default and quietly report "0 trades" on a
+    # symbol IDX does not have; resolve the symbol from the market instead.
+    args.symbol = args.symbol or DEFAULT_SYMBOL.get(args.market, "BBCA")
     data = _backtest_data(args.market, args.symbol, args.bars)
     bars = data["bars"][-args.bars :]
     report = walk_forward(
@@ -413,6 +419,30 @@ def cmd_backtest(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def _security_checks(settings: Settings) -> list[tuple[str, bool, str]]:
+    """Credential + at-rest encryption rows for `doctor` (presence only, never values)."""
+    from . import secure_state
+    from .env import credential_status, load_env
+
+    env_file = load_env()
+    key_name = str(settings.get("execution.api_key_env", "TO_API_KEY"))
+    secret_name = str(settings.get("execution.api_secret_env", "TO_API_SECRET"))
+    creds = credential_status(key_name, secret_name)
+    have = sum(1 for entry in creds.values() if entry["set"])
+    via = ", ".join(f"{k} via {v['via']}" for k, v in creds.items() if v["set"]) or "none"
+    sealing = secure_state.status()
+    return [
+        (".env", env_file["found"],
+         f"{env_file['file']} · {env_file['loaded']} key(s)" if env_file["found"]
+         else "not found — copy .env.example to .env (variables also work without it)"),
+        ("credentials", have == len(creds),
+         f"{have}/{len(creds)} loaded ({via}); live execution stays off until both exist"),
+        ("state at rest", bool(sealing.get("encrypted")),
+         f"{sealing.get('algorithm')} via {sealing.get('source')}" if sealing.get("encrypted")
+         else "plaintext state/ — set TO_STATE_ENCRYPTION_KEY to seal it"),
+    ]
+
+
 def cmd_doctor(args: argparse.Namespace, settings: Settings) -> int:
     from .market import CryptoClient, IdxClient
 
@@ -425,7 +455,7 @@ def cmd_doctor(args: argparse.Namespace, settings: Settings) -> int:
         ("ccxt", crypto.available(), f"{crypto.exchange_id} reachable" if crypto.available() else crypto.last_error or "install ccxt"),
         ("config", settings.path.exists(), str(settings.path)),
         ("paper broker", bool(settings.get("execution.paper", True)), "no capital at risk"),
-    ]
+    ] + _security_checks(settings)
     if args.json:
         print(json.dumps([{"check": c, "ok": ok, "detail": d} for c, ok, d in checks], indent=2))
         return 0
@@ -440,8 +470,23 @@ def cmd_doctor(args: argparse.Namespace, settings: Settings) -> int:
 
 
 def cmd_serve(args: argparse.Namespace, settings: Settings) -> int:
+    import socket
+
     import uvicorn
 
+    # A second uvicorn on the same port dies with a bare OSError traceback; check first and
+    # say what is actually going on (a stale instance is the usual cause).
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        probe.bind((args.host, args.port))
+    except OSError:
+        print(f"  {red('port busy')} {args.host}:{args.port} is already in use — another "
+              f"`serve` is probably running. Stop it or pick --port {args.port + 1}.",
+              file=sys.stderr)
+        return 1
+    finally:
+        probe.close()
     print(f"  Trading Office on http://{args.host}:{args.port}")
     uvicorn.run("trading_office.api.server:app", host=args.host, port=args.port, log_level="info")
     return 0
@@ -538,7 +583,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="trading-office",
         description="IDX + crypto trading desk: market filter → signal → risk → execution.",
-        epilog="Every command takes --json for machine-readable output.",
+        epilog="--json is global: put it before the command (trading-office --json screen --market idx).",
     )
     parser.add_argument("--config", default="", help="path to settings.json")
     parser.add_argument("--json", action="store_true", help="emit JSON (same as the REST API)")
@@ -571,7 +616,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--days", type=int, default=20)
     p.set_defaults(func=cmd_foreign)
 
-    p = sub.add_parser("ownership", help="KSEI holders above 1%")
+    p = sub.add_parser("ownership", help="KSEI holders above 1 percent")
     p.add_argument("--symbol", required=True)
     p.set_defaults(func=cmd_ownership)
 
@@ -586,7 +631,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("backtest", help="walk-forward backtest on closed candles")
     p.add_argument("--market", choices=["idx", "crypto"], default="crypto")
-    p.add_argument("--symbol", default="BTC/USDT:USDT")
+    p.add_argument("--symbol", default=None,
+                   help="defaults to BTC/USDT:USDT (crypto) or BBCA (idx) — never a crypto pair on IDX")
     p.add_argument("--oos", type=float, default=0.3)
     p.add_argument("--bars", type=int, default=900)
     p.set_defaults(func=cmd_backtest)
