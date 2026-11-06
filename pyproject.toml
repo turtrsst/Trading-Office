@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-office"
+version = "1.0.0"
+description = "Expert-Advisor style trading engine for IDX equities and crypto perpetual futures: market filter -> signal -> risk -> execution, with a web terminal, CLI, REST API and MCP server."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "pydantic>=2.5",
+]
+
+[project.optional-dependencies]
+crypto = ["ccxt>=4.2"]
+agent = ["mcp>=2.3"]
+dev = ["pytest>=8.0", "httpx>=0.27"]
+
+[project.scripts]
+trading-office = "trading_office.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["trading_office*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

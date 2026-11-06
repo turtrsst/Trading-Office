@@ -1,0 +1,663 @@
+"""Event-driven backtester for the four-gate pipeline.
+
+Rules that keep the simulation honest:
+
+* Signals are evaluated on **closed bars only**; a fill happens at the **next bar's
+  open** (plus the spread/slippage of the profile), never at the signal bar's close.
+* Intrabar order of events per bar: gaps are respected — if the bar opens beyond the
+  stop, the stop fills at the open, not at the stop price.
+* Stops and targets are checked against the bar's high/low, with the pessimistic
+  assumption that the stop is hit first when both are inside the same bar.
+* Commissions, spread and slippage come from the market profile, so the equity curve is
+  net of costs.
+* The market filter, signal scoring, risk sizing and trade management are the *same*
+  functions the live engine calls — there is no parallel "test" logic.
+
+Usage::
+
+    python -m trading_office.backtest --market crypto --data data/crypto_BTCUSDT_15m.json
+    python -m trading_office.backtest --market idx --data data/idx_swing.json --oos 0.3
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import math
+import statistics
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable, Sequence
+
+from .. import indicators as ind
+from .. import market_filter, risk, signals
+from ..config import Settings, idx_tick_size
+from ..management import Position, manage_position
+
+
+# --------------------------------------------------------------------------- helpers
+def _as_dt(value: Any, fallback_tz: str = "Asia/Jakarta") -> dt.datetime:
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(fallback_tz)
+    except Exception:  # pragma: no cover
+        tz = dt.timezone.utc
+    if isinstance(value, (int, float)):
+        return dt.datetime.fromtimestamp(float(value) / 1000.0, dt.timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return dt.datetime.now(dt.timezone.utc)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=tz)
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def resample(bars: Sequence[dict[str, Any]], factor: int) -> list[dict[str, Any]]:
+    """Aggregate ``factor`` consecutive bars into one (simple OHLCV resampling)."""
+    if factor <= 1:
+        return list(bars)
+    out: list[dict[str, Any]] = []
+    for i in range(0, len(bars), factor):
+        chunk = bars[i : i + factor]
+        if len(chunk) < factor and out:
+            break
+        out.append(
+            {
+                "time": chunk[0]["time"],
+                "open": chunk[0]["open"],
+                "high": max(b["high"] for b in chunk),
+                "low": min(b["low"] for b in chunk),
+                "close": chunk[-1]["close"],
+                "volume": sum(float(b.get("volume") or 0) for b in chunk),
+            }
+        )
+    return out
+
+
+def align_htf(
+    ltf_bars: Sequence[dict[str, Any]],
+    htf_bars: Sequence[dict[str, Any]],
+    factor: int,
+) -> list[list[dict[str, Any]]]:
+    """For each LTF bar, the list of *closed* HTF bars available at that moment.
+
+    ``htf`` is built by resampling the LTF series, so an HTF bar only becomes visible
+    once its final LTF member has closed. That removes the look-ahead trap of using a
+    weekly EMA while the week is still forming.
+    """
+    out: list[list[dict[str, Any]]] = []
+    htf_index = 0
+    for i in range(len(ltf_bars)):
+        # HTF bar that contains bar i finishes at the end of its group
+        completed = (i + 1) // factor
+        if completed != htf_index:
+            htf_index = completed
+        out.append(htf_bars[:htf_index])
+    return out
+
+
+# --------------------------------------------------------------------------- result
+@dataclass
+class BacktestResult:
+    market: str
+    symbol: str
+    timeframe: str
+    bars: int
+    start: str
+    end: str
+    starting_equity: float
+    ending_equity: float
+    trades: list[dict[str, Any]] = field(default_factory=list)
+    equity_curve: list[tuple[str, float]] = field(default_factory=list)
+    rejections: dict[str, int] = field(default_factory=dict)
+    filters_blocked: dict[str, int] = field(default_factory=dict)
+    signals_by_bar: list[dict[str, Any]] = field(default_factory=list)
+
+    # ------------------------------------------------------------------ metrics
+    @property
+    def wins(self) -> list[dict[str, Any]]:
+        return [t for t in self.trades if t["pnl"] > 0]
+
+    @property
+    def losses(self) -> list[dict[str, Any]]:
+        return [t for t in self.trades if t["pnl"] <= 0]
+
+    def metrics(self) -> dict[str, Any]:
+        n = len(self.trades)
+        pnls = [float(t["pnl"]) for t in self.trades]
+        r_multiples = [float(t["r_multiple"]) for t in self.trades]
+        gross_win = sum(p for p in pnls if p > 0)
+        gross_loss = -sum(p for p in pnls if p < 0)
+        peak = self.starting_equity
+        max_dd = 0.0
+        for _ts, eq in self.equity_curve:
+            peak = max(peak, eq)
+            if peak > 0:
+                max_dd = max(max_dd, (peak - eq) / peak * 100.0)
+        returns = []
+        for i in range(1, len(self.equity_curve)):
+            prev = self.equity_curve[i - 1][1]
+            if prev:
+                returns.append((self.equity_curve[i][1] - prev) / prev)
+        sharpe = 0.0
+        if len(returns) > 2:
+            sd = statistics.pstdev(returns)
+            if sd > 0:
+                sharpe = statistics.mean(returns) / sd * math.sqrt(252)
+        return {
+            "trades": n,
+            "wins": len(self.wins),
+            "losses": len(self.losses),
+            "win_rate_pct": round(len(self.wins) / n * 100.0, 2) if n else 0.0,
+            "net_pnl": round(sum(pnls), 2),
+            "return_pct": round((self.ending_equity / self.starting_equity - 1) * 100.0, 2)
+            if self.starting_equity
+            else 0.0,
+            "profit_factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else None,
+            "expectancy_cash": round(sum(pnls) / n, 2) if n else 0.0,
+            "expectancy_r": round(sum(r_multiples) / n, 3) if n else 0.0,
+            "avg_win": round(gross_win / len(self.wins), 2) if self.wins else 0.0,
+            "avg_loss": round(-gross_loss / len(self.losses), 2) if self.losses else 0.0,
+            "max_drawdown_pct": round(max_dd, 2),
+            "sharpe": round(sharpe, 2),
+            "long_trades": sum(1 for t in self.trades if t["side"] == "long"),
+            "short_trades": sum(1 for t in self.trades if t["side"] == "short"),
+            "avg_bars_held": round(statistics.mean([t["bars_held"] for t in self.trades]), 1)
+            if self.trades
+            else 0.0,
+            "rejections": dict(sorted(self.rejections.items(), key=lambda kv: -kv[1])),
+            "filters_blocked": dict(sorted(self.filters_blocked.items(), key=lambda kv: -kv[1])),
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "market": self.market,
+            "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "bars": self.bars,
+            "start": self.start,
+            "end": self.end,
+            "starting_equity": self.starting_equity,
+            "ending_equity": round(self.ending_equity, 2),
+            "metrics": self.metrics(),
+            "trades": self.trades,
+            "equity_curve": self.equity_curve,
+            "signals_by_bar": self.signals_by_bar,
+        }
+
+
+# --------------------------------------------------------------------------- engine
+class Backtester:
+    def __init__(
+        self,
+        *,
+        market: str,
+        settings: Settings | None = None,
+        risk_override: dict[str, Any] | None = None,
+        signal_override: dict[str, Any] | None = None,
+    ) -> None:
+        self.settings = settings or Settings.load()
+        self.market = market
+        self.profile = self.settings.profile(market)
+        self.filter_cfg = self.settings.merged("market_filter", "engine")
+        self.signal_cfg = {
+            **self.settings.section("signal"),
+            "timeframe": self.profile.get("timeframe"),
+            **(signal_override or {}),
+        }
+        self.risk_cfg = {**self.settings.section("risk"), **(risk_override or {})}
+        self.risk_cfg.setdefault("max_leverage", self.profile.get("leverage", 1) if market == "idx" else self.risk_cfg.get("max_leverage", 3))
+        self.mgmt_cfg = self.settings.section("management")
+        self.engine_cfg = self.settings.section("engine")
+
+    # ------------------------------------------------------------------ helpers
+    def _equity_start(self) -> float:
+        return float(
+            self.engine_cfg.get("equity_idr" if self.market == "idx" else "equity_usdt", 1_000.0)
+        )
+
+    def _commission(self, side: str, notional: float) -> float:
+        p = self.profile
+        if self.market == "idx":
+            pct = float(p.get("commission_buy_pct" if side == "buy" else "commission_sell_pct", 0.15))
+            return notional * pct / 100.0
+        return notional * float(p.get("commission_bps", 5.5)) / 10_000.0
+
+    def _spread_bps(self, bar: dict[str, Any], tick: float | None) -> float:
+        if tick and bar["close"]:
+            return 2.0 * tick / bar["close"] * 10_000.0
+        return float(self.profile.get("slippage_bps", 2.0))
+
+    # ------------------------------------------------------------------ main loop
+    def run(
+        self,
+        symbol: str,
+        bars: Sequence[dict[str, Any]],
+        *,
+        htf_factor: int | None = None,
+        start_equity: float | None = None,
+        collect_signals: bool = True,
+        window: tuple[str | None, str | None] = (None, None),
+    ) -> BacktestResult:
+        bars = [b for b in bars if b.get("close") and b.get("high") and b.get("low")]
+        if len(bars) < 120:
+            raise ValueError(f"need at least 120 bars, got {len(bars)}")
+        factor = int(htf_factor or self.profile.get("htf_factor", 8 if self.market == "crypto" else 5))
+        htf_bars = resample(bars, factor)
+        htf_view = align_htf(bars, htf_bars, factor)
+        tick = self.profile.get("tick_table") and self.market == "idx"
+
+        equity = float(start_equity if start_equity is not None else self._equity_start())
+        result = BacktestResult(
+            market=self.market,
+            symbol=symbol,
+            timeframe=str(self.profile.get("timeframe", "")),
+            bars=len(bars),
+            start=str(bars[0]["time"]),
+            end=str(bars[-1]["time"]),
+            starting_equity=equity,
+            ending_equity=equity,
+        )
+        result.equity_curve.append((str(bars[0]["time"]), equity))
+
+        # Walk-forward windows: indicators warm up on the whole series, but entries are
+        # only allowed inside the window. This is what makes an out-of-sample slice fair
+        # (it is not handicapped by a missing EMA warm-up).
+        win_start, win_end = window
+        first_i = 60
+        last_i = len(bars) - 1
+        if win_start:
+            first_i = max(first_i, next((j for j, b in enumerate(bars) if str(b["time"]) >= win_start), len(bars) - 2))
+        if win_end:
+            last_i = min(last_i, next((j for j, b in enumerate(bars) if str(b["time"]) >= win_end), len(bars) - 1))
+
+        position: Position | None = None
+        pending: dict[str, Any] | None = None
+        closed_today: list[dict[str, Any]] = []
+        current_day: str | None = None
+        last_exit_bar: str | None = None
+        cooldown = int(self.engine_cfg.get("cooldown_bars", 3))
+
+        for i in range(first_i, last_i):
+            bar = bars[i]
+            next_bar = bars[i + 1]
+            now = _as_dt(bar["time"], str(self.profile.get("sessions_timezone", "Asia/Jakarta")))
+            today = now.strftime("%Y-%m-%d")
+            if today != current_day:
+                closed_today = []
+                current_day = today
+
+            closed = bars[: i + 1]
+            htf_closed = htf_view[i]
+
+            # ------------------------------------------------------ fill the pending order
+            if pending is not None:
+                fill_price = float(next_bar["open"]) if i + 1 < len(bars) else float(next_bar["close"])
+                slip = float(self.profile.get("slippage_bps", 2.0)) / 10_000.0
+                spread = self._spread_bps(pending["bar"], pending.get("tick"))
+                direction = 1.0 if pending["plan"].side == "long" else -1.0
+                fill_price = fill_price * (1 + direction * (slip + spread / 2 / 10_000.0))
+                plan = pending["plan"]
+                fee = self._commission("buy" if plan.side == "long" else "sell", abs(fill_price * plan.size))
+                position = Position(
+                    symbol=symbol,
+                    market=self.market,
+                    side=plan.side,
+                    entry=fill_price,
+                    stop=plan.stop,
+                    target=plan.target,
+                    size=plan.size,
+                    initial_stop=plan.stop,
+                    opened_at=str(bar["time"]),
+                    bar_time=str(pending["bar_time"]),
+                    meta={"reasons": pending["reasons"], "fees": fee, "plan": plan.to_dict()},
+                )
+                pending = None
+
+            # ------------------------------------------------------ manage the open position
+            if position is not None:
+                bar_high = float(bar["high"])
+                bar_low = float(bar["low"])
+                spread_bps = self._spread_bps(bar, tick if tick else None)
+                # gap handling: if the bar opens through the stop, fill at the open
+                exit_price = None
+                exit_reason = ""
+                long = position.side == "long"
+                if long:
+                    if float(bar["open"]) <= position.stop:
+                        exit_price, exit_reason = float(bar["open"]), "stop loss (gap)"
+                    elif bar_low <= position.stop:
+                        exit_price, exit_reason = position.stop, "stop loss"
+                    elif float(bar["open"]) >= position.target:
+                        exit_price, exit_reason = float(bar["open"]), "take profit (gap)"
+                    elif bar_high >= position.target:
+                        exit_price, exit_reason = position.target, "take profit"
+                else:
+                    if float(bar["open"]) >= position.stop:
+                        exit_price, exit_reason = float(bar["open"]), "stop loss (gap)"
+                    elif bar_high >= position.stop:
+                        exit_price, exit_reason = position.stop, "stop loss"
+                    elif float(bar["open"]) <= position.target:
+                        exit_price, exit_reason = float(bar["open"]), "take profit (gap)"
+                    elif bar_low <= position.target:
+                        exit_price, exit_reason = position.target, "take profit"
+
+                if exit_price is None:
+                    actions = manage_position(
+                        position,
+                        closed_bar=bar,
+                        price=float(bar["close"]),
+                        atr=ind.last_defined(ind.atr([b["high"] for b in closed], [b["low"] for b in closed],
+                                                     [b["close"] for b in closed], int(self.filter_cfg.get("atr_period", 14)))) or 0.0,
+                        now=now,
+                        mgmt_cfg=self.mgmt_cfg,
+                        profile=self.profile,
+                        spread_bps=spread_bps,
+                        opposite_signal=False,
+                        tick_size=idx_tick_size(bar["close"]) if tick else None,
+                    )
+                    for action in actions:
+                        if action.kind == "close":
+                            exit_price, exit_reason = action.price or float(bar["close"]), action.reason
+                        elif action.kind == "modify_stop" and action.new_stop:
+                            position.stop = action.new_stop
+
+                if exit_price is not None:
+                    fee = self._commission("sell" if long else "buy", abs(exit_price * position.size))
+                    direction = 1.0 if long else -1.0
+                    gross = (exit_price - position.entry) * position.size * direction
+                    total_fee = fee + float(position.meta.get("fees", 0.0))
+                    pnl = gross - total_fee
+                    equity += pnl
+                    rpu = max(position.risk_per_unit, 1e-12)
+                    trade = {
+                        "symbol": symbol,
+                        "side": position.side,
+                        "entry": round(position.entry, 6),
+                        "exit": round(exit_price, 6),
+                        "stop": round(position.initial_stop, 6),
+                        "target": round(position.target, 6),
+                        "size": round(position.size, 6),
+                        "pnl": round(pnl, 2),
+                        "fees": round(total_fee, 2),
+                        "r_multiple": round(pnl / (rpu * position.size), 3) if position.size else 0.0,
+                        "reason": exit_reason,
+                        "entry_reason": " | ".join(position.meta.get("reasons", [])),
+                        "opened_at": position.opened_at,
+                        "closed_at": str(bar["time"]),
+                        "bars_held": position.bars_held,
+                        "rr_planned": round(
+                            abs(position.target - position.entry) / rpu, 2
+                        ),
+                    }
+                    result.trades.append(trade)
+                    closed_today.append(trade)
+                    last_exit_bar = str(bar["time"])
+                    position = None
+                    result.equity_curve.append((str(bar["time"]), equity))
+                    continue
+
+            result.equity_curve.append((str(bar["time"]), equity))
+
+            # ------------------------------------------------------ new entries
+            if position is not None or pending is not None or last_exit_bar == str(bar["time"]):
+                continue
+            if last_exit_bar and cooldown:
+                idx_exit = next((j for j in range(i, -1, -1) if str(bars[j]["time"]) == last_exit_bar), None)
+                if idx_exit is not None and i - idx_exit < cooldown:
+                    continue
+
+            # cooldown after deployment of capital: one position at a time in the test
+            ctx = market_filter.build_context_from_bars(
+                symbol,
+                self.market,
+                closed,
+                htf_closed,
+                now=now,
+                profile=self.profile,
+                config=self.filter_cfg,
+                stale=False,
+                data_age_s=0,
+                is_trading_day=now.weekday() < 5,
+            )
+            if tick:
+                ctx.tick_size = idx_tick_size(bar["close"])
+            filt = market_filter.evaluate(ctx, profile=self.profile, config=self.filter_cfg)
+            if not filt.passed:
+                for check in filt.checks:
+                    if not check.passed:
+                        result.filters_blocked[check.name] = result.filters_blocked.get(check.name, 0) + 1
+                continue
+
+            sig = signals.evaluate(symbol, closed, self.signal_cfg, bar_time=str(bar["time"]))
+            if collect_signals:
+                result.signals_by_bar.append(
+                    {
+                        "time": str(bar["time"]),
+                        "action": sig.action,
+                        "long": sig.long_score,
+                        "short": sig.short_score,
+                    }
+                )
+            if sig.action == "WAIT":
+                key = sig.block_code or "wait"
+                result.rejections[key] = result.rejections.get(key, 0) + 1
+                continue
+            if filt.direction and filt.direction != sig.action.lower():
+                result.rejections["signal against HTF trend"] = (
+                    result.rejections.get("signal against HTF trend", 0) + 1
+                )
+                continue
+
+            entry = float(bar["close"])
+            spread_bps = self._spread_bps(bar, idx_tick_size(entry) if tick else None)
+            decision = risk.build_plan(
+                symbol=symbol,
+                market=self.market,
+                side=sig.action.lower(),
+                entry=entry,
+                atr=float(sig.atr or 0.0),
+                bars=closed,
+                equity=equity,
+                config=self.signal_cfg,
+                risk_cfg=self.risk_cfg,
+                profile=self.profile,
+                spread_bps=spread_bps,
+                tick_size=idx_tick_size(entry) if tick else None,
+                quote_volume=ctx.quote_volume,
+            )
+            if not decision.approved:
+                for reason in decision.rejections:
+                    key = reason.split("(")[0].split(":")[0].strip()
+                    result.rejections[key] = result.rejections.get(key, 0) + 1
+                continue
+            plan = decision.plan
+            if plan is None or plan.size <= 0:
+                continue
+            pending = {
+                "plan": plan,
+                "bar": bar,
+                "bar_time": str(bar["time"]),
+                "reasons": sig.reasons_for(sig.action),
+                "tick": idx_tick_size(entry) if tick else None,
+            }
+            result.equity_curve.append((str(bar["time"]) + "+signal", equity))
+
+        # force-close at the last bar of the window so the metrics include the open trade
+        if position is not None:
+            last = bars[min(last_i, len(bars) - 1)]
+            exit_price = float(last["close"])
+            long = position.side == "long"
+            fee = self._commission("sell" if long else "buy", abs(exit_price * position.size))
+            gross = (exit_price - position.entry) * position.size * (1 if long else -1)
+            pnl = gross - fee - float(position.meta.get("fees", 0.0))
+            equity += pnl
+            rpu = max(position.risk_per_unit, 1e-12)
+            result.trades.append(
+                {
+                    "symbol": symbol,
+                    "side": position.side,
+                    "entry": round(position.entry, 6),
+                    "exit": round(exit_price, 6),
+                    "stop": round(position.initial_stop, 6),
+                    "target": round(position.target, 6),
+                    "size": round(position.size, 6),
+                    "pnl": round(pnl, 2),
+                    "fees": round(fee, 2),
+                    "r_multiple": round(pnl / (rpu * position.size), 3) if position.size else 0.0,
+                    "reason": "end of data",
+                    "entry_reason": " | ".join(position.meta.get("reasons", [])),
+                    "opened_at": position.opened_at,
+                    "closed_at": str(last["time"]),
+                    "bars_held": position.bars_held,
+                    "rr_planned": round(abs(position.target - position.entry) / rpu, 2),
+                }
+            )
+            result.equity_curve.append((str(last["time"]), equity))
+
+        result.ending_equity = equity
+        return result
+
+
+# --------------------------------------------------------------------------- walk-forward
+def walk_forward(
+    *,
+    market: str,
+    symbol: str,
+    bars: Sequence[dict[str, Any]],
+    settings: Settings | None = None,
+    oos_fraction: float = 0.3,
+    param_grid: Iterable[dict[str, Any]] | None = None,
+    htf_factor: int | None = None,
+) -> dict[str, Any]:
+    """Pick parameters in-sample, then report the untouched out-of-sample slice.
+
+    ``param_grid`` yields overrides like ``{"signal": {"min_score": 5},
+    "risk": {"rr_target": 2.0}}``. The best in-sample set is chosen by expectancy R with
+    a minimum trade count, then re-run once on the OOS slice.
+    """
+    settings = settings or Settings.load()
+    split = int(len(bars) * (1.0 - oos_fraction))
+    split_time = str(bars[split]["time"])
+    grid = list(param_grid or [
+        {"signal": {"min_score": 5}},
+        {"signal": {"min_score": 6}},
+        {"signal": {"min_score": 7}},
+        {"signal": {"min_score": 5}, "risk": {"rr_target": 1.5}},
+        {"signal": {"min_score": 5}, "risk": {"rr_target": 3.0}},
+    ])
+
+    rows = []
+    best = None
+    for params in grid:
+        bt = Backtester(
+            market=market,
+            settings=settings,
+            signal_override=params.get("signal"),
+            risk_override=params.get("risk"),
+        )
+        res = bt.run(symbol, bars, htf_factor=htf_factor, collect_signals=False,
+                     window=(None, split_time))
+        metrics = res.metrics()
+        rows.append({"params": params, "metrics": metrics})
+        score = metrics["expectancy_r"] if metrics["trades"] >= 5 else -999.0
+        if best is None or score > best[0]:
+            best = (score, params, res)
+
+    chosen = best[1] if best else {}
+    bt_oos = Backtester(
+        market=market,
+        settings=settings,
+        signal_override=chosen.get("signal"),
+        risk_override=chosen.get("risk"),
+    )
+    res_oos = bt_oos.run(symbol, bars, htf_factor=htf_factor, collect_signals=False,
+                         window=(split_time, None))
+    return {
+        "symbol": symbol,
+        "market": market,
+        "split_index": split,
+        "split_time": split_time,
+        "oos_start": res_oos.start,
+        "oos_note": (
+            "the out-of-sample run starts at the first bar after the split where the "
+            "indicators of the trading timeframe are warm (they warm up on the full series)"
+        ),
+        "chosen_params": chosen,
+        "in_sample": best[2].to_dict() if best else None,
+        "out_of_sample": res_oos.to_dict(),
+        "grid": rows,
+        "note": (
+            "The out-of-sample slice was never used for selection; indicators are warmed up "
+            "on the full history so the slice is not handicapped, but no entry is taken "
+            "before the split. A positive in-sample and a negative OOS result means the "
+            "parameters are curve-fitted."
+        ),
+    }
+
+
+# --------------------------------------------------------------------------- CLI
+def load_bars(path: str | Path) -> list[dict[str, Any]]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(payload, dict):
+        for key in ("candles", "bars", "data", "ohlcv"):
+            if key in payload:
+                payload = payload[key]
+                break
+        else:
+            if "quote" in payload and "candles" not in payload:
+                raise ValueError("file holds a quote, not candles")
+    bars = []
+    for row in payload:
+        if isinstance(row, (list, tuple)):
+            bars.append({"time": row[0], "open": row[1], "high": row[2], "low": row[3],
+                         "close": row[4], "volume": row[5] if len(row) > 5 else 0})
+        elif isinstance(row, dict):
+            bars.append(row)
+    return bars
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Backtest the Trading Office pipeline on closed candles.")
+    parser.add_argument("--market", choices=["crypto", "idx"], required=True)
+    parser.add_argument("--data", required=True, help="JSON file with candles (idx shape or ccxt rows)")
+    parser.add_argument("--symbol", default="")
+    parser.add_argument("--oos", type=float, default=0.0, help="out-of-sample fraction, e.g. 0.3")
+    parser.add_argument("--htf-factor", type=int, default=None, help="LTF bars per HTF bar")
+    parser.add_argument("--out", default="", help="write the report JSON here")
+    args = parser.parse_args(argv)
+
+    bars = load_bars(args.data)
+    symbol = args.symbol or Path(args.data).stem
+    settings = Settings.load()
+    if args.oos:
+        report = walk_forward(
+            market=args.market, symbol=symbol, bars=bars, settings=settings,
+            oos_fraction=args.oos, htf_factor=args.htf_factor,
+        )
+    else:
+        bt = Backtester(market=args.market, settings=settings)
+        report = bt.run(symbol, bars, htf_factor=args.htf_factor).to_dict()
+
+    text = json.dumps(report, indent=2, default=str)
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+        print(f"wrote {args.out}")
+    else:
+        print(text)
+    metrics = report.get("metrics") or (report.get("out_of_sample") or {}).get("metrics") or {}
+    if metrics:
+        print(
+            f"\n{symbol}: {metrics['trades']} trades · win {metrics['win_rate_pct']}% · "
+            f"expectancy {metrics['expectancy_r']}R · PF {metrics['profit_factor']} · "
+            f"maxDD {metrics['max_drawdown_pct']}%",
+            flush=True,
+        )
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

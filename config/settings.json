@@ -1,0 +1,148 @@
+{
+  "engine": {
+    "state_dir": "state",
+    "timezone": "Asia/Jakarta",
+    "require_trend_filter": true,
+    "min_filters_passed": 3,
+    "max_open_positions": 4,
+    "max_portfolio_risk_pct": 4.0,
+    "max_daily_loss_pct": 2.0,
+    "max_consecutive_losses": 4,
+    "cooldown_bars": 3,
+    "equity_idr": 100000000,
+    "equity_usdt": 1000.0
+  },
+  "market_filter": {
+    "trend_ema": 200,
+    "trend_tolerance_atr": 0.25,
+    "atr_period": 14,
+    "atr_pct_band_mult": [
+      0.6,
+      2.5
+    ],
+    "news_blackout": [],
+    "block_weekend_crypto": false
+  },
+  "signal": {
+    "min_score": 5,
+    "rsi_period": 14,
+    "rsi_trigger": 35,
+    "rsi_overbought": 75,
+    "rsi_oversold": 25,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "bb_period": 20,
+    "bb_std": 2.0,
+    "volume_ma": 20,
+    "volume_mult": 1.2,
+    "swing_lookback": 10
+  },
+  "risk": {
+    "risk_per_trade_pct": 1.0,
+    "rr_target": 2.0,
+    "min_rr": 1.5,
+    "atr_sl_mult": 1.5,
+    "atr_tp_cap_mult": 6.0,
+    "max_leverage": 3,
+    "max_margin_per_trade_pct": 8.0,
+    "max_symbol_exposure_pct": 20.0,
+    "liquidity_participation_pct": 0.5,
+    "cost_multiple": 3.0
+  },
+  "management": {
+    "breakeven_at_r": 1.0,
+    "breakeven_buffer_spread": 1.0,
+    "trail_atr_mult": 1.0,
+    "trail_start_r": 1.0,
+    "partial_tp_r": null,
+    "partial_tp_fraction": 0.5,
+    "max_bars_in_trade_crypto": 96,
+    "max_bars_in_trade_idx": 15,
+    "exit_on_opposite_signal": true,
+    "flat_before_weekend": false,
+    "idx_close_before_minutes": 10
+  },
+  "profiles": {
+    "crypto": {
+      "timeframe": "15m",
+      "trend_timeframe": "4h",
+      "atr_min_pct": 0.25,
+      "atr_max_pct": 6.0,
+      "max_spread_bps": 8.0,
+      "commission_bps": 5.5,
+      "slippage_bps": 2.0,
+      "sessions": [
+        [
+          "07:00",
+          "10:00"
+        ],
+        [
+          "13:00",
+          "22:00"
+        ]
+      ],
+      "sessions_timezone": "Asia/Jakarta",
+      "symbols": [
+        "BTC/USDT:USDT",
+        "ETH/USDT:USDT",
+        "SOL/USDT:USDT",
+        "XRP/USDT:USDT"
+      ],
+      "max_margin_per_trade_pct": 8.0
+    },
+    "idx": {
+      "timeframe": "1d",
+      "trend_timeframe": "1wk",
+      "atr_min_pct": 0.8,
+      "atr_max_pct": 9.0,
+      "max_spread_bps": 60.0,
+      "commission_buy_pct": 0.15,
+      "commission_sell_pct": 0.25,
+      "slippage_bps": 5.0,
+      "tick_table": true,
+      "min_daily_value_idr": 5000000000,
+      "sessions": [
+        [
+          "09:15",
+          "11:30"
+        ],
+        [
+          "13:30",
+          "15:45"
+        ]
+      ],
+      "sessions_timezone": "Asia/Jakarta",
+      "symbols": [
+        "BBCA",
+        "BBRI",
+        "BMRI",
+        "BBNI",
+        "TLKM",
+        "ASII",
+        "ADRO",
+        "ANTM",
+        "MDKA",
+        "GOTO"
+      ],
+      "max_margin_per_trade_pct": 20.0
+    }
+  },
+  "execution": {
+    "exchange_id": "bybit",
+    "testnet": true,
+    "api_key_env": "TO_API_KEY",
+    "api_secret_env": "TO_API_SECRET",
+    "paper": true,
+    "dry_run": false,
+    "max_order_retries": 2,
+    "poll_seconds": 15
+  },
+  "idx": {
+    "command": "idx",
+    "timeout_seconds": 45,
+    "universe_limit": 40,
+    "cache_ttl_seconds": 120,
+    "offline": false
+  }
+}

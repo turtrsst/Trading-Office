@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Trading Office — IDX &amp; Crypto desk</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="grain"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="mark">TO</div>
+      <div class="brand-text">
+        <h1>Trading Office</h1>
+        <p>Market Filter → Signal → Risk → Execution</p>
+      </div>
+    </div>
+
+    <div class="market-switch" role="tablist" aria-label="Market">
+      <button class="switch-btn active" data-market="idx" role="tab">IDX / IHSG</button>
+      <button class="switch-btn" data-market="crypto" role="tab">Crypto Perps</button>
+    </div>
+
+    <div class="topbar-right">
+      <div class="pill" id="source-pill" title="Data provider for the active view">
+        <span class="dot"></span><span id="source-text">checking…</span>
+      </div>
+      <div class="pill mono" id="clock">--:--:-- WIB</div>
+      <a class="ghost-btn" href="/api/mcp/tools" target="_blank" rel="noreferrer">MCP / API</a>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-tab="screen">Screening</button>
+    <button class="tab" data-tab="analysis">Analysis</button>
+    <button class="tab" data-tab="bandar">Bandarmology</button>
+    <button class="tab" data-tab="backtest">Backtest</button>
+    <button class="tab" data-tab="engine">Live Engine</button>
+    <button class="tab" data-tab="api">CLI / MCP</button>
+  </nav>
+
+  <main>
+    <!-- ============================================================ SCREENING -->
+    <section class="panel active" id="tab-screen">
+      <div class="panel-head">
+        <div>
+          <h2 id="screen-title">IDX screening</h2>
+          <p class="muted" id="screen-subtitle">Four gates over the most liquid names, ranked by conviction.</p>
+        </div>
+        <div class="row-actions">
+          <input id="screen-symbols" class="input" placeholder="tickers (BBCA,TLKM) — optional" />
+          <button class="btn" id="screen-run">Scan</button>
+        </div>
+      </div>
+
+      <div class="stat-strip" id="screen-stats"></div>
+
+      <div class="split">
+        <div class="card">
+          <div class="card-head">
+            <h3>Ranked universe</h3>
+            <span class="muted small" id="screen-meta"></span>
+          </div>
+          <div class="table-wrap">
+            <table class="table" id="screen-table">
+              <thead>
+                <tr>
+                  <th>Symbol</th><th>Ticker</th><th class="num">Price</th><th class="num">Chg%</th>
+                  <th>Label</th><th class="num">Score</th><th>Conviction</th><th>Why</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>Index / market</h3></div>
+          <div id="market-card" class="market-card"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ ANALYSIS -->
+    <section class="panel" id="tab-analysis">
+      <div class="panel-head">
+        <div>
+          <h2>Symbol analysis</h2>
+          <p class="muted">Every gate, every number, and the plan it produced.</p>
+        </div>
+        <div class="row-actions">
+          <input id="analysis-symbol" class="input" value="BBCA" />
+          <button class="btn" id="analysis-run">Analyse</button>
+        </div>
+      </div>
+
+      <div class="analysis-grid">
+        <div class="card chart-card">
+          <div class="card-head">
+            <h3 id="chart-title">BBCA</h3>
+            <div class="chart-legend" id="chart-legend"></div>
+          </div>
+          <canvas id="price-chart" height="340"></canvas>
+          <canvas id="rsi-chart" height="96"></canvas>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h3>Verdict</h3><span class="chip" id="verdict-chip">—</span></div>
+          <div class="verdict" id="verdict-body"></div>
+        </div>
+      </div>
+
+      <div class="gate-grid" id="gate-grid"></div>
+
+      <div class="split">
+        <div class="card">
+          <div class="card-head"><h3>Trade plan</h3><span class="muted small">risk-first sizing</span></div>
+          <div id="plan-body" class="plan-body"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>Signal scorecard</h3><span class="muted small" id="score-meta"></span></div>
+          <div id="score-body" class="score-body"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ BANDARMOLOGY -->
+    <section class="panel" id="tab-bandar">
+      <div class="panel-head">
+        <div>
+          <h2>Bandarmology &amp; flow</h2>
+          <p class="muted">Broker accumulation, foreign flow, KSEI ownership, corporate actions — IDX only.</p>
+        </div>
+        <div class="row-actions">
+          <input id="bandar-symbol" class="input" value="BBCA" />
+          <select id="bandar-period" class="input">
+            <option value="1d">1 day</option>
+            <option value="1w" selected>1 week</option>
+            <option value="1m">1 month</option>
+            <option value="3m">3 months</option>
+          </select>
+          <button class="btn" id="bandar-run">Load</button>
+        </div>
+      </div>
+
+      <div class="stat-strip" id="bandar-stats"></div>
+
+      <div class="split">
+        <div class="card">
+          <div class="card-head"><h3>Broker summary — top buyers</h3><span class="muted small" id="broker-date"></span></div>
+          <div id="buyers" class="broker-list"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>Broker summary — top sellers</h3></div>
+          <div id="sellers" class="broker-list"></div>
+        </div>
+      </div>
+
+      <div class="split">
+        <div class="card">
+          <div class="card-head"><h3>Foreign flow (20 sessions)</h3><span class="muted small" id="foreign-meta"></span></div>
+          <canvas id="foreign-chart" height="140"></canvas>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>KSEI holders &gt; 1%</h3><span class="muted small" id="ksei-meta"></span></div>
+          <div id="ksei" class="ksei"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>Corporate actions &amp; RUPS</h3></div>
+        <div id="actions" class="actions"></div>
+      </div>
+    </section>
+
+    <!-- ============================================================ BACKTEST -->
+    <section class="panel" id="tab-backtest">
+      <div class="panel-head">
+        <div>
+          <h2>Backtest &amp; unseen data</h2>
+          <p class="muted">Parameters chosen in-sample; the metrics below are reported on the untouched slice.</p>
+        </div>
+        <div class="row-actions">
+          <input id="bt-symbol" class="input" value="BTC/USDT:USDT" />
+          <select id="bt-market" class="input">
+            <option value="crypto">crypto</option>
+            <option value="idx">idx</option>
+          </select>
+          <button class="btn" id="bt-run">Run walk-forward</button>
+        </div>
+      </div>
+      <div class="stat-strip" id="bt-stats"></div>
+      <div class="split">
+        <div class="card">
+          <div class="card-head"><h3>Out-of-sample equity</h3><span class="muted small" id="bt-meta"></span></div>
+          <canvas id="equity-chart" height="220"></canvas>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>Why trades were skipped</h3></div>
+          <div id="bt-funnel" class="funnel"></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Trades (out-of-sample)</h3><span class="muted small">fills at next bar open, net of costs</span></div>
+        <div class="table-wrap">
+          <table class="table" id="bt-table">
+            <thead><tr><th>#</th><th>Side</th><th class="num">Entry</th><th class="num">Stop</th><th class="num">Target</th>
+            <th class="num">Exit</th><th class="num">R</th><th class="num">PnL</th><th>Exit reason</th><th>Entry reasons</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ ENGINE -->
+    <section class="panel" id="tab-engine">
+      <div class="panel-head">
+        <div>
+          <h2>Live engine</h2>
+          <p class="muted">One decision per closed bar. Duplicate orders are refused by the bar lock, the
+            one-position-per-symbol rule and the client order id.</p>
+        </div>
+        <div class="row-actions">
+          <button class="btn" id="eng-start">Start</button>
+          <button class="btn ghost" id="eng-stop">Stop</button>
+          <button class="btn ghost" id="eng-cycle">Run one cycle</button>
+          <button class="btn danger" id="eng-flat">Flatten</button>
+        </div>
+      </div>
+
+      <div class="stat-strip" id="eng-stats"></div>
+
+      <div class="split">
+        <div class="card">
+          <div class="card-head"><h3>Open positions</h3></div>
+          <div id="eng-positions" class="positions"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>Equity</h3><span class="muted small" id="eng-equity-meta"></span></div>
+          <canvas id="live-equity" height="200"></canvas>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>Audit ledger</h3><span class="muted small">every decision, taken or skipped</span></div>
+        <div id="eng-ledger" class="ledger"></div>
+      </div>
+    </section>
+
+    <!-- ============================================================ API -->
+    <section class="panel" id="tab-api">
+      <div class="panel-head">
+        <div>
+          <h2>CLI, REST &amp; MCP</h2>
+          <p class="muted">The same engine for a terminal, a script, or an AI agent.</p>
+        </div>
+      </div>
+      <div class="split">
+        <div class="card">
+          <div class="card-head"><h3>Terminal</h3></div>
+          <pre class="code" id="cli-snippets"></pre>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>MCP registration</h3></div>
+          <pre class="code" id="mcp-snippets"></pre>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Tools exposed to agents</h3><span class="muted small">/api/mcp/tools</span></div>
+        <div id="tool-list" class="tool-list"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Provider status</h3><span class="muted small">/api/health</span></div>
+        <div id="provider-status" class="provider-status"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>Simulation &amp; research tooling — not investment advice. Synthetic data is labelled per row.</span>
+    <span class="mono" id="footer-version">v1.0.0</span>
+  </footer>
+
+  <script src="/static/charts.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

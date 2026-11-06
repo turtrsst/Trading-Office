@@ -1,0 +1,18 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# runtime state (paper account, bar locks, ledger) — safe to regenerate
+state/
+
+# generated demo data (scripts/make_demo_data.py --live regenerates it)
+data/*.json
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
