@@ -233,7 +233,8 @@
     ],
     "telegram": {
       "chat_id": "",
-      "token_env": "TO_TELEGRAM_TOKEN"
+      "token_env": "TO_TELEGRAM_TOKEN",
+      "parse_mode": "HTML"
     }
   },
   "autonomy": {

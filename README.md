@@ -240,12 +240,13 @@ trading_office/
   market/idx_client.py        idx CLI bridge (cached, failure-tolerant, synthetic fallback)
   market/crypto_client.py     ccxt bridge (closed candles only, ticks, book)
   market/demo.py              deterministic synthetic series (labelled everywhere)
+  digest.py                   the daily one-message report (reads the running server)
   api/server.py               FastAPI: REST + static UI
   api/mcp_server.py           MCP tools (stdio / streamable HTTP)
   backtest/engine.py          bar-by-bar backtester + walk-forward
   cli.py                      terminal
 web/                          the web terminal (no build step, no frameworks)
-tests/                        151 unit + API tests, all offline
+tests/                        163 unit + API tests, all offline
 docs/                         strategy logic, API, MCP, operations
 scripts/make_demo_data.py     writes data/*.json for the backtester
 ```
@@ -267,8 +268,24 @@ python -m trading_office.cli supervise --port 8000 --log logs/trading-office.log
 Restart-with-backoff when the process dies, a heartbeat probe that restarts it when the
 engine **loop** stops cycling (the failure an external service manager cannot see),
 rotating logs, and optional Telegram alerts on breaker trips / cycle errors / watchdog
-events. Linux unit in `deploy/trading-office.service`; Windows (NSSM / Task Scheduler)
-recipes in `docs/OPERATIONS.md`.
+events. Linux unit in `deploy/trading-office.service`; Windows recipes in
+`docs/OPERATIONS.md`.
+
+### The daily digest
+
+```bash
+python -m trading_office.cli digest            # print it
+python -m trading_office.cli digest --send     # print it and deliver it to Telegram
+```
+
+Equity (mark-to-market), realised performance, guard state, loop heartbeat + uptime, open
+positions, the approval queue and the top skip reasons — one message, readable on a phone.
+It asks the **running** server for those numbers instead of starting its own engine, so
+`cycles` and `equity` are the bot's, not the report's. If the server is unreachable,
+`--send` refuses (exit 1) rather than mailing a report about a process that does not exist;
+`--offline` is the explicit opt-in for a local-state snapshot, and the message says so.
+Scheduling it (cron and Windows Task Scheduler) is in
+[docs/AUTONOMY.md](docs/AUTONOMY.md).
 
 ## Secrets & state at rest
 
@@ -290,7 +307,7 @@ trading-office doctor     # shows credential presence + whether state/ is sealed
 
 ```sh
 pip install pytest httpx
-python -m pytest -q           # 151 passed, entirely offline
+python -m pytest -q           # 163 passed, entirely offline
 ```
 
 The suite covers indicator maths, each filter's pass/block path, the no-trigger veto, the

@@ -30,12 +30,14 @@ The token comes from the environment (``TO_TELEGRAM_TOKEN``) and never from conf
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from html import escape
 from typing import Any, Callable
 
 #: events worth waking somebody up for (engine events, not every cycle)
@@ -72,6 +74,13 @@ class Alerter:
     chat_id: str = ""
     market: str = ""
     timeout: float = 5.0
+    #: Telegram parse mode. Must match how the caller builds the text: sending HTML
+    #: without parse_mode shows the tags, sending plain text with it fails the whole
+    #: message (Telegram rejects entities it cannot parse).
+    parse_mode: str = ""
+    #: Bot API base. Only worth changing behind a proxy; it also lets the offline suite
+    #: exercise the real HTTP path against a local stub instead of mocking urlopen.
+    api_base: str = "https://api.telegram.org"
     transport: Callable[[str, str], dict[str, Any]] | None = None
     sink: list[dict[str, Any]] = field(default_factory=list)   # what was sent/attempted
     _last_sent: dict[str, float] = field(default_factory=dict, repr=False)
@@ -98,6 +107,9 @@ class Alerter:
             chat_id=str(telegram.get("chat_id", "") or ""),
             market=market,
             timeout=float(cfg.get("timeout_s", 5) or 5),
+            parse_mode=str(telegram.get("parse_mode", "HTML") or ""),
+            api_base=str(telegram.get("api_base") or os.environ.get("TO_TELEGRAM_API_BASE")
+                         or "https://api.telegram.org").rstrip("/"),
             transport=transport,
         )
 
@@ -166,8 +178,9 @@ class Alerter:
 
     # ------------------------------------------------------------------ delivery
     def _send_telegram(self, text: str) -> dict[str, Any]:
-        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        url = f"{self.api_base.rstrip('/')}/bot{self.token}/sendMessage"
         body = json.dumps({"chat_id": self.chat_id, "text": text,
+                           "parse_mode": self.parse_mode,
                            "disable_web_page_preview": True}).encode("utf-8")
         request = urllib.request.Request(url, data=body,
                                          headers={"Content-Type": "application/json"})
@@ -180,9 +193,17 @@ class Alerter:
             return {"ok": False, "error": type(exc).__name__}
 
     def deliver(self, text: str) -> dict[str, Any]:
-        transport = self.transport or self._send_telegram
+        """Hand one already-formatted message to Telegram (or to the injected transport).
+
+        Note the shape: a custom transport takes ``(text, chat_id)``, while the built-in
+        sender takes only ``text`` and reads ``self.chat_id``. Passing the chat id to the
+        built-in one raised ``TypeError`` *inside* ``deliver``'s own try block, which made
+        every real Telegram call report ``ok: False`` while looking like a network error.
+        """
         try:
-            return transport(text, self.chat_id)
+            if self.transport is not None:
+                return self.transport(text, self.chat_id)
+            return self._send_telegram(text)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -196,7 +217,12 @@ class Alerter:
         key = f"{self.market}:{event.get('event')}:{event.get('symbol') or event.get('error') or ''}"
         with self._lock:
             self._last_sent[key] = time.time()
-        outcome = self.deliver(text) if blocking else self._deliver_async(text)
+        # format() renders plain text; with parse_mode=HTML a stray "<" (an error message
+        # quoting an expression, say) would make Telegram reject the entire alert, so the
+        # text is escaped on the way out. The digest escapes its own body and does not come
+        # through here.
+        outbound = escape(text) if self.parse_mode.upper() == "HTML" else text
+        outcome = self.deliver(outbound) if blocking else self._deliver_async(outbound)
         record = {"event": event.get("event"), "text": text, **outcome}
         self.sink.append(record)
         del self.sink[:-50]  # keep the last 50 for the UI/diagnostics

@@ -99,6 +99,19 @@ class TelegramControl:
         "updates": 0, "commands": 0, "denied": 0, "actions": 0, "errors": 0})
 
     # ------------------------------------------------------------------ state
+    @classmethod
+    def from_settings(cls, settings: Any, *, market: str = "crypto",
+                      engine_for: Callable[[str], Any] | None = None) -> "TelegramControl":
+        """Build the control bot from config + environment (token is env-only)."""
+        from .env import get
+
+        telegram = (settings.get("alerts", {}) or {}).get("telegram", {}) or {}
+        return cls(
+            token=get(str(telegram.get("token_env") or "TO_TELEGRAM_TOKEN")) or get("TO_TELEGRAM_TOKEN"),
+            owner_chat_id=str(telegram.get("chat_id") or ""),
+            market=market, engine_for=engine_for,
+        )
+
     @property
     def configured(self) -> bool:
         return bool(self.token and self.owner_chat_id)

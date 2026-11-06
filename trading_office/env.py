@@ -43,6 +43,8 @@ ALIASES: dict[str, tuple[str, ...]] = {
     "TO_TESTNET": ("CCXT_TESTNET",),
     "TO_STATE_ENCRYPTION_KEY": ("STATE_ENCRYPTION_KEY",),
     "TO_STATE_PASSPHRASE": ("STATE_PASSPHRASE",),
+    # a bot token pasted from a generic tutorial is usually named after the service
+    "TO_TELEGRAM_TOKEN": ("TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "TG_TOKEN"),
 }
 
 #: variables from other ecosystems that this project cannot honour (see the docstring)

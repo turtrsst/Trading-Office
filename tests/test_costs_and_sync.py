@@ -399,10 +399,17 @@ def _close_trade(engine, pnl: float, when: str) -> None:
 
 
 def test_kill_switch_blocks_after_the_daily_loss_limit(tmp_path, settings):
-    today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+    # the breaker's day is the market timezone (Asia/Jakarta), not UTC: between 00:00 and
+    # 07:00 WIB a UTC-dated trade belongs to yesterday, so build the stamp the same way
+    # the engine reads it.
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(str(settings.profile("crypto").get("sessions_timezone", "Asia/Jakarta")))
+    now_local = dt.datetime.now(tz)
     engine = TradingEngine(market="crypto", settings=settings, symbols=["TEST/USDT:USDT"],
                            state_dir=tmp_path / "guard")
-    _close_trade(engine, -30.0, f"{today}T10:00:00+00:00")  # -3 % of a 1000 USDT book
+    # -3 % of a 1000 USDT book, booked a minute ago in real time
+    _close_trade(engine, -30.0, (now_local - dt.timedelta(minutes=1)).isoformat())
     guard = engine.guard_state()
     assert guard["blocked"] is True
     assert any("daily loss" in r for r in guard["reasons"])
@@ -421,6 +428,32 @@ def test_kill_switch_blocks_after_the_daily_loss_limit(tmp_path, settings):
     restarted = TradingEngine(market="crypto", settings=settings, symbols=["TEST/USDT:USDT"],
                              state_dir=tmp_path / "guard")
     assert restarted.guard_state()["blocked"] is False
+
+
+def test_kill_switch_counts_a_utc_stamp_by_its_market_tz_day(tmp_path, settings):
+    """A loss booked at 20:00 UTC is 03:00 WIB the next day: it belongs to *that* day."""
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(str(settings.profile("crypto").get("sessions_timezone", "Asia/Jakarta")))
+    now_local = dt.datetime.now(tz)
+    engine = TradingEngine(market="crypto", settings=settings, symbols=["TEST/USDT:USDT"],
+                           state_dir=tmp_path / "guard_tz")
+    # written the way the ledger writes it -- UTC -- but two days back, so it is stale
+    stale = (now_local - dt.timedelta(days=2)).astimezone(dt.timezone.utc)
+    _close_trade(engine, -30.0, stale.isoformat())
+    assert engine.guard_state()["blocked"] is False
+
+    # same instant expressed in the market timezone is also stale
+    engine2 = TradingEngine(market="crypto", settings=settings, symbols=["TEST/USDT:USDT"],
+                            state_dir=tmp_path / "guard_tz2")
+    _close_trade(engine2, -30.0, stale.astimezone(tz).isoformat())
+    assert engine2.guard_state()["blocked"] is False
+
+    # and one booked two minutes ago blocks whatever timezone it is stamped in
+    engine3 = TradingEngine(market="crypto", settings=settings, symbols=["TEST/USDT:USDT"],
+                            state_dir=tmp_path / "guard_tz3")
+    _close_trade(engine3, -30.0, (now_local - dt.timedelta(minutes=2)).astimezone(dt.timezone.utc).isoformat())
+    assert engine3.guard_state()["blocked"] is True
 
 
 def test_kill_switch_counts_consecutive_losses(tmp_path, settings):

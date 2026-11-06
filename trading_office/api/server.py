@@ -184,15 +184,10 @@ def _telegram_control() -> Any:
     global _TELEGRAM
     with _ENGINE_LOCK:
         if _TELEGRAM is None:
-            from ..env import get
             from ..telegram_bot import TelegramControl
 
-            alerts = SETTINGS.get("alerts", {}) or {}
-            telegram = alerts.get("telegram", {}) or {}
-            token = get(str(telegram.get("token_env") or "TO_TELEGRAM_TOKEN"))
-            _TELEGRAM = TelegramControl(
-                token=token,
-                owner_chat_id=str(telegram.get("chat_id") or ""),
+            _TELEGRAM = TelegramControl.from_settings(
+                SETTINGS,
                 market=str(SETTINGS.get("autonomy.control_market", "crypto")),
                 engine_for=lambda market: _engine(market),
             )

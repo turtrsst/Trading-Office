@@ -101,6 +101,52 @@ Security properties that are tested, not claimed (`tests/test_telegram_control.p
 `--send` delivers it to the same Telegram channel. An autonomous bot nobody reads is
 indistinguishable from one that stopped working three days ago.
 
+### The digest talks to the running bot, not to a new process
+
+`digest` asks `http://127.0.0.1:8000` (`/api/metrics`, `/api/engine/status`,
+`/api/engine/kill-switch`, `/api/approvals`) for the numbers. That distinction is the whole
+point: an engine constructed inside the digest process reports `cycles 0` and an equity
+frozen at its own starting balance, because it is describing *itself*. A digest that is
+wrong in the reassuring direction every morning is worse than none.
+
+| Situation | What `digest --send` does |
+| --- | --- |
+| server answering | reports the live book, cycles, uptime, guard and approvals; sends |
+| server down, no `--offline` | prints why and exits **1**; sends nothing |
+| server down, `--offline` | reports local state, labelled `local state (server not reachable)`; sends |
+| no token / chat id | prints `alert channel not configured` and exits **1** |
+
+| Flag | Default | Use |
+| --- | --- | --- |
+| `--market crypto\|idx` | `crypto` | which book to report |
+| `--api URL` | `http://127.0.0.1:8000` | server to ask (useful when it runs on another port) |
+| `--send` | off | deliver to Telegram; without it the message only goes to the terminal |
+| `--offline` | off | allow a local-state report while the server is unreachable |
+| `--timeout` | `5` | give up on a wedged server instead of hanging a scheduled task |
+
+Exit codes are cron-friendly on purpose: **0** printed/sent, **1** nothing was sent. A cron
+mail on a non-zero exit is your second alerting channel, and it needs no credentials.
+
+Windows Task Scheduler equivalent (on the Windows box that runs the bot). The scheduler
+starts in `C:\Windows\system32` and reads no shell profile, so `cd` into the repo first —
+both `config/settings.json` and `state/` are resolved relative to it:
+
+```bat
+schtasks /Create /TN "TradingOffice digest" /SC DAILY /ST 00:15 /RU "%USERNAME%" ^
+  /TR "cmd /c cd /d C:\Trading-Office && .venv\Scripts\python.exe -m trading_office.cli digest --send"
+
+:: 0 = the digest was delivered; anything else = it was not (see the table above)
+schtasks /Query /TN "TradingOffice digest" /V /FO LIST | findstr /i "result"
+:: run it right now instead of waiting until 00:15
+schtasks /Run /TN "TradingOffice digest"
+```
+
+The token (`TO_TELEGRAM_TOKEN`, alias `TELEGRAM_BOT_TOKEN`) must be a **user** environment
+variable of the account the task runs as — `setx TO_TELEGRAM_TOKEN "123:abc"` once, then sign
+out and back in — not something exported only in the terminal you happened to use. GUI route:
+`taskschd.msc` → *Create Task* → *Actions* → **Start in** = `C:\Trading-Office`, and tick
+*Run whether user is logged on or not*.
+
 ## What still needs a human
 
 | Situation | Why it is not automated |

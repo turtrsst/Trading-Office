@@ -480,52 +480,47 @@ def cmd_doctor(args: argparse.Namespace, settings: Settings) -> int:
 
 
 def cmd_digest(args: argparse.Namespace, settings: Settings) -> int:
-    """One screen an operator can read in 20 seconds: risk, book, guard, what was skipped.
+    """Report on the **running** bot (or, failing that, on state rebuilt from disk).
 
-    Designed to be run by cron once a session closes: an autonomous bot that nobody reads
-    is indistinguishable from one that stopped working three days ago.
+    A digest built from a freshly constructed engine describes the process that just
+    started — "cycles 0, equity unchanged" — which is precisely the reassuring lie that
+    hides a dead loop. So the server is asked first; only if it cannot be reached does this
+    fall back to local state, and the message says which one it used.
     """
-    from .alerts import Alerter
+    from . import digest as digest_mod
 
-    engine = _engine_for_cli(args.market, settings)
-    guard = engine.guard_state()
-    perf = engine.performance()
-    beat = engine.heartbeat()
-    rows = engine.active_trades()
-    skips = [e for e in engine.state.ledger(400) if e.get("event") == "skip"]
-    from collections import Counter
+    remote = None if args.offline else digest_mod.fetch_remote(args.api, args.market, args.timeout)
+    if remote is None and args.send and not args.offline:
+        # Refuse *before* rebuilding a local engine: opening the state store takes the lock
+        # and the report would describe this process, not the bot that is supposed to be
+        # running. Say what to do instead of printing a confident, wrong number.
+        print(f"  {red('not sent')} the API at {args.api} did not answer; "
+              f"nothing to report on.")
+        print(dim("  start the server (trading-office supervise) or pass --offline to send the "
+                  "local snapshot anyway"))
+        return 1
+    if remote is not None:
+        snapshot = digest_mod.snapshot_from_remote(remote, args.market)
+        source = f"api {args.api}"
+    else:
+        engine = _engine_for_cli(args.market, settings)
+        snapshot = digest_mod.snapshot_from_engine(engine)
+        source = "local state (server not reachable)"
 
-    reasons = Counter(str(e.get("reason", "")).split(":")[0] for e in skips).most_common(4)
-    lines = [
-        f"<b>Trading Office · {args.market} · digest</b>",
-        f"mode {engine.mode} · equity {perf.get('ending_equity', 0):,.2f} · "
-        f"net {perf.get('net_profit_pct', 0):+.2f}%",
-        f"guard {'OPEN' if guard['blocked'] else 'armed'} · day {guard['daily_loss_pct']}% · "
-        f"streak {guard['consecutive_losses']}",
-        f"heartbeat {'ok' if beat['ok'] else 'STALLED'} · cycles {engine.status.cycle_count} · "
-        f"orders {engine.status.orders}",
-        f"open positions {len(rows)}",
-    ]
-    for row in rows[:6]:
-        lines.append(f"  {row['symbol']} {row['side']} {row['size']} @ {row['entry']} "
-                     f"stop {row['stop']} · {row['r_multiple']:+.2f}R")
-    if reasons:
-        lines.append("skipped: " + ", ".join(f"{k or 'other'} ×{v}" for k, v in reasons))
-    pending = engine.state.approvals(status="pending")
-    if pending:
-        lines.append(f"⚠️ {len(pending)} approval(s) waiting")
-    text = "\n".join(lines)
-    print(text.replace("<b>", "").replace("</b>", ""))
-    if args.send:
-        alerter = Alerter.from_settings(settings, args.market)
-        if not alerter.configured:
-            print(f"  {amber('not sent')} alert channel not configured "
-                  f"(TO_TELEGRAM_TOKEN + alerts.telegram.chat_id)")
-            return 1
-        outcome = alerter.deliver(text)
-        print(f"  {green('sent') if outcome.get('ok') else red('failed')} via {alerter.channel}")
-        return 0 if outcome.get("ok") else 1
-    return 0
+    text = digest_mod.format_digest(snapshot)
+    print(digest_mod.plain(text))
+    if args.json:
+        print(json.dumps({**snapshot, "text": digest_mod.plain(text)}, indent=2, default=str))
+
+    if not args.send:
+        print(dim(f"\n  source: {source} · not sent (add --send)"))
+        return 0
+    outcome = digest_mod.send(settings, text, market=args.market)
+    if outcome.get("ok"):
+        print(f"  {green('sent')} via {outcome.get('channel')} · source {source}")
+        return 0
+    print(f"  {red('failed')} {outcome.get('reason') or outcome.get('error') or 'unknown error'}")
+    return 1
 
 
 def cmd_arm_live(args: argparse.Namespace, settings: Settings) -> int:
@@ -825,6 +820,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("digest", help="send (or print) a daily status digest — cron-friendly")
     p.add_argument("--market", choices=["idx", "crypto"], default="crypto")
     p.add_argument("--send", action="store_true", help="deliver to the configured alert channel")
+    p.add_argument("--api", default="http://127.0.0.1:8000",
+                   help="running server to report on (default http://127.0.0.1:8000)")
+    p.add_argument("--offline", action="store_true",
+                   help="do not call the API; rebuild the report from local state")
+    p.add_argument("--timeout", type=float, default=5.0, help="API timeout in seconds")
     p.set_defaults(func=cmd_digest)
 
     p = sub.add_parser("arm-live", help="authorise unattended LIVE entries (binds the gate fingerprint)")

@@ -658,11 +658,24 @@ class TradingEngine:
         """Daily-loss / consecutive-loss circuit breaker, evaluated from the ledger."""
         closed = self.state.closed_trades()[-500:]
         equity = self.broker.equity()
-        day = dt.datetime.now(ZoneInfo(str(self.profile.get("sessions_timezone", "Asia/Jakarta")))).strftime("%Y-%m-%d")
+        tz = ZoneInfo(str(self.profile.get("sessions_timezone", "Asia/Jakarta")))
+        day = dt.datetime.now(tz).strftime("%Y-%m-%d")
         today_pnl = 0.0
         for trade in closed:
             closed_at = str(trade.get("closed_at") or trade.get("ts") or "")
-            if closed_at.startswith(day) or (not closed_at and False):
+            # A trade stamped in UTC (as the ledger writes them) and a day boundary in
+            # Jakarta are seven hours apart: between 00:00 and 07:00 WIB, string-prefix
+            # comparison counted yesterday's losses as today's. Compare instants in the
+            # market timezone instead, and keep the prefix test for naive timestamps.
+            stamp_day = closed_at[:10]
+            if closed_at:
+                try:
+                    parsed = dt.datetime.fromisoformat(closed_at.replace("Z", "+00:00"))
+                    if parsed.tzinfo is not None:
+                        stamp_day = parsed.astimezone(tz).strftime("%Y-%m-%d")
+                except ValueError:
+                    pass
+            if stamp_day == day:
                 today_pnl += float(trade.get("pnl") or 0.0)
         day_start = equity - today_pnl
         streak = 0
