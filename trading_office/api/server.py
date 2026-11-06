@@ -316,6 +316,11 @@ def create_app() -> FastAPI:
                 htf_factor=req.htf_factor,
             )
             report["source"] = data.get("source")
+            report["drawdown_curve"] = [
+                {"time": p.get("time"), "equity": p.get("equity"),
+                 "peak": p.get("peak"), "drawdown_pct": p.get("drawdown_pct")}
+                for p in (report.get("out_of_sample") or {}).get("equity_curve") or []
+            ]
             return report
         result = bt.run(req.symbol, bars, htf_factor=req.htf_factor).to_dict()
         result["source"] = data.get("source")
@@ -326,6 +331,40 @@ def create_app() -> FastAPI:
     def engine_reconcile(req: EngineReconcileRequest) -> dict[str, Any]:
         engine = _engine(req.market)
         return engine.startup_sync(adopt_untracked=req.adopt, close_orphans=req.close_orphans)
+
+    @app.get("/api/metrics")
+    def live_metrics(market: Literal["crypto", "idx"] = "crypto", limit: int = Query(200, ge=2, le=2000)) -> dict[str, Any]:
+        """Equity + drawdown time series for the dashboard charts.
+
+        ``timestamps`` / ``equity`` / ``drawdown`` are parallel arrays (chart-friendly);
+        the same points are also grouped under ``series`` for callers that want the meta
+        fields. ``status: "empty"`` means the engine has never traded, never an error.
+        """
+        engine = _engine(market)
+        marks = {
+            symbol: float(scan["price"])
+            for symbol, scan in engine.last_scans.items()
+            if scan.get("price")
+        }
+        curve = engine._equity_curve(marks)[-limit:]
+        perf = engine.performance(marks)
+        return {
+            "status": "success" if len(curve) > 1 else "empty",
+            "market": market,
+            "timestamps": [p.get("ts") for p in curve],
+            "equity": [p["equity"] for p in curve],
+            "drawdown": [p.get("drawdown_pct", 0.0) for p in curve],
+            "peak": [p.get("peak") for p in curve],
+            "series": curve,
+            "performance": perf,
+            "starting_equity": perf["starting_equity"],
+            "updated_at": _iso_now(),
+        }
+
+    @app.get("/api/performance")
+    def performance(market: Literal["crypto", "idx"] = "crypto") -> dict[str, Any]:
+        """Profit factor, max drawdown, win rate and net profit of the live/paper book."""
+        return _engine(market).performance()
 
     @app.get("/api/engine/kill-switch")
     def engine_kill_switch(market: Literal["crypto", "idx"] = "crypto") -> dict[str, Any]:

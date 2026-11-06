@@ -195,7 +195,8 @@
       <div class="split">
         <div class="card">
           <div class="card-head"><h3>Out-of-sample equity</h3><span class="muted small" id="bt-meta"></span></div>
-          <canvas id="equity-chart" height="220"></canvas>
+          <canvas id="equity-chart" height="200"></canvas>
+          <canvas id="drawdown-chart" height="110" style="margin-top:8px"></canvas>
         </div>
         <div class="card">
           <div class="card-head"><h3>Why trades were skipped</h3></div>
@@ -234,6 +235,8 @@
 
       <div class="stat-strip" id="eng-stats"></div>
 
+      <div class="stat-strip" id="eng-perf"></div>
+
       <div class="card">
         <div class="card-head">
           <h3>Startup reconciliation</h3>
@@ -249,7 +252,11 @@
         </div>
         <div class="card">
           <div class="card-head"><h3>Equity</h3><span class="muted small" id="eng-equity-meta"></span></div>
-          <canvas id="live-equity" height="200"></canvas>
+          <canvas id="live-equity" height="170"></canvas>
+          <div class="card-head" style="margin-top:10px">
+            <h3>Drawdown</h3><span class="muted small" id="eng-dd-meta"></span>
+          </div>
+          <canvas id="live-drawdown" height="110"></canvas>
         </div>
       </div>
 

@@ -361,12 +361,25 @@ def cmd_backtest(args: argparse.Namespace, settings: Settings) -> int:
         ["profit factor", ins["profit_factor"], m["profit_factor"]],
         ["return %", ins["return_pct"], m["return_pct"]],
         ["max drawdown %", ins["max_drawdown_pct"], m["max_drawdown_pct"]],
+        ["max drawdown % (MTM)", ins.get("max_drawdown_pct_mtm"), m.get("max_drawdown_pct_mtm")],
         ["sharpe", ins["sharpe"], m["sharpe"]],
         ["partials (2R)", ins.get("partials", 0), m.get("partials", 0)],
         ["entry slippage bps", ins.get("avg_entry_slippage_bps"), m.get("avg_entry_slippage_bps")],
         ["gap-through stops", ins.get("gap_stops", 0), m.get("gap_stops", 0)],
     ]
     print(table(["METRIC", "IN-SAMPLE (used for selection)", "OUT-OF-SAMPLE (unseen)"], rows, ["l", "r", "r"]))
+    print()
+    print(bold("  LAPORAN KINERJA (out-of-sample)"))
+    pf = m.get("profit_factor")
+    dd = m.get("max_drawdown_pct") or 0.0
+    dd_mtm = m.get("max_drawdown_pct_mtm") or dd
+    print(f"   Total trade        {m['trades']:>10}      Profit factor   "
+          f"{'∞ (no losing trade)' if pf is None else f'{pf:.2f}'}")
+    print(f"   Win rate           {m['win_rate_pct']:>9.1f}%      Max drawdown    {dd:>6.2f}% "
+          f"(mark-to-market {dd_mtm:.2f}%)")
+    print(f"   Net profit         {m['return_pct']:>9.2f}%      Ending equity   "
+          f"{oos.get('ending_equity', 0):>10,.2f}")
+    print(f"   Expectancy         {m['expectancy_r']:>8.2f} R      Sharpe          {m.get('sharpe', 0):>6.2f}")
     costs = m.get("costs") or {}
     if costs:
         slip = costs.get("slippage_bps") or {}
@@ -381,6 +394,9 @@ def cmd_backtest(args: argparse.Namespace, settings: Settings) -> int:
         print(f"   gap guard refused {costs.get('gap_guards', 0)} entries · "
               f"{costs.get('partial_fills', 0)} partials banked "
               f"({costs.get('partial_pnl', 0):,.2f})")
+        print(f"   effective k_slip {costs.get('avg_k_slip') or 0:.4f} × ATR per fill · "
+              f"{costs.get('shock_fills', 0)} fill(s) in a shock regime · "
+              f"{costs.get('entries_cancelled', 0)} entry cancelled after a gap")
         print()
     if m["rejections"] or m["filters_blocked"]:
         print(bold("  WHY TRADES WERE SKIPPED (OOS)"))
@@ -485,6 +501,9 @@ def cmd_costs(args: argparse.Namespace, settings: Settings) -> int:
     print(f"  latency      {cfg.latency_ms:.0f} ms")
     print(f"  slippage     base {cfg.slippage_base_bps:.2f} bps + {cfg.atr_mult:.2f}×ATR% "
           f"+ {cfg.impact_coeff:.2f}×√participation, cap {cfg.max_slippage_bps:.0f} bps")
+    print(f"  k_slip       {cfg.atr_mult:.3f} × ATR normally, up to "
+          f"{cfg.atr_mult * cfg.shock_slippage_mult:.3f} in a shock "
+          f"(ATR ≥ {cfg.shock_atr_mult:.1f}× its 50-bar mean)")
     print(f"  gaps         reject at {cfg.gap_reject_atr:.1f} ATR or "
           f"{cfg.gap_reject_spread_mult:.1f}× spread; fill {cfg.gap_fill_fraction:.0%} of the gap")
     print(f"  risk scale   up to {cfg.max_risk_multiplier:.2f}× smaller size when stressed")

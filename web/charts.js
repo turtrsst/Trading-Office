@@ -221,6 +221,35 @@
     }
   }
 
+  /* ---------------------------------------------------------------- drawdown */
+  function drawdown(canvas, values) {
+    const { ctx, w, h } = setup(canvas);
+    const pad = { l: 8, t: 10, r: 58, b: 14 };
+    const plotH = h - pad.t - pad.b;
+    const nums = values.map((v) => Math.abs(Number(v) || 0));
+    if (!nums.length) return;
+    const maxV = Math.max(0.5, Math.max(...nums));
+    const y = (v) => pad.t + (Math.abs(v) / maxV) * plotH;
+    grid(ctx, w, h, pad, 0, maxV, 2);
+    const step = (w - pad.l - pad.r) / Math.max(1, values.length - 1);
+    const pts = nums.map((v, i) => [pad.l + step * i, y(v)]);
+    const grad = ctx.createLinearGradient(0, pad.t, 0, h - pad.b);
+    grad.addColorStop(0, "rgba(255,93,115,0.35)");
+    grad.addColorStop(1, "rgba(255,93,115,0.02)");
+    ctx.beginPath();
+    pts.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])));
+    ctx.lineTo(pts[pts.length - 1][0], pad.t);
+    ctx.lineTo(pts[0][0], pad.t);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+    path(ctx, pts, C.down, 1.4);
+    ctx.fillStyle = C.text;
+    ctx.font = "10px ui-monospace, monospace";
+    ctx.fillText(`-${maxV.toFixed(2)}%`, w - pad.r + 6, y(maxV) - 2);
+    ctx.fillText("0%", w - pad.r + 6, pad.t + 8);
+  }
+
   /* ---------------------------------------------------------------- bars (+/-) */
   function signedBars(canvas, values, labels) {
     const { ctx, w, h } = setup(canvas);
@@ -249,5 +278,5 @@
     });
   }
 
-  window.Charts = { candles, rsi, area, signedBars, fmt };
+  window.Charts = { candles, rsi, area, drawdown, signedBars, fmt };
 })();

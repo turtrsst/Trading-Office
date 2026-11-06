@@ -176,8 +176,14 @@ Fees are fixed; the *fill* is modelled (`trading_office/costs.py`):
 
 | market | fees | latency | slippage (`bps`) | cap | gap reject | cooldown |
 | --- | --- | --- | --- | --- | --- | --- |
-| crypto | 5.5 bps taker per side | 400 ms | `1.5 + 0.06 × ATR% + 1.5 × √participation%` | 45 bps | 2.0 ATR / 3× spread cap | 3 cycles |
-| IDX | 0.15 % buy, 0.25 % sell (incl. 0.1 % sales tax) | 900 ms | `2.0 + 0.05 × ATR% + 2.5 × √participation%` | 80 bps | 1.5 ATR / 2.5× spread cap | 2 sessions |
+| crypto | 5.5 bps taker per side | 400 ms | `1.5 + k_slip × ATR% + 1.5 × √participation%`, `k_slip` 0.06 → 0.18 | 45 bps | 2.0 ATR / 3× spread cap | 3 cycles |
+| IDX | 0.15 % buy, 0.25 % sell (incl. 0.1 % sales tax) | 900 ms | `2.0 + k_slip × ATR% + 2.5 × √participation%`, `k_slip` 0.05 → 0.125 | 80 bps | 1.5 ATR / 2.5× spread cap | 2 sessions |
+
+`k_slip` is the ATR fraction the fill is pushed against you (the price form of the same
+model: `fill = open ± k_slip × ATR`). It rises linearly from `atr_mult` to
+`atr_mult × shock_slippage_mult` as ATR stretches from 1× to `shock_atr_mult`× its own
+50-bar mean, so a flash-crash bar pays panic money while a merely volatile instrument does
+not.
 
 `participation % = notional / median(quote volume over 20 bars)`. The risk gate still
 refuses any target smaller than `3 ×` the round-trip cost, and the live engine defers an
@@ -189,6 +195,22 @@ python -m trading_office.cli costs --market idx --notional 50000000 --atr-pct 1.
 ```
 
 Adjust the model per market in `profiles.<market>.execution_costs` (`latency_ms`,
-`slippage_base_bps`, `atr_mult`, `impact_coeff`, `max_slippage_bps`, `gap_reject_atr`,
-`gap_reject_spread_mult`, `gap_fill_fraction`, `gap_cooldown_bars`,
-`max_risk_multiplier`, `auction_windows`).
+`slippage_base_bps`, `atr_mult` = k_slip, `impact_coeff`, `max_slippage_bps`,
+`shock_atr_mult`, `shock_slippage_mult`, `gap_reject_atr`, `gap_reject_spread_mult`,
+`gap_fill_fraction`, `gap_cooldown_bars`, `max_risk_multiplier`, `auction_windows`).
+
+## Live equity & drawdown dashboard
+
+`GET /api/metrics?market=crypto` returns parallel `timestamps` / `equity` / `drawdown`
+arrays (plus `series` with `peak` and `drawdown_pct`, and a `performance` block) built from
+the ledger — no separate history file to corrupt, and it survives a restart. The Live
+Engine tab polls it every 2 s and draws the equity area and the drawdown band with the
+repo's own canvas module (`web/charts.js`), so no CDN or internet access is needed:
+
+```sh
+curl -s 'localhost:8000/api/metrics?market=crypto' | jq '{status, performance}'
+curl -s 'localhost:8000/api/performance?market=idx'
+```
+
+Open positions contribute an unrealised mark to the last point; a flat book ends the curve
+at the last closed trade.

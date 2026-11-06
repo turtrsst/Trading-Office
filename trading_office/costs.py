@@ -9,8 +9,13 @@ volatility and of the size being pushed through the book:
 slippage_bps = base_bps  +  atr_mult * (ATR / price * 10_000)  +  impact_coeff * sqrt(participation %)
 ```
 
-* ``atr_mult`` makes a fill in a volatile SOL/XRP bar expensive and a fill in a quiet
-  large-cap cheap.
+* ``atr_mult`` is the **slippage coefficient in ATR units** (``k_slip``): a fill moves
+  ``atr_mult × ATR`` against you, which is the same number expressed in bps as
+  ``atr_mult × ATR/price × 10⁴``. ``k_slip = 0.06`` on a 96 400 BTC with ATR 700 is a
+  651-point worse fill (≈ 6.8 bps); the same coefficient in a quiet large-cap is cents.
+* the coefficient is not constant: while ATR is stretched against its own 50-bar mean
+  (``shock_atr_mult``, default 3×) it is scaled up to ``shock_slippage_mult`` (default 3×),
+  the panic regime of a flash crash or a scheduled macro release.
 * ``impact_coeff`` is a square-root market-impact law against the bar's quote volume, so a
   size that is 0.5 % of a bar costs more than a size that is 0.02 %.
 * ``latency_ms`` delays the fill: the fill price is the open plus the bar's own drift over
@@ -46,6 +51,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "gap_fill_fraction": 0.5,
         "gap_cooldown_bars": 3,
         "max_risk_multiplier": 1.75,
+        "shock_atr_mult": 3.0,
+        "shock_slippage_mult": 3.0,
         "auction_windows": [],
     },
     "idx": {
@@ -59,6 +66,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "gap_fill_fraction": 0.75,
         "gap_cooldown_bars": 2,
         "max_risk_multiplier": 1.5,
+        "shock_atr_mult": 3.0,
+        "shock_slippage_mult": 2.5,
         # IDX pre-opening / opening auction and the closing auction: fills are unreliable
         "auction_windows": [["08:45", "09:15"], ["15:45", "16:15"]],
     },
@@ -77,6 +86,10 @@ class CostConfig:
     gap_fill_fraction: float = 0.5
     gap_cooldown_bars: int = 3
     max_risk_multiplier: float = 1.75
+    #: ATR >= shock_atr_mult × ATR(50) = a shock bar; the slippage coefficient is then
+    #: multiplied by shock_slippage_mult (panic / flash-crash regime).
+    shock_atr_mult: float = 3.0
+    shock_slippage_mult: float = 3.0
     auction_windows: list[list[str]] = field(default_factory=list)
 
     @classmethod
@@ -156,6 +169,31 @@ def apply_latency(
 
 
 # --------------------------------------------------------------------------- slippage
+def slippage_coefficient(
+    *, atr: float, atr_baseline: float | None, cfg: CostConfig
+) -> tuple[float, float]:
+    """Effective ``k_slip`` and its stress ratio.
+
+    ``k_slip = atr_mult`` in a normal bar. When ATR is at least ``shock_atr_mult`` times
+    its own 50-bar mean, the book is in a shock: market makers widen, stops cascade, and
+    the same order pays ``shock_slippage_mult`` times more. The multiplier ramps linearly
+    between the two thresholds so there is no cliff, and is reported so a backtest can
+    explain *why* a fill was expensive.
+    """
+    base_k = float(cfg.atr_mult)
+    atr = float(atr or 0.0)
+    baseline = float(atr_baseline or 0.0)
+    if atr <= 0 or baseline <= 0:
+        return base_k, 0.0
+    stress = atr / baseline
+    threshold = max(1.0, float(cfg.shock_atr_mult))
+    if stress <= 1.0:
+        return base_k, stress
+    ramp = min(1.0, (stress - 1.0) / max(1e-9, threshold - 1.0))
+    k = base_k * (1.0 + (float(cfg.shock_slippage_mult) - 1.0) * ramp)
+    return round(k, 6), round(stress, 4)
+
+
 def estimate_slippage(
     *,
     price: float,
@@ -163,22 +201,28 @@ def estimate_slippage(
     notional: float,
     quote_volume: float | None,
     cfg: CostConfig,
+    atr_baseline: float | None = None,
 ) -> SlippageEstimate:
     """Volatility- and size-aware slippage in basis points (always ≥ 0)."""
     price = float(price)
+    atr_bps = (float(atr) / price * 10_000.0) if atr and atr > 0 else 0.0
+    k_slip, stress = slippage_coefficient(atr=atr, atr_baseline=atr_baseline, cfg=cfg)
     components: dict[str, float] = {"base": float(cfg.slippage_base_bps)}
     if price <= 0:
         return SlippageEstimate(price, 0.0, components)
 
-    atr_bps = (float(atr) / price * 10_000.0) if atr and atr > 0 else 0.0
-    components["volatility"] = cfg.atr_mult * atr_bps
+    components["volatility"] = k_slip * atr_bps
+    components["k_slip"] = round(k_slip, 6)
+    components["atr_stress"] = round(stress, 4)
 
     participation_pct = 0.0
     if quote_volume and quote_volume > 0 and notional > 0:
         participation_pct = notional / quote_volume * 100.0
     components["impact"] = cfg.impact_coeff * math.sqrt(max(0.0, participation_pct))
 
-    total = sum(components.values())
+    # only the *cost* components add up: k_slip / atr_stress are informational, and
+    # summing every dict value would silently add them to the bill (a real bug once)
+    total = components["base"] + components["volatility"] + components["impact"]
     capped = total > cfg.max_slippage_bps
     total = min(total, cfg.max_slippage_bps)
     components["total"] = total

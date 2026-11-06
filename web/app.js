@@ -8,6 +8,7 @@
     bandar: null,
     backtest: null,
     engine: null,
+    metrics: null,
     health: null,
     engineTimer: null,
   };
@@ -515,13 +516,19 @@
       stat("Expectancy", `${m.expectancy_r} R`, "per trade", m.expectancy_r > 0 ? "good" : "bad"),
       stat("Profit factor", m.profit_factor == null ? "∞" : m.profit_factor, "gross win / loss", (m.profit_factor || 0) > 1 ? "good" : "bad"),
       stat("Return", fmtPct(m.return_pct), "net of costs", m.return_pct >= 0 ? "good" : "bad"),
-      stat("Max drawdown", `${m.max_drawdown_pct}%`, "peak to trough", m.max_drawdown_pct > 10 ? "bad" : ""),
+      stat("Max drawdown", `${m.max_drawdown_pct ?? 0}%`,
+        `mark-to-market ${m.max_drawdown_pct_mtm ?? "—"}%`, (m.max_drawdown_pct || 0) > 10 ? "bad" : ""),
+      stat("Fills at the cap", m.costs?.slippage_capped ?? 0, "slippage truncated", ""),
       stat("In-sample", ins ? `${ins.trades} trades · ${ins.expectancy_r}R` : "—", "used for selection", ""),
     ].join("");
 
-    const curve = (oos.equity_curve || []).map((p) => p[1]);
+    // equity_curve points are {time, equity, peak, drawdown_pct}; older payloads were pairs
+    const curve = (oos.equity_curve || []).map((p) => (Array.isArray(p) ? p[1] : p.equity));
     if (curve.length > 1) {
       Charts.area($("#equity-chart"), curve, { baseline: curve[0], color: "#2ee6a8" });
+      const dds = (data.drawdown_curve || oos.equity_curve || [])
+        .map((p) => (Array.isArray(p) ? 0 : p.drawdown_pct || 0));
+      if (dds.length > 1) Charts.drawdown($("#drawdown-chart"), dds);
     }
     $("#bt-meta").textContent = `${data.symbol || ""} · ${oos.bars || 0} OOS bars · params ${JSON.stringify(data.chosen_params || {})}`;
 
@@ -573,15 +580,19 @@
 
   async function loadEngine() {
     try {
-      const data = await api(`/api/engine/status?market=${state.market}`);
+      const [data, metrics] = await Promise.all([
+        api(`/api/engine/status?market=${state.market}`),
+        api(`/api/metrics?market=${state.market}`).catch(() => null),
+      ]);
       state.engine = data;
-      renderEngine(data);
+      state.metrics = metrics;
+      renderEngine(data, metrics);
     } catch (err) {
       toast("Engine status failed: " + err.message, true);
     }
   }
 
-  function renderEngine(data) {
+  function renderEngine(data, metrics) {
     const st = data.status || {};
     const broker = data.broker || {};
     $("#eng-stats").innerHTML = [
@@ -613,9 +624,26 @@
           </div></div>`).join("")
       : `<div class="empty">No open positions.</div>`;
 
-    const curve = (data.equity_curve || []).map((p) => p.equity);
+    const series = (metrics && metrics.series) || data.equity_curve || [];
+    const curve = series.map((p) => p.equity);
+    const drawdowns = series.map((p) => p.drawdown_pct || 0);
     if (curve.length > 1) Charts.area($("#live-equity"), curve, { baseline: curve[0] });
-    $("#eng-equity-meta").textContent = `${curve.length} points · ${st.last_cycle_at ? new Date(st.last_cycle_at).toLocaleTimeString("id-ID") : "not started"}`;
+    if (drawdowns.length > 1) Charts.drawdown($("#live-drawdown"), drawdowns);
+    $("#eng-equity-meta").textContent =
+      `${curve.length} points · ${st.last_cycle_at ? new Date(st.last_cycle_at).toLocaleTimeString("id-ID") : "not started"}`;
+    const worst = Math.max(0, ...drawdowns);
+    $("#eng-dd-meta").textContent = `max ${worst.toFixed(2)}% · now ${(drawdowns[drawdowns.length - 1] || 0).toFixed(2)}%`;
+
+    const perf = (metrics && metrics.performance) || data.performance || {};
+    $("#eng-perf").innerHTML = [
+      stat("Profit factor", perf.profit_factor == null ? "—" : perf.profit_factor, "gross win / loss",
+        (perf.profit_factor || 0) >= 1.5 ? "good" : perf.profit_factor == null ? "" : "bad"),
+      stat("Win rate", `${perf.win_rate_pct ?? 0}%`, `${perf.trades ?? 0} closed trades`),
+      stat("Net profit", `${(perf.net_profit_pct ?? 0).toFixed(2)}%`, `equity ${fmtNum(perf.ending_equity)}`,
+        (perf.net_profit_pct || 0) >= 0 ? "good" : "bad"),
+      stat("Max drawdown", `${perf.max_drawdown_pct ?? 0}%`, "peak to trough (equity curve)",
+        (perf.max_drawdown_pct || 0) > 10 ? "bad" : ""),
+    ].join("");
 
     const ledger = (data.ledger || []).slice().reverse().slice(0, 60);
     $("#eng-ledger").innerHTML = ledger.length
@@ -775,7 +803,10 @@
   }
 
   setInterval(tickClock, 1000);
-  setInterval(() => { if (state.tab === "engine" && state.engine?.status?.running) loadEngine(); }, 8000);
+  // the engine tab polls the metrics endpoint every 2 s so equity/drawdown move live
+  setInterval(() => {
+    if (state.tab === "engine" && (state.engine?.status?.running || state.metrics)) loadEngine();
+  }, 2000);
   tickClock();
   bind();
   loadHealth().then(() => {

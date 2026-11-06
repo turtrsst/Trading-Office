@@ -102,6 +102,28 @@ def test_cost_model_endpoint_and_reconcile(client):
     assert status["costs"]["latency_ms"] == 400
 
 
+def test_metrics_endpoint_feeds_the_live_charts(client):
+    body = client.get("/api/metrics?market=crypto").json()
+    assert body["status"] in ("success", "empty")
+    assert len(body["timestamps"]) == len(body["equity"]) == len(body["drawdown"])
+    assert body["series"] and {"equity", "peak", "drawdown_pct"} <= set(body["series"][0])
+    assert "max_drawdown_pct" in body["performance"]
+    perf = client.get("/api/performance?market=crypto").json()
+    assert {"profit_factor", "max_drawdown_pct", "net_profit_pct"} <= set(perf)
+
+
+def test_backtest_payload_has_a_drawdown_curve(client):
+    body = client.post(
+        "/api/backtest", json={"market": "crypto", "symbol": "SOL/USDT:USDT", "oos": 0.3, "bars": 800}
+    ).json()
+    assert body["drawdown_curve"]
+    point = body["drawdown_curve"][-1]
+    assert {"time", "equity", "peak", "drawdown_pct"} <= set(point)
+    metrics = body["out_of_sample"]["metrics"]
+    assert metrics["max_drawdown_pct_mtm"] >= metrics["max_drawdown_pct"]
+    assert metrics["costs"]["avg_k_slip"] is not None
+
+
 def test_engine_cycle_is_idempotent_on_the_same_bar(client):
     first = client.post("/api/engine/cycle", json={"market": "idx", "symbols": ["BBCA"]}).json()
     second = client.post("/api/engine/cycle", json={"market": "idx", "symbols": ["BBCA"]}).json()

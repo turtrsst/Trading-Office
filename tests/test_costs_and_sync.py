@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest  # noqa: E402
 
-from trading_office import costs, risk  # noqa: E402
+from trading_office import costs, indicators as ind, risk  # noqa: E402
 from trading_office.config import Settings  # noqa: E402
 from trading_office.engine import TradingEngine  # noqa: E402
 from trading_office.execution import Order, PaperBroker  # noqa: E402
@@ -433,3 +433,126 @@ def test_kill_switch_counts_consecutive_losses(tmp_path, settings):
     assert guard["consecutive_losses"] >= 4
     assert guard["blocked"] is True
     assert any("consecutive losses" in r for r in guard["reasons"])
+
+
+# --------------------------------------------------------------------------- k_slip / shock
+def test_slippage_coefficient_is_atr_units_and_ramps_in_a_shock():
+    cfg = costs.CostConfig(atr_mult=0.06, shock_atr_mult=3.0, shock_slippage_mult=3.0)
+    calm_k, stress = costs.slippage_coefficient(atr=700, atr_baseline=700, cfg=cfg)
+    assert calm_k == pytest.approx(0.06) and stress == pytest.approx(1.0)
+    # 3x its own 50-bar mean ATR = a shock bar: the coefficient triples
+    shock_k, stress = costs.slippage_coefficient(atr=2100, atr_baseline=700, cfg=cfg)
+    assert shock_k == pytest.approx(0.18) and stress == pytest.approx(3.0)
+    # between the two it ramps (no cliff), never below the base coefficient
+    mid_k, _ = costs.slippage_coefficient(atr=1400, atr_baseline=700, cfg=cfg)
+    assert 0.06 < mid_k < 0.18
+    assert costs.slippage_coefficient(atr=0, atr_baseline=700, cfg=cfg)[0] == pytest.approx(0.06)
+
+
+def test_fill_offset_equals_k_slip_times_atr_in_price_terms():
+    """The ATR-fraction model (open ± k·ATR) is what the bps model computes."""
+    cfg = costs.CostConfig(slippage_base_bps=0.0, atr_mult=0.1, impact_coeff=0.0,
+                           max_slippage_bps=10_000, shock_atr_mult=100.0)
+    price, atr = 100.0, 2.0
+    est = costs.estimate_slippage(price=price, atr=atr, notional=0.0, quote_volume=None, cfg=cfg)
+    assert est.fill_price - price == pytest.approx(0.1 * atr, rel=1e-9)
+    short_fill = price - (est.fill_price - price)
+    assert short_fill == pytest.approx(price - 0.1 * atr)
+
+
+def test_shock_bar_pays_more_than_the_same_bar_in_a_quiet_tape():
+    cfg = costs.CostConfig()
+    quiet = costs.estimate_slippage(price=96_400.0, atr=700.0, notional=1500.0,
+                                    quote_volume=5e7, cfg=cfg, atr_baseline=700.0)
+    shock = costs.estimate_slippage(price=96_400.0, atr=2100.0, notional=1500.0,
+                                    quote_volume=5e7, cfg=cfg, atr_baseline=700.0)
+    assert shock.slippage_bps > quiet.slippage_bps
+    assert shock.components["k_slip"] > quiet.components["k_slip"]
+    assert shock.components["atr_stress"] >= 2.9
+
+
+def test_backtest_reports_the_effective_slippage_coefficient():
+    from trading_office.backtest import Backtester
+
+    settings = Settings.load()
+    bt = Backtester(market="crypto", settings=settings)
+    result = bt.run("SOL/USDT:USDT", demo.crypto_bars("SOL/USDT:USDT", "15m", 800))
+    report = result.metrics()["costs"]
+    if report["entries"]:
+        assert report["avg_k_slip"] and report["avg_k_slip"] > 0
+        assert "shock_fills" in report
+
+
+# --------------------------------------------------------------------------- metrics
+def test_backtest_metrics_include_drawdown_curve_and_mtm_drawdown():
+    from trading_office.backtest import Backtester
+
+    settings = Settings.load()
+    result = Backtester(market="crypto", settings=settings).run(
+        "SOL/USDT:USDT", demo.crypto_bars("SOL/USDT:USDT", "15m", 1200)
+    )
+    metrics = result.metrics()
+    payload = result.to_dict()
+    curve = payload["equity_curve"]
+    assert curve and {"time", "equity", "peak", "drawdown_pct"} <= set(curve[0])
+    assert metrics["max_drawdown_pct"] >= 0
+    # the mark-to-market drawdown counts open excursions, so it can only be worse
+    assert metrics["max_drawdown_pct_mtm"] >= metrics["max_drawdown_pct"]
+    assert metrics["avg_mae_r"] >= 0
+    if metrics["trades"]:
+        worst_curve = max(p["drawdown_pct"] for p in curve)
+        assert worst_curve >= metrics["max_drawdown_pct"] - 0.01
+
+
+def test_live_performance_matches_the_ledger(tmp_path, settings):
+    engine = TradingEngine(market="crypto", settings=settings, symbols=["TEST/USDT:USDT"],
+                           state_dir=tmp_path / "perf")
+    today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+    for pnl in (12.0, -4.0, 8.0):
+        _close_trade(engine, pnl, f"{today}T10:00:00+00:00")
+    perf = engine.performance()
+    assert perf["trades"] == 3
+    assert perf["gross_profit"] == pytest.approx(20.0)
+    assert perf["gross_loss"] == pytest.approx(4.0)
+    assert perf["profit_factor"] == pytest.approx(5.0)
+    assert perf["net_pnl"] == pytest.approx(16.0)
+    assert perf["net_profit_pct"] == pytest.approx(1.6, rel=0.01)
+    assert perf["max_drawdown_pct"] > 0  # the -4 after +12 is a real trough
+    curve = engine._equity_curve()
+    assert {"peak", "drawdown_pct"} <= set(curve[-1])
+
+
+def test_atr_baseline_is_a_rolling_mean_not_a_fixed_percentage(settings):
+    from trading_office.backtest import Backtester
+
+    bt = Backtester(market="crypto", settings=settings)
+    bars = demo.crypto_bars("BTC/USDT:USDT", "15m", 200)
+    baseline = bt._atr_baseline(bars)
+    assert baseline and baseline > 0
+    assert bt._atr_baseline(bars[:10]) is None  # too little history to call anything a shock
+
+    # double every bar's range: ATR and its own mean move together, so the *stress ratio*
+    # stays ~1 and the guard does not fire on a permanently volatile instrument
+    wide = [dict(b, high=(b["high"] + b["low"]) / 2 + (b["high"] - (b["high"] + b["low"]) / 2) * 2,
+                 low=(b["high"] + b["low"]) / 2 - ((b["high"] + b["low"]) / 2 - b["low"]) * 2)
+            for b in bars]
+    wide_baseline = bt._atr_baseline(wide)
+    ratio = wide_baseline / baseline
+    assert 1.8 < ratio < 2.2
+
+
+def test_a_flash_crash_bar_makes_the_fill_coefficient_climb(settings):
+    from trading_office.backtest import Backtester
+
+    bt = Backtester(market="crypto", settings=settings)
+    bars = [dict(b) for b in demo.crypto_bars("BTC/USDT:USDT", "15m", 300)]
+    crash = dict(bars[-1])
+    mid = crash["close"]
+    crash.update(open=mid * 0.97, high=mid * 1.06, low=mid * 0.90, close=mid * 0.93)
+    bars[-1] = crash
+    baseline = bt._atr_baseline(bars[:-1])
+    atr_now = ind.atr([b["high"] for b in bars], [b["low"] for b in bars],
+                      [b["close"] for b in bars], 14)[-1]
+    k, stress = costs.slippage_coefficient(atr=atr_now, atr_baseline=baseline, cfg=bt.cost_cfg)
+    assert stress > 1.5
+    assert k > bt.cost_cfg.atr_mult

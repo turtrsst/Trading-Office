@@ -137,12 +137,26 @@ class BacktestResult:
         r_multiples = [float(t["r_multiple"]) for t in self.trades]
         gross_win = sum(p for p in pnls if p > 0)
         gross_loss = -sum(p for p in pnls if p < 0)
+        # closed-trade view of the drawdown: every trade worst case is its exit P&L
         peak = self.starting_equity
         max_dd = 0.0
         for _ts, eq in self.equity_curve:
             peak = max(peak, eq)
             if peak > 0:
                 max_dd = max(max_dd, (peak - eq) / peak * 100.0)
+        # mark-to-market view: the worst *open* excursion counts too, which is what can
+        # actually stop a live account out (a paper DD that ignores it flatters the run)
+        peak = self.starting_equity
+        max_dd_mtm = max_dd
+        running = self.starting_equity
+        for trade in self.trades:
+            if trade.get("worst_equity") is not None:
+                running = float(trade["worst_equity"])
+                peak = max(peak, running)
+                max_dd_mtm = max(max_dd_mtm, (peak - running) / peak * 100.0 if peak > 0 else 0.0)
+            running += float(trade["pnl"])
+            peak = max(peak, running)
+            max_dd_mtm = max(max_dd_mtm, (peak - running) / peak * 100.0 if peak > 0 else 0.0)
         returns = []
         for i in range(1, len(self.equity_curve)):
             prev = self.equity_curve[i - 1][1]
@@ -168,6 +182,10 @@ class BacktestResult:
             "avg_win": round(gross_win / len(self.wins), 2) if self.wins else 0.0,
             "avg_loss": round(-gross_loss / len(self.losses), 2) if self.losses else 0.0,
             "max_drawdown_pct": round(max_dd, 2),
+            "max_drawdown_pct_mtm": round(max_dd_mtm, 2),
+            "avg_mae_r": round(
+                statistics.mean([float(t.get("mae_r") or 0.0) for t in self.trades]), 3
+            ) if self.trades else 0.0,
             "sharpe": round(sharpe, 2),
             "long_trades": sum(1 for t in self.trades if t["side"] == "long"),
             "short_trades": sum(1 for t in self.trades if t["side"] == "short"),
@@ -187,6 +205,21 @@ class BacktestResult:
             "costs": self.cost_report,
         }
 
+    def _curve_with_drawdown(self) -> list[dict[str, Any]]:
+        """``[time, equity]`` -> points carrying the running peak and drawdown %.
+
+        The engine's live charts and any UI reading this payload can then plot the
+        drawdown band without re-deriving it (and without disagreeing with the metrics).
+        """
+        peak = self.starting_equity
+        out: list[dict[str, Any]] = []
+        for ts, eq in self.equity_curve:
+            peak = max(peak, float(eq))
+            dd = ((peak - float(eq)) / peak * 100.0) if peak > 0 else 0.0
+            out.append({"time": ts, "equity": round(float(eq), 2),
+                        "peak": round(peak, 2), "drawdown_pct": round(dd, 3)})
+        return out
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "market": self.market,
@@ -199,7 +232,7 @@ class BacktestResult:
             "ending_equity": round(self.ending_equity, 2),
             "metrics": self.metrics(),
             "trades": self.trades,
-            "equity_curve": self.equity_curve,
+            "equity_curve": self._curve_with_drawdown(),
             "signals_by_bar": self.signals_by_bar,
             "cost_model": self.cost_report.get("model"),
         }
@@ -252,14 +285,41 @@ class Backtester:
         return sorted(recent)[len(recent) // 2]
 
     def _slippage(self, *, price: float, atr: float, notional: float,
-                  quote_volume: float | None) -> costs.SlippageEstimate:
+                  quote_volume: float | None,
+                  atr_baseline: float | None = None) -> costs.SlippageEstimate:
         estimate = costs.estimate_slippage(
-            price=price, atr=atr, notional=notional, quote_volume=quote_volume, cfg=self.cost_cfg
+            price=price, atr=atr, notional=notional, quote_volume=quote_volume,
+            cfg=self.cost_cfg, atr_baseline=atr_baseline,
         )
         self.cost_events.append(
             {"kind": "slippage", **estimate.to_dict(), "notional": round(notional, 2)}
         )
         return estimate
+
+    def _atr_baseline(self, closed: Sequence[dict[str, Any]]) -> float | None:
+        """Mean ATR over the last ``shock_baseline_bars`` bars — the shock reference.
+
+        Comparing today's ATR with a *rolling mean of the same series* (rather than a
+        fixed percentage) keeps the guard meaningful in both a quiet BTC tape and a
+        position with a permanently fat ATR.
+        """
+        window = int(getattr(self, "shock_baseline_bars", 50) or 50)
+        if len(closed) < 20:
+            return None
+        period = int(self.filter_cfg.get("atr_period", 14))
+        highs = [b["high"] for b in closed]
+        lows = [b["low"] for b in closed]
+        closes = [b["close"] for b in closed]
+        series = ind.atr(highs, lows, closes, period)
+        tail = [v for v in series[-window:] if v is not None]
+        if not tail:
+            return None
+        return float(statistics.mean(tail))
+
+    @staticmethod
+    def _open_pnl(position: Position, mark: float) -> float:
+        direction = 1.0 if position.side == "long" else -1.0
+        return (float(mark) - position.entry) * position.size * direction
 
     def _spread_bps(self, bar: dict[str, Any], tick: float | None) -> float:
         if tick and bar["close"]:
@@ -284,6 +344,17 @@ class Backtester:
             "slippage_capped": sum(
                 1 for e in self.cost_events if e.get("kind") == "slippage" and e.get("capped")
             ),
+            "shock_fills": sum(
+                1 for e in self.cost_events
+                if e.get("kind") == "slippage"
+                and float((e.get("components") or {}).get("atr_stress") or 0) >= 1.5
+            ),
+            "avg_k_slip": round(
+                statistics.mean(
+                    [float((e.get("components") or {}).get("k_slip") or 0.0)
+                     for e in self.cost_events if e.get("kind") == "slippage"]
+                ), 4,
+            ) if any(e.get("kind") == "slippage" for e in self.cost_events) else None,
             "latency_adverse_bps": costs.quantiles(latencies, (0.5, 0.9, 1.0)) if latencies else {},
             "latency_ms": self.cost_cfg.latency_ms,
             "gap_guards": len(gaps),
@@ -396,6 +467,7 @@ class Backtester:
                 slip_est = self._slippage(
                     price=fill_price, atr=float(pending.get("atr") or 0.0), notional=notional,
                     quote_volume=pending.get("quote_volume"),
+                    atr_baseline=pending.get("atr_baseline"),
                 )
                 direction = 1.0 if plan.side == "long" else -1.0
                 fill_price = fill_price * (1 + direction * (spread / 2 / 10_000.0))
@@ -473,6 +545,13 @@ class Backtester:
                         side=position.side, cfg=self.cost_cfg, atr=atr_now,
                     )
                     exit_reason = "stop loss (gap through)"
+
+                # worst open excursion (MAE): the mark-to-market drawdown a live account
+                # would have had to survive *before* this bar resolved
+                bar_worst = bar_low if long else bar_high
+                worst_px = float(position.meta.get("worst_px") or position.entry)
+                worst_px = min(worst_px, bar_worst) if long else max(worst_px, bar_worst)
+                position.meta["worst_px"] = worst_px
 
                 if exit_price is None:
                     actions = manage_position(
@@ -557,6 +636,11 @@ class Backtester:
                         "r_multiple": round((pnl + position.realised_pnl) / (rpu * initial_size), 3),
                         "reason": exit_reason,
                         "gap_risk": exit_reason == "stop loss (gap through)",
+                        "worst_equity": round(equity + self._open_pnl(position, worst_px), 2),
+                        "mae_r": round(
+                            ((position.entry - worst_px) if long else (worst_px - position.entry))
+                            / max(position.risk_per_unit, 1e-12), 3
+                        ),
                         "entry_reason": " | ".join(position.meta.get("reasons", [])),
                         "opened_at": position.opened_at,
                         "closed_at": str(bar["time"]),
@@ -669,6 +753,7 @@ class Backtester:
                 "reasons": sig.reasons_for(sig.action),
                 "tick": idx_tick_size(entry) if tick else None,
                 "atr": float(sig.atr or 0.0),
+                "atr_baseline": self._atr_baseline(closed),
                 "quote_volume": ctx.quote_volume,
             }
             result.equity_curve.append((str(bar["time"]) + "+signal", equity))

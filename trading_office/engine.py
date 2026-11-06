@@ -843,7 +843,8 @@ class TradingEngine:
             "last_scans": self.last_scans,
             "closed_trades": closed[-25:],
             "ledger": self.state.ledger(60),
-            "equity_curve": self._equity_curve(),
+            "equity_curve": self._equity_curve(marks),
+            "performance": self.performance(marks),
         }
 
     def broker_marks(self, marks: dict[str, float]) -> dict[str, float]:
@@ -851,8 +852,14 @@ class TradingEngine:
             return self.broker.unrealised(marks)
         return {}
 
-    def _equity_curve(self) -> list[dict[str, Any]]:
-        """Equity over time, rebuilt from the ledger (cheap and always consistent)."""
+    def _equity_curve(self, marks: dict[str, float] | None = None) -> list[dict[str, Any]]:
+        """Realised equity over time (rebuilt from the ledger) + a live mark.
+
+        Rebuilding from the ledger instead of appending to a separate history file means
+        the curve can never drift from the trades, and it survives a restart for free.
+        Every point carries its running peak and drawdown, so the UI does not need to
+        re-derive them (and cannot disagree with the metrics).
+        """
         points = []
         equity = float(self.settings.get("engine.equity_idr" if self.market == "idx" else "engine.equity_usdt", 0))
         points.append({"ts": None, "equity": equity})
@@ -860,7 +867,50 @@ class TradingEngine:
             if event.get("event") == "trade_closed":
                 equity += float(event.get("pnl", 0.0))
                 points.append({"ts": event.get("closed_at") or event.get("ts"), "equity": round(equity, 2)})
+        # live mark-to-market: open positions move the curve before they close
+        unrealised = 0.0
+        for symbol, position in self.positions.items():
+            mark = (marks or {}).get(symbol)
+            if mark:
+                direction = 1.0 if position.side == "long" else -1.0
+                unrealised += (float(mark) - position.entry) * position.size * direction
+        if self.positions and unrealised:
+            points.append({"ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+                           "equity": round(equity + unrealised, 2), "unrealised": round(unrealised, 2)})
+        peak = points[0]["equity"] if points else 0.0
+        for point in points:
+            peak = max(peak, float(point["equity"]))
+            point["peak"] = round(peak, 2)
+            point["drawdown_pct"] = round(((peak - float(point["equity"])) / peak * 100.0) if peak > 0 else 0.0, 3)
         return points[-200:]
+
+    def performance(self, marks: dict[str, float] | None = None) -> dict[str, Any]:
+        """Closed-trade performance + the drawdown of the equity curve, for the UI/API."""
+        curve = self._equity_curve(marks)
+        closed = self.state.closed_trades()
+        pnls = [float(t.get("pnl") or 0.0) for t in closed]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p < 0]
+        gross_win = sum(wins)
+        gross_loss = -sum(losses)
+        start = curve[0]["equity"] if curve else 0.0
+        end = curve[-1]["equity"] if curve else start
+        max_dd = max((float(p.get("drawdown_pct") or 0.0) for p in curve), default=0.0)
+        return {
+            "market": self.market,
+            "trades": len(pnls),
+            "win_rate_pct": round(len(wins) / len(pnls) * 100.0, 2) if pnls else 0.0,
+            "profit_factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else None,
+            "gross_profit": round(gross_win, 2),
+            "gross_loss": round(gross_loss, 2),
+            "net_pnl": round(sum(pnls), 2),
+            "net_profit_pct": round(((end - start) / start * 100.0) if start else 0.0, 2),
+            "starting_equity": round(start, 2),
+            "ending_equity": round(end, 2),
+            "max_drawdown_pct": round(max_dd, 3),
+            "current_drawdown_pct": round(float(curve[-1].get("drawdown_pct") or 0.0), 3) if curve else 0.0,
+            "points": len(curve),
+        }
 
     # ------------------------------------------------------------------ events
     def _emit(self, event: dict[str, Any]) -> None:

@@ -95,6 +95,11 @@ Closed candles and indicator series aligned 1:1 with `bars` (`ema50`, `ema200`, 
 
 ## Backtest
 
+`POST /api/backtest` also returns `drawdown_curve` (the OOS `equity_curve` with `peak` and
+`drawdown_pct` per point) and, in `out_of_sample.metrics`, `max_drawdown_pct` (closed
+trades) next to `max_drawdown_pct_mtm` (worst open excursion), `avg_mae_r`, `profit_factor`
+(`null` = no losing trade), `partials`, `gap_stops` and the `costs` block.
+
 ### `POST /api/backtest`
 
 ```json
@@ -130,6 +135,8 @@ With `oos = 0` it returns a single `BacktestResult` (`metrics`, `trades`,
 | `POST /api/engine/close-all` | `{"market":"crypto"}` | flatten everything |
 | `POST /api/engine/reconcile` | `{"market":"crypto","adopt":false,"close_orphans":false}` | compare `state/positions.json` with the exchange (the boot-time `startup_sync()`) |
 | `GET /api/cost-model?market=crypto` | — | the fill model: latency, slippage coefficients/caps, gap thresholds, auction windows, partial-TP defaults |
+| `GET /api/metrics?market=crypto&limit=200` | — | `status`, parallel `timestamps`/`equity`/`drawdown`, `series[{ts,equity,peak,drawdown_pct}]`, `performance` |
+| `GET /api/performance?market=crypto` | — | profit factor, max drawdown, win rate, net profit % of the live/paper book |
 | `GET /api/engine/kill-switch?market=crypto` | — | daily-loss and consecutive-loss breaker state (`blocked`, `reasons`, `day_pnl`) |
 | `POST /api/engine/resume` | `{"market":"crypto"}` | human override of the breaker for the current day (ledgered) |
 | `GET /api/ledger?market=crypto&limit=120` | — | raw audit trail |

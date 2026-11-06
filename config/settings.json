@@ -125,7 +125,9 @@
         "gap_fill_fraction": 0.5,
         "gap_cooldown_bars": 3,
         "max_risk_multiplier": 1.75,
-        "auction_windows": []
+        "auction_windows": [],
+        "shock_atr_mult": 3.0,
+        "shock_slippage_mult": 3.0
       },
       "leverage": 3,
       "atr_soft_cap_pct": 2.5,
@@ -186,7 +188,9 @@
             "15:45",
             "16:15"
           ]
-        ]
+        ],
+        "shock_atr_mult": 3.0,
+        "shock_slippage_mult": 2.5
       },
       "leverage": 1,
       "atr_soft_cap_pct": 4.0,

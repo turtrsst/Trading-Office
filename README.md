@@ -128,8 +128,10 @@ exchange-side brackets for live crypto orders.
 ### 5 · Costs, gaps and restarts
 
 - Fills are never free or instant: the backtest *and* the live engine apply the same
-  model — `latency (400 ms crypto / 900 ms IDX)` + `base + 0.06 × ATR% + impact × √participation`
-  slippage, capped per market (`45` / `80` bps).
+  model — `latency (400 ms crypto / 900 ms IDX)` + `base + k_slip × ATR% + impact × √participation`
+  slippage, capped per market (`45` / `80` bps). `k_slip` **is** the ATR fraction the fill
+  moves against you (`fill = open ± k_slip × ATR`), and it triples on a shock bar (ATR ≥ 3×
+  its own 50-bar mean) so a flash crash costs panic money instead of the calm-tape rate.
 - Gate 1 refuses entries after a gap of `2.0 ATR` (crypto) / `1.5 ATR` (IDX), or when the
   spread blows past `3×` its cap, and blocks the symbol for a cooldown; a stop that is
   gapped through fills *worse* than the stop, and that loss shows up in the results.
@@ -170,8 +172,10 @@ exchange-side brackets for live crypto orders.
 
 ### Terminal, API, agents
 - **Web terminal** (`web/`) — screening table, one-symbol deep dive with candles/RSI/EMA
-  chart, gate cards, trade plan, bandarmology tab, walk-forward backtest tab, live engine
-  monitor with audit ledger, and a CLI/MCP reference tab.
+  chart, gate cards, trade plan, bandarmology tab, walk-forward backtest tab (equity +
+  drawdown), live engine monitor with **real-time equity and drawdown charts polled every
+  2 s** from `/api/metrics`, audit ledger, and a CLI/MCP reference tab. Charting is the
+  repo's own canvas module — no CDN, works offline and behind the preview proxy.
 - **CLI** — `screen`, `analyse`, `bandar`, `broker`, `foreign`, `ownership`, `actions`,
   `crypto`, `backtest`, `engine`, `costs`, `reconcile`, `serve`, `doctor`; every command
   takes `--json`.
@@ -203,7 +207,8 @@ Honesty rules in `trading_office/backtest/`:
 - the OOS report is generated on a slice that never influenced parameter selection, and
   indicators are warmed on the full series so the slice is not handicapped.
 
-Results are reported as trades, win rate, expectancy in R, profit factor, max drawdown,
+Results are reported as trades, win rate, expectancy in R, profit factor, **two drawdowns**
+(closed-trade peak-to-trough and mark-to-market, which counts the worst open excursion),
 Sharpe, partials taken, gap-through stops, and a **funnel of why trades were skipped**
 (which filter, which signal rule). A cost block reports realised slippage p50/p90/worst,
 the delay cost of the latency model, how many fills hit the slippage cap, and the pnl
@@ -234,7 +239,7 @@ trading_office/
   backtest/engine.py          bar-by-bar backtester + walk-forward
   cli.py                      terminal
 web/                          the web terminal (no build step, no frameworks)
-tests/                        72 unit + API tests, all offline
+tests/                        82 unit + API tests, all offline
 docs/                         strategy logic, API, MCP, operations
 scripts/make_demo_data.py     writes data/*.json for the backtester
 ```
@@ -243,7 +248,7 @@ scripts/make_demo_data.py     writes data/*.json for the backtester
 
 ```sh
 pip install pytest httpx
-python -m pytest -q           # 72 passed, entirely offline
+python -m pytest -q           # 82 passed, entirely offline
 ```
 
 The suite covers indicator maths, each filter's pass/block path, the no-trigger veto, the

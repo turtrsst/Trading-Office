@@ -291,15 +291,37 @@ and its break-even move are emitted together):
   open** (no look-ahead), and emits trades with R-multiples. It reports win rate,
   expectancy, profit factor, max drawdown, Sharpe, exposure, partials, gap-stops and the
   per-filter rejection counts (why trades were skipped).
+- **Two drawdowns, on purpose.** `max_drawdown_pct` walks the closed-trade equity curve
+  (peak to trough of the realised book). `max_drawdown_pct_mtm` counts the worst *open*
+  excursion of every trade (its MAE, `avg_mae_r`): that is the number a live account has
+  to survive, and it is always ≥ the realised one. A backtest that reports only the
+  first is flattering itself.
+- **Profit factor** = gross win ÷ gross loss; `null` means "no losing trade in the slice",
+  which is a sample-size warning, not an infinite edge. Every `equity_curve` point carries
+  `{time, equity, peak, drawdown_pct}` so a chart and the metrics cannot disagree.
 - **Fill model** (identical to the live engine, `trading_office/costs.py`):
 
   ```
   latency_drift   = (open − signal_close) / close × (latency_ms / bar_ms)
   fill            = open × (1 + latency_drift)
-  slippage_bps    = base + atr_mult × (ATR/price × 10⁴) + impact_coeff × √(participation %)
+  k_slip          = atr_mult × (1 + (shock_slippage_mult − 1) × ramp)
+  slippage_bps    = base + k_slip × (ATR/price × 10⁴) + impact_coeff × √(participation %)
                     capped at max_slippage_bps
   participation % = notional / median(quote volume, 20 bars)
   ```
+
+  **`k_slip` is the slippage coefficient in ATR units.** The price offset is literally
+  `fill = open ± k_slip × ATR` (long buys above the open, short sells below it) — the bps
+  form is the same number after dividing by the price. `atr_mult = 0.06` means "a fill
+  pays 6 % of one ATR"; a 96 400 BTC with ATR 700 pays 42 points (≈ 4.4 bps) on top of the
+  base, and a quiet large-cap pays cents.
+
+  **Shock regime (black swan).** `ramp = clamp((ATR/ATR₅₀ − 1)/(shock_atr_mult − 1), 0, 1)`
+  with `shock_atr_mult = 3`: once the current ATR is three times its own 50-bar mean — a
+  flash crash, a liquidation cascade, a macro release — the coefficient multiplies up to
+  `shock_slippage_mult` (3× crypto, 2.5× IDX) and the cap becomes the binding constraint.
+  Comparing ATR with *its own rolling mean* (not a fixed percentage) keeps the guard from
+  firing on an instrument that is simply always volatile.
 
   Crypto: 400 ms latency, 1.5 bps base, 0.06 × ATR%, 1.5 × √impact, 45 bps cap.
   IDX: 900 ms, 2 bps, 0.05, 2.5, 80 bps. Every fill emits a `cost_event`, which the
@@ -308,6 +330,8 @@ and its break-even move are emitted together):
   | Key | Meaning |
   | --- | --- |
   | `slippage_bps.p50 / p90 / p100` | realised slippage distribution |
+  | `avg_k_slip`, `shock_fills` | the effective ATR coefficient, and how many fills happened in a shock regime |
+  | `entries_cancelled` | entries refused because the fill bar had already gapped through the stop |
   | `slippage_capped` | fills that hit `max_slippage_bps` (a size warning) |
   | `latency_adverse_bps` | how much the 400/900 ms delay moved fills against us |
   | `gap_guards`, `gap_examples` | entries refused by the gap/spread guard |
