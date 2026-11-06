@@ -173,9 +173,10 @@ exchange-side brackets for live crypto orders.
   chart, gate cards, trade plan, bandarmology tab, walk-forward backtest tab, live engine
   monitor with audit ledger, and a CLI/MCP reference tab.
 - **CLI** — `screen`, `analyse`, `bandar`, `broker`, `foreign`, `ownership`, `actions`,
-  `crypto`, `backtest`, `engine`, `serve`, `doctor`; every command takes `--json`.
+  `crypto`, `backtest`, `engine`, `costs`, `reconcile`, `serve`, `doctor`; every command
+  takes `--json`.
 - **REST** — documented in [docs/API.md](docs/API.md).
-- **MCP server** — 10 tools over stdio or streamable HTTP, same JSON as REST:
+- **MCP server** — 12 tools over stdio or streamable HTTP, same JSON as REST:
   [docs/MCP.md](docs/MCP.md).
 
 ---

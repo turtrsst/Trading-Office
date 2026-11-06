@@ -52,6 +52,8 @@ do not speak MCP.
 | `run_backtest` | `market`, `symbol`, `oos`, `bars` | walk-forward: `chosen_params`, `in_sample`, `out_of_sample` |
 | `market_overview` | `market` | IHSG indices + breadth, or crypto tickers + spreads |
 | `candles` | `market`, `symbol`, `limit` | closed OHLCV + EMA/RSI/MACD/BB/ATR series |
+| `execution_costs` | `market` | latency, slippage coefficients/caps, gap thresholds, auction windows, partial-TP defaults |
+| `reconcile_state` | `market`, `adopt`, `close_orphans` | `startup_sync()`: restored / adopted / closed / untracked / blocked / missing stops |
 | `idx_bandarmology` | `symbol`, `period` (`1d`\|`1w`\|`1m`\|`3m`) | accumulation/distribution signal, phase, top-5 net %, bandar P/L |
 | `idx_broker_summary` | `symbol`, `date` | top buyers/sellers with broker codes, lots, value |
 | `idx_foreign_flow` | `symbol`, `days` | per-session foreign net, totals, streak |
