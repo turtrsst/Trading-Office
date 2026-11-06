@@ -54,6 +54,7 @@ IDX = SCREENER.idx
 CRYPTO = SCREENER.crypto
 
 _ENGINES: dict[str, TradingEngine] = {}
+_TELEGRAM: Any = None
 _ENGINE_LOCK = threading.RLock()
 #: set by tests / a hot reconfiguration; takes precedence over the file-backed SETTINGS
 _SETTINGS_OVERRIDE: Settings | None = None
@@ -145,6 +146,18 @@ class EngineRequest(BaseModel):
     symbols: list[str] | None = None
 
 
+class ApprovalDecisionRequest(BaseModel):
+    market: Literal["crypto", "idx"] = "crypto"
+    request_id: str
+    by: str = "browser"
+
+
+class ArmLiveRequest(BaseModel):
+    market: Literal["crypto", "idx"] = "crypto"
+    confirm: bool = False           # must be true; an accidental POST must not arm trading
+    by: str = "operator"
+
+
 class ClosePositionRequest(BaseModel):
     market: Literal["crypto", "idx"] = "crypto"
     symbol: str
@@ -164,6 +177,53 @@ class EngineReconcileRequest(BaseModel):
 
 # --------------------------------------------------------------------------- lifecycle
 from contextlib import asynccontextmanager
+
+
+def _telegram_control() -> Any:
+    """The control bot (approve/reject/panic from a phone), built once per process."""
+    global _TELEGRAM
+    with _ENGINE_LOCK:
+        if _TELEGRAM is None:
+            from ..env import get
+            from ..telegram_bot import TelegramControl
+
+            alerts = SETTINGS.get("alerts", {}) or {}
+            telegram = alerts.get("telegram", {}) or {}
+            token = get(str(telegram.get("token_env") or "TO_TELEGRAM_TOKEN"))
+            _TELEGRAM = TelegramControl(
+                token=token,
+                owner_chat_id=str(telegram.get("chat_id") or ""),
+                market=str(SETTINGS.get("autonomy.control_market", "crypto")),
+                engine_for=lambda market: _engine(market),
+            )
+            # every engine event flows through here: the bot only sends the interesting ones
+            for market in ("crypto", "idx"):
+                try:
+                    _attach_telegram(_engine(market))
+                except Exception:
+                    continue
+        return _TELEGRAM
+
+
+def _attach_telegram(engine: TradingEngine) -> None:
+    """Route approval events to the chat without taking over ``on_event``."""
+    bot = _TELEGRAM
+    if bot is None or engine is None:
+        return
+
+    def listener(event: dict[str, Any]) -> None:
+        if not bot.configured:
+            return
+        try:
+            name = event.get("event")
+            if name == "approval_requested" and event.get("request"):
+                bot.notify_request(event["request"])
+            elif name in ("guard_set", "watchdog_trip", "engine_error"):
+                bot.send(f"⚠️ <b>{name}</b> · {str(event)[:400]}")
+        except Exception:  # a chat failure must never reach the trading loop
+            pass
+
+    engine.on_event = listener
 
 
 @asynccontextmanager
@@ -195,9 +255,18 @@ async def _lifespan(_app: FastAPI):
                 started.append(str(market))
             except Exception as exc:  # noqa: BLE001 - never block the API from starting
                 print(f"[engine] could not autostart {market}: {exc}")
+    bot = None
+    if SETTINGS.get("alerts.telegram.chat_id"):
+        try:
+            bot = _telegram_control()
+            bot.start_background()
+        except Exception as exc:  # noqa: BLE001 - a chat outage must not stop trading
+            print(f"[telegram] control disabled: {exc}")
     try:
         yield
     finally:
+        if bot is not None:
+            bot.stop()
         for market, engine in list(_ENGINES.items()):
             try:
                 engine.stop()
@@ -249,6 +318,63 @@ def create_app() -> FastAPI:
             "state_encryption": secure_state.status(),
             "alerts": _alerts_summary(),
         }
+
+    @app.get("/api/telegram")
+    def telegram_status() -> dict[str, Any]:
+        bot = _TELEGRAM
+        if bot is None:
+            return {"configured": False, "running": False,
+                    "reason": "no alerts.telegram.chat_id configured"}
+        status = bot.status()
+        status["audit"] = bot.audit[-5:]
+        return status
+
+    @app.get("/api/approvals")
+    def approvals(market: Literal["crypto", "idx"] = "crypto", status: str = "pending") -> dict[str, Any]:
+        engine = _engine(market)
+        return {
+            "market": market,
+            "mode": engine.settings.get("autonomy.mode", "ask"),
+            "approval_required": engine.approval_required(),
+            "entries_gate": engine.execution_gate()["entries"],
+            "requests": engine.state.approvals(status=None if status == "all" else status),
+        }
+
+    @app.post("/api/approvals/approve")
+    def approve(req: ApprovalDecisionRequest) -> dict[str, Any]:
+        return _engine(req.market).execute_approved(req.request_id, by=req.by)
+
+    @app.post("/api/approvals/reject")
+    def reject(req: ApprovalDecisionRequest) -> dict[str, Any]:
+        ok = _engine(req.market).reject_approval(req.request_id, by=req.by, reason="browser")
+        return {"ok": ok}
+
+    @app.post("/api/autonomy/arm")
+    def arm_live(req: ArmLiveRequest) -> dict[str, Any]:
+        """Arm unattended live entries. Bound to the gate fingerprint (see autonomy.py)."""
+        from ..autonomy import execution_gate_fingerprint, execution_gate_limits
+
+        if not req.confirm:
+            return {"ok": False, "reason": "confirm must be true (this authorises live orders)"}
+        engine = _engine(req.market)
+        grant = {
+            "armed": True,
+            "fingerprint": execution_gate_fingerprint(),
+            "limits": execution_gate_limits(engine.settings),
+            "armed_by": req.by,
+            "armed_at": _iso_now(),
+        }
+        engine.state.set_setting("live_entry_grant", grant)
+        engine.state.append_ledger({"event": "live_armed", "market": req.market, **grant})
+        return {"ok": True, "grant": grant, "entries": engine.execution_gate()["entries"]}
+
+    @app.post("/api/autonomy/disarm")
+    def disarm_live(req: ArmLiveRequest) -> dict[str, Any]:
+        engine = _engine(req.market)
+        engine.state.set_setting("live_entry_grant", {"armed": False, "disarmed_at": _iso_now()})
+        engine.state.append_ledger({"event": "live_disarmed", "market": req.market,
+                                    "by": req.by})
+        return {"ok": True, "entries": engine.execution_gate()["entries"]}
 
     @app.get("/api/alerts")
     def alerts_status() -> dict[str, Any]:

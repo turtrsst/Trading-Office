@@ -33,6 +33,39 @@ from.
 The MCP tool catalog as plain JSON (name, description, parameters) plus copy-paste
 registration snippets — for agents that cannot speak MCP.
 
+## Autonomy & approvals
+
+An unattended entry only reaches a live venue through these endpoints. Paper always fills
+immediately; everything here is about *live* money.
+
+| Endpoint | Body | What happens |
+| --- | --- | --- |
+| `GET /api/approvals?market=crypto&status=pending` | — | the queue: `mode`, `approval_required`, `entries_gate`, `requests[]` |
+| `POST /api/approvals/approve` | `{"market","request_id","by"}` | re-prices at the current book, sends the order once, then the id is dead |
+| `POST /api/approvals/reject` | `{"market","request_id","by"}` | closes the request, sends nothing |
+| `POST /api/autonomy/arm` | `{"market","confirm":true,"by"}` | authorises unattended live entries; `confirm` must be `true` |
+| `POST /api/autonomy/disarm` | `{"market","by"}` | revokes immediately |
+| `GET /api/telegram` | — | control-bot status: owner set, poll offset, stats, last 5 audited actions |
+
+`entries_gate` is the same object `execution_gate.entries` carries everywhere:
+
+```json
+{"allowed": false, "gate": "armed", "fingerprint": "2170fde3112ffdf4",
+ "limits": {"max_daily_loss_pct": 2.0, "max_consecutive_losses": 4.0, "max_open_positions": 4.0},
+ "reason": "live entries are not armed (trading-office arm-live --yes)"}
+```
+
+| `gate` | Meaning |
+| --- | --- |
+| `paper` | simulated venue: always allowed, no approval needed |
+| `armed` | live + a matching grant: allowed (mode `auto`) |
+| `fingerprint` / `limits` | the gate code or a risk limit changed since arming → re-arm |
+| `approved` | this specific entry was approved by a human (id recorded in the bar lock) |
+
+An approval is **not** a licence to pay any price: the entry is re-priced and the engine's
+cost check still runs, so a market that moved away is refused (`{"ok": false, "reason": …}`)
+instead of chased.
+
 ## Market overview
 
 ### `GET /api/market/idx?refresh=false`

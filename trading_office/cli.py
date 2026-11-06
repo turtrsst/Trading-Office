@@ -19,8 +19,10 @@ API), so a shell pipeline and an agent see identical data.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import sys
+from pathlib import Path
 from typing import Any, Sequence
 
 from .config import Settings
@@ -477,6 +479,135 @@ def cmd_doctor(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def cmd_digest(args: argparse.Namespace, settings: Settings) -> int:
+    """One screen an operator can read in 20 seconds: risk, book, guard, what was skipped.
+
+    Designed to be run by cron once a session closes: an autonomous bot that nobody reads
+    is indistinguishable from one that stopped working three days ago.
+    """
+    from .alerts import Alerter
+
+    engine = _engine_for_cli(args.market, settings)
+    guard = engine.guard_state()
+    perf = engine.performance()
+    beat = engine.heartbeat()
+    rows = engine.active_trades()
+    skips = [e for e in engine.state.ledger(400) if e.get("event") == "skip"]
+    from collections import Counter
+
+    reasons = Counter(str(e.get("reason", "")).split(":")[0] for e in skips).most_common(4)
+    lines = [
+        f"<b>Trading Office · {args.market} · digest</b>",
+        f"mode {engine.mode} · equity {perf.get('ending_equity', 0):,.2f} · "
+        f"net {perf.get('net_profit_pct', 0):+.2f}%",
+        f"guard {'OPEN' if guard['blocked'] else 'armed'} · day {guard['daily_loss_pct']}% · "
+        f"streak {guard['consecutive_losses']}",
+        f"heartbeat {'ok' if beat['ok'] else 'STALLED'} · cycles {engine.status.cycle_count} · "
+        f"orders {engine.status.orders}",
+        f"open positions {len(rows)}",
+    ]
+    for row in rows[:6]:
+        lines.append(f"  {row['symbol']} {row['side']} {row['size']} @ {row['entry']} "
+                     f"stop {row['stop']} · {row['r_multiple']:+.2f}R")
+    if reasons:
+        lines.append("skipped: " + ", ".join(f"{k or 'other'} ×{v}" for k, v in reasons))
+    pending = engine.state.approvals(status="pending")
+    if pending:
+        lines.append(f"⚠️ {len(pending)} approval(s) waiting")
+    text = "\n".join(lines)
+    print(text.replace("<b>", "").replace("</b>", ""))
+    if args.send:
+        alerter = Alerter.from_settings(settings, args.market)
+        if not alerter.configured:
+            print(f"  {amber('not sent')} alert channel not configured "
+                  f"(TO_TELEGRAM_TOKEN + alerts.telegram.chat_id)")
+            return 1
+        outcome = alerter.deliver(text)
+        print(f"  {green('sent') if outcome.get('ok') else red('failed')} via {alerter.channel}")
+        return 0 if outcome.get("ok") else 1
+    return 0
+
+
+def cmd_arm_live(args: argparse.Namespace, settings: Settings) -> int:
+    """Arm unattended live entries. Refuses without --yes and prints exactly what it covers."""
+    from .autonomy import execution_gate_fingerprint, execution_gate_limits
+    from .state import StateStore
+
+    engine = _engine_for_cli(args.market, settings)
+    limits = execution_gate_limits(settings)
+    fingerprint = execution_gate_fingerprint()
+    if not args.yes:
+        print(f"  {amber('not armed')} this authorises real orders on {args.market}.")
+        print(dim("  It would grant:"))
+        for name, value in limits.items():
+            print(dim(f"    {name:<24} {value}"))
+        print(dim(f"  Gate fingerprint {fingerprint} (changes if the gate or these limits change)."))
+        print(dim(f"  Re-run with --yes to arm: trading-office arm-live --market {args.market} --yes"))
+        return 1
+    grant = {"armed": True, "fingerprint": fingerprint, "limits": limits,
+             "armed_by": args.by, "armed_at": dt.datetime.now(dt.timezone.utc).isoformat()}
+    engine.state.set_setting("live_entry_grant", grant)
+    engine.state.append_ledger({"event": "live_armed", "market": args.market, **grant})
+    gate = engine.execution_gate()["entries"]
+    print(f"  {green('armed')} {args.market} · gate {gate['gate']} · {gate['reason']}")
+    print(dim(f"  autonomy.mode = {settings.get('autonomy.mode', 'ask')} "
+              f"(ask = every entry still waits for a human)"))
+    return 0
+
+
+def cmd_disarm_live(args: argparse.Namespace, settings: Settings) -> int:
+    engine = _engine_for_cli(args.market, settings)
+    engine.state.set_setting("live_entry_grant", {"armed": False,
+                                                  "disarmed_at": dt.datetime.now(dt.timezone.utc).isoformat()})
+    engine.state.append_ledger({"event": "live_disarmed", "market": args.market, "by": "cli"})
+    print(f"  {amber('disarmed')} {args.market} — live entries are refused until re-armed")
+    return 0
+
+
+def _engine_for_cli(market: str, settings: Settings):
+    from .engine import TradingEngine
+
+    return TradingEngine(market=market, settings=settings,
+                         execute=not bool(settings.get("execution.dry_run", True)),
+                         state_dir=settings.get("engine.state_dir", "state"))
+
+
+def cmd_approvals(args: argparse.Namespace, settings: Settings) -> int:
+    from .state import StateStore
+
+    store = StateStore(Path(settings.get("engine.state_dir", "state")) / args.market)
+    if args.action == "list":
+        rows = store.approvals(status="pending")
+        if args.json:
+            print(json.dumps(rows, indent=2, default=str))
+            return 0
+        if not rows:
+            print(dim("  no pending approvals"))
+            return 0
+        print()
+        print(table(["ID", "SYMBOL", "SIDE", "ENTRY", "STOP", "TARGET", "SIZE", "EXPIRES"],
+                    [[r["id"], r["symbol"], r["side"], r["plan"].get("entry"),
+                      r["plan"].get("stop"), r["plan"].get("target"), r["plan"].get("size"),
+                      str(r.get("expires_at"))[11:19]] for r in rows],
+                    ["l", "l", "l", "r", "r", "r", "r", "l"]))
+        print()
+        print(dim(f"  approve: trading-office approvals approve <ID> --market {args.market}"))
+        return 0
+    if not args.request_id:
+        print(f"  {red('error')} request id required", file=sys.stderr)
+        return 2
+    if args.action == "reject":
+        ok = store.resolve_approval(args.request_id, "rejected", by=args.by, reason="cli")
+        print(green("rejected") if ok else amber("already decided"))
+        return 0 if ok else 1
+    # approve: execute through the engine so the gates and the bar lock still apply
+    engine = _engine_for_cli(args.market, settings)
+    result = engine.execute_approved(args.request_id, by=args.by)
+    print(json.dumps(result, indent=2, default=str) if args.json else
+          (green("approved and sent") if result.get("ok") else red(f"refused: {result.get('reason')}")))
+    return 0 if result.get("ok") else 1
+
+
 def cmd_supervise(args: argparse.Namespace, settings: Settings) -> int:
     """Keep the API + engine loop alive, and restart it when the loop stops cycling."""
     from .supervisor import Supervisor, SupervisorConfig, configure_logging, serve_command
@@ -690,6 +821,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("digest", help="send (or print) a daily status digest — cron-friendly")
+    p.add_argument("--market", choices=["idx", "crypto"], default="crypto")
+    p.add_argument("--send", action="store_true", help="deliver to the configured alert channel")
+    p.set_defaults(func=cmd_digest)
+
+    p = sub.add_parser("arm-live", help="authorise unattended LIVE entries (binds the gate fingerprint)")
+    p.add_argument("--market", choices=["idx", "crypto"], default="crypto")
+    p.add_argument("--yes", action="store_true", help="required: this authorises real orders")
+    p.add_argument("--by", default="cli", help="who armed it (shows up in the audit trail)")
+    p.set_defaults(func=cmd_arm_live)
+
+    p = sub.add_parser("disarm-live", help="revoke the live-entry grant immediately")
+    p.add_argument("--market", choices=["idx", "crypto"], default="crypto")
+    p.set_defaults(func=cmd_disarm_live)
+
+    p = sub.add_parser("approvals", help="list or decide queued trade requests")
+    p.add_argument("action", nargs="?", choices=["list", "approve", "reject"], default="list")
+    p.add_argument("request_id", nargs="?", default="")
+    p.add_argument("--market", choices=["idx", "crypto"], default="crypto")
+    p.add_argument("--by", default="cli")
+    p.set_defaults(func=cmd_approvals)
 
     p = sub.add_parser("supervise", help="run the API under a restarting, heartbeat-checking supervisor")
     p.add_argument("--host", default="0.0.0.0")

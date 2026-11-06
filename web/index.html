@@ -308,6 +308,25 @@
 
       <div class="card">
         <div class="card-head">
+          <h3>Approval queue</h3>
+          <span class="muted small" id="approval-mode"></span>
+        </div>
+        <p class="muted small" id="approval-gate" style="margin:-4px 0 10px"></p>
+        <div class="table-scroll">
+          <table class="book-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Side</th><th>Entry</th><th>Stop</th><th>Target</th>
+                <th>Size</th><th>Expires</th><th class="ta-right">Decision</th>
+              </tr>
+            </thead>
+            <tbody id="approval-rows"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
           <h3>Active trades &amp; open orders</h3>
           <span class="muted small" id="book-meta">one position per symbol · mandatory stop · reduce-only closes</span>
         </div>

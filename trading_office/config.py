@@ -36,6 +36,12 @@ DEFAULTS: dict[str, Any] = {
         "auto_start_engine": False,
         "auto_start_markets": ["crypto"],
     },
+    "autonomy": {
+        # ask = a live entry waits for a human; auto = send it, but only fully armed;
+        # off = no gate at all (paper only, please)
+        "mode": "ask",
+        "approval_ttl_s": 1800,
+    },
     "market_filter": {
         "trend_ema": 200,
         # macro windows in which no entry is allowed (see market_filter.in_blackout):

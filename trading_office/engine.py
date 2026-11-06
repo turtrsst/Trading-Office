@@ -379,7 +379,8 @@ class TradingEngine:
             self.status.blocked += 1
         return payload
 
-    def _handle_entry(self, symbol: str, payload: dict[str, Any]) -> None:
+    def _handle_entry(self, symbol: str, payload: dict[str, Any],
+                      approved_request: dict[str, Any] | None = None) -> None:
         timeframe = str(self.profile.get("timeframe", ""))
         bar_time = payload["bar_time"]
         side = payload["action"].lower()
@@ -400,14 +401,18 @@ class TradingEngine:
                 self._skip(symbol, f"cooldown after last exit ({last_exit})")
                 return
 
-        # ---- bar lock: one decision per bar, written before the order
-        locked = self.state.lock(
-            symbol, timeframe, bar_time,
-            {"action": payload["action"], "score": payload["score"], "reasons": payload["reasons"][:5]},
-        )
-        if not locked:
-            self._skip(symbol, "bar already decided (state lock)")
-            return
+        # ---- bar lock: one decision per bar, written before the order. An approved
+        # request already holds that lock (written when it was parked), so it must not
+        # take it twice — that is what proves the approval is the same decision.
+        if approved_request is None:
+            locked = self.state.lock(
+                symbol, timeframe, bar_time,
+                {"action": payload["action"], "score": payload["score"],
+                 "reasons": payload["reasons"][:5]},
+            )
+            if not locked:
+                self._skip(symbol, "bar already decided (state lock)")
+                return
 
         plan_dict = payload.get("risk", {}).get("plan")
         if not plan_dict:
@@ -421,6 +426,22 @@ class TradingEngine:
             payload["execution"] = {"skipped": "execution disabled"}
             return
 
+        # ---- unattended-execution gate (live venues only; paper is always allowed).
+        # A request a human approved in Telegram is already authorised, and the grant was
+        # checked when it was parked, so re-checking it here would block the very entry
+        # the operator just approved if the grant were rotated in between.
+        gate = self._remote_entry_allowed()
+        if approved_request is not None:
+            gate = {"allowed": True, "gate": "approved",
+                    "reason": f"approved via {approved_request.get('id')}",
+                    "approved_by": "operator"}
+        if not gate["allowed"]:
+            self._skip(symbol, f"autonomy gate: {gate['reason']}")
+            payload["execution"] = {"skipped": f"autonomy gate: {gate['reason']}", "gate": gate}
+            self._emit({"event": "autonomy_block", "market": self.market, "symbol": symbol,
+                        **gate})
+            return
+
         # ---- execution-time cost check: the frozen plan was priced on the closed bar,
         # the fill happens now. If the book widened (or a shock hit), defer instead of
         # paying for it: the bar lock above already stops a second attempt on this bar.
@@ -430,6 +451,11 @@ class TradingEngine:
             payload["execution"] = {"skipped": check["reason"], "cost": check}
             return
         payload["cost"] = check
+
+        if approved_request is None and self.approval_required():
+            request = self.park_for_approval(symbol, payload)
+            payload["execution"] = {"queued_for_approval": request}
+            return
 
         order = order_from_plan(plan, bar_time, payload.get("reasons", []))
         fill = self.broker.submit(order)
@@ -468,9 +494,137 @@ class TradingEngine:
         self._emit({"event": "trade_opened", "market": self.market, "symbol": symbol,
                     "position": position.to_dict(), "fill": fill.to_dict()})
 
+    def approval_required(self) -> bool:
+        """Does a new entry need a human yes?
+
+        ``autonomy.mode``: ``ask`` (default) queues every live entry, ``auto`` sends it —
+        and ``auto`` is only reachable when the venue is the paper broker or the execution
+        gate is armed. Everything else queues, which is also what happens when the setting
+        is missing or malformed.
+        """
+        # paper is the rehearsal: queuing approvals for simulated fills teaches nothing
+        if isinstance(self.broker, PaperBroker):
+            return False
+        mode = str(self.settings.get("autonomy.mode", "ask") or "ask").lower()
+        if mode not in ("ask", "auto", "off"):
+            mode = "ask"
+        if mode == "off":
+            return False
+        if mode == "auto":
+            return not self._remote_entry_allowed()["allowed"]
+        return True
+
+    # ------------------------------------------------------------------ approval queue
+    def park_for_approval(self, symbol: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist a plan and wait for a human decision instead of sending an order.
+
+        The plan is written **before** anything reaches the venue, so an approval can
+        never arrive for a plan that no longer exists, and a crash while waiting loses
+        nothing: the request is in ``state/<market>/approvals.json``. Requests expire
+        quickly because the price they were computed at expires too.
+        """
+        import uuid
+
+        plan = payload.get("risk", {}).get("plan") or {}
+        ttl = int(self.settings.get("autonomy.approval_ttl_s", 1800))
+        now = dt.datetime.now(dt.timezone.utc)
+        request = {
+            "id": uuid.uuid4().hex[:10],
+            "market": self.market,
+            "symbol": symbol,
+            "side": str(payload.get("action") or "").upper(),
+            "score": payload.get("score"),
+            "reasons": list(payload.get("reasons") or [])[:4],
+            "plan": plan,
+            "bar_time": payload.get("bar_time"),
+            "created_at": now.isoformat(),
+            "expires_at": (now + dt.timedelta(seconds=ttl)).isoformat(),
+            "status": "pending",
+        }
+        self.state.add_approval(request)
+        self._emit({"event": "approval_requested", "market": self.market,
+                    "symbol": symbol, "request": request})
+        return request
+
+    def take_approval(self, symbol: str) -> dict[str, Any] | None:
+        """The pending request for a symbol, or None (expired requests self-expire)."""
+        for request in self.state.approvals(status="pending"):
+            if request.get("symbol") != symbol:
+                continue
+            try:
+                expires = dt.datetime.fromisoformat(str(request.get("expires_at")))
+            except ValueError:
+                expires = None
+            if expires and expires <= dt.datetime.now(dt.timezone.utc):
+                self.state.resolve_approval(request["id"], "expired")
+                continue
+            return request
+        return None
+
+    def execute_approved(self, request_id: str, *, by: str = "operator") -> dict[str, Any]:
+        """Send the order for an approved plan at the current market price.
+
+        The price is re-derived now: the plan was computed on the closed bar, so the
+        original entry may no longer be where the book is. If the market moved beyond the
+        plan's tolerance the request is rejected instead of chased (an approval is not a
+        licence to pay any price).
+        """
+        request = self.state.get_approval(request_id)
+        if not request:
+            return {"ok": False, "reason": "unknown request"}
+        if request.get("status") != "pending":
+            return {"ok": False, "reason": f"request is {request.get('status')}"}
+        if self.take_approval(request["symbol"]) is None:
+            return {"ok": False, "reason": "request expired"}
+        symbol = request["symbol"]
+        payload = {
+            "action": request.get("side"),
+            "symbol": symbol,
+            "score": request.get("score"),
+            "reasons": request.get("reasons") or [],
+            "bar_time": request.get("bar_time"),
+            "risk": {"plan": request.get("plan") or {}},
+        }
+        self.state.resolve_approval(request_id, "approved", by=by)
+        # The bar lock was written when the plan was parked, so re-locking here would make
+        # the engine refuse its own approved entry. Instead the decision is stamped onto
+        # the existing lock: one entry per bar still holds, and the ledger says who
+        # authorised this one.
+        self.state.stamp_decision(
+            symbol, str(self.profile.get("timeframe", "")), str(request.get("bar_time") or ""),
+            {"approved_by": by, "approval_id": request_id},
+        )
+        self._handle_entry(symbol, payload, approved_request=request)
+        return {"ok": True, "symbol": symbol, "execution": payload.get("execution")}
+
+    def reject_approval(self, request_id: str, *, by: str = "operator", reason: str = "") -> bool:
+        return self.state.resolve_approval(request_id, "rejected", by=by, reason=reason)
+
     def _skip(self, symbol: str, reason: str) -> None:
         self.state.append_ledger({"event": "skip", "market": self.market, "symbol": symbol, "reason": reason})
         self._emit({"event": "skip", "market": self.market, "symbol": symbol, "reason": reason})
+
+    # ------------------------------------------------------------------ remote execution gate
+    def _remote_entry_allowed(self) -> dict[str, Any]:
+        """May an *unattended* entry be sent to this venue?
+
+        In live mode the answer is **not mine to invent**. A gate written as a three-line
+        function is one "temporary" relaxation away from never blocking anything, and
+        nothing notices: the engine just trades. So the decision is bound to a fingerprint
+        of the pure function that implements it plus the risk limits it enforces
+        (:mod:`trading_office.autonomy`). Editing either invalidates the grant and entries
+        are refused until an operator re-arms them with ``trading-office arm-live``.
+
+        Paper trading is always allowed: it is the rehearsal, and a rehearsal that needs a
+        signature every bar teaches nothing.
+        """
+        from .autonomy import evaluate, execution_gate_limits
+
+        return evaluate(
+            is_paper=isinstance(self.broker, PaperBroker),
+            armed=self.state.get_setting("live_entry_grant") or {},
+            limits=execution_gate_limits(self.settings),
+        )
 
     # ------------------------------------------------------------------ manual controls
     def execution_gate(self) -> dict[str, Any]:
@@ -487,6 +641,7 @@ class TradingEngine:
             "execute": bool(self.execute),
             "live": self.mode == "live",
             "simulated": isinstance(self.broker, PaperBroker) or not self.execute,
+            "entries": self._remote_entry_allowed(),
             "note": (
                 "paper + dry-run: nothing leaves this machine"
                 if isinstance(self.broker, PaperBroker) and not self.execute

@@ -250,6 +250,14 @@ docs/                         strategy logic, API, MCP, operations
 scripts/make_demo_data.py     writes data/*.json for the backtester
 ```
 
+## Autonomous mode (approve from Telegram)
+
+Live entries are parked and pushed to Telegram; you tap **Approve** or **Reject**. Tapping
+is single-use, bound to a nonce, and refused for anyone but the allowlisted chat id. Unattended
+sending (`autonomy.mode=auto`) requires `trading-office arm-live --yes`, and the grant is
+invalidated automatically if the gate code or a risk limit changes. Full runbook:
+[docs/AUTONOMY.md](docs/AUTONOMY.md).
+
 ## Running 24/7
 
 ```bash

@@ -264,6 +264,14 @@ cannot leave a second engine attached to the same state directory.
 Linux unit: `deploy/trading-office.service` (hardened, `Restart=always`,
 `TimeoutStopSec=45`). Windows Server: see the appendix below.
 
+## Autonomous entries
+
+`autonomy.mode` decides whether a new live entry is sent or parked: see
+[docs/AUTONOMY.md](AUTONOMY.md). Default is `ask` — a queue in the web terminal and a
+Telegram card with two buttons. `trading-office arm-live --yes` is the only way to let the
+engine send by itself, and the grant is bound to a fingerprint of the gate code plus the
+risk limits.
+
 ## Out-of-band alerts (Telegram)
 
 The dashboard only helps while somebody is looking at it. `alerts` in

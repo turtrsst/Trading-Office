@@ -91,6 +91,10 @@ class StateStore:
         return self.root / "runtime.json"
 
     @property
+    def approvals_path(self) -> Path:
+        return self.root / "approvals.json"
+
+    @property
     def snapshot_path(self) -> Path:
         return self.root / "snapshot.json"
 
@@ -120,6 +124,18 @@ class StateStore:
             if len(data) > 5000:
                 for old_key in list(data.keys())[: len(data) - 5000]:
                     data.pop(old_key, None)
+            _atomic_write(self.signals_path, data)
+            return True
+
+    def stamp_decision(self, symbol: str, timeframe: str, bar_time: str,
+                       extra: dict[str, Any]) -> bool:
+        """Annotate an existing bar lock (e.g. who approved it). Never creates one."""
+        with self._lock:
+            data = _read_json(self.signals_path, {})
+            key = self.key(symbol, timeframe, bar_time)
+            if key not in data:
+                return False
+            data[key].update(extra)
             _atomic_write(self.signals_path, data)
             return True
 
@@ -234,6 +250,52 @@ class StateStore:
             data[key] = value
             _atomic_write(self.settings_path, data)
 
+    # ------------------------------------------------------------------ approvals
+    def approvals(self, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        """Pending/decided trade requests, newest first (bounded file, see _PRUNE)."""
+        with self._lock:
+            data = _read_json(self.approvals_path, {}) or {}
+            rows = list((data.get("requests") or {}).values())
+        if status:
+            rows = [r for r in rows if r.get("status") == status]
+        rows.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+        return rows[:limit]
+
+    def get_approval(self, request_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            data = _read_json(self.approvals_path, {}) or {}
+            return (data.get("requests") or {}).get(request_id)
+
+    def add_approval(self, request: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            data = _read_json(self.approvals_path, {}) or {}
+            requests = data.setdefault("requests", {})
+            requests[request["id"]] = request
+            # keep the file bounded: decisions are also in the ledger, this is the queue
+            if len(requests) > 200:
+                for old in sorted(requests.values(), key=lambda r: str(r.get("created_at") or ""))[:100]:
+                    requests.pop(old["id"], None)
+            _atomic_write(self.approvals_path, {"requests": requests})
+        return request
+
+    def resolve_approval(self, request_id: str, status: str, *, by: str = "",
+                         reason: str = "") -> bool:
+        with self._lock:
+            data = _read_json(self.approvals_path, {}) or {}
+            requests = data.get("requests") or {}
+            request = requests.get(request_id)
+            if not request:
+                return False
+            if request.get("status") not in ("pending",):
+                return False
+            request.update({
+                "status": status, "decided_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "decided_by": by, "decision_reason": reason,
+            })
+            requests[request_id] = request
+            _atomic_write(self.approvals_path, {"requests": requests})
+        return True
+
     # ------------------------------------------------------------------ account
     def account(self) -> dict[str, Any]:
         with self._lock:
@@ -248,7 +310,7 @@ class StateStore:
         with self._lock:
             for path in (self.signals_path, self.positions_path, self.cooldowns_path,
                          self.account_path, self.settings_path, self.snapshot_path,
-                         self.reconciled_path):
+                         self.reconciled_path, self.approvals_path):
                 if path.exists():
                     path.unlink()
             if not keep_ledger and self.ledger_path.exists():

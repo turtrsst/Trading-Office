@@ -648,6 +648,8 @@
     cancel: () => cancelOrder,
     // UI-only dry run of the close flow with a fake row: never touches the backend
     previewClose: (symbol) => closePosition(String(symbol || "BTC/USDT:USDT"), { preview: true }),
+    approvals: () => loadApprovals(),
+    decideApproval: (id, approve) => decideApproval(String(id), approve !== false),
   });
 
   /* ------------------------------------------------------------------ live metrics (WS) */
@@ -904,6 +906,80 @@
       set("eng-healthy-note", "loop stalled");
     } else if (beat.running) {
       set("eng-healthy-note", `loop healthy · last cycle ${beat.silent_s ?? 0}s ago`);
+    }
+  }
+
+  /* ------------------------------------------------------------------ approvals */
+  async function loadApprovals() {
+    try {
+      const data = await api(`/api/approvals?market=${state.market}`);
+      state.approvals = data;
+      renderApprovals(data);
+    } catch (err) {
+      // the approvals panel is informational; a failure here must not spam the operator
+      set("approval-empty", "approvals unavailable");
+    }
+  }
+
+  function renderApprovals(data) {
+    const rows = (data && data.requests) || [];
+    const body = $("#approval-rows");
+    const gate = (data && data.entries_gate) || {};
+    set("approval-mode", data
+      ? `${data.mode} mode · ${rows.length} pending`
+      : "");
+    const gateText = gate.allowed
+      ? `entries: ${gate.reason || "allowed"}`
+      : `entries BLOCKED — ${gate.reason || "not armed"}`;
+    set("approval-gate", gateText);
+    const badge = $("#approval-gate");
+    if (badge) badge.className = gate.allowed ? "muted small" : "muted small warn-text";
+    if (!body) return;
+    if (!rows.length) {
+      body.innerHTML = `<tr class="empty-row"><td colspan="8" id="approval-empty">`
+        + `${data && data.approval_required ? "Waiting for the next entry." : "No approval required in this mode."}`
+        + `</td></tr>`;
+      return;
+    }
+    body.innerHTML = rows.map((r) => {
+      const plan = r.plan || {};
+      const expires = r.expires_at ? new Date(r.expires_at) : null;
+      const left = expires ? Math.max(0, Math.round((expires - Date.now()) / 1000)) : null;
+      return `<tr>
+        <td class="sym">${esc(r.symbol)}</td>
+        <td>${chip(r.side)}</td>
+        <td>${fmtNum(plan.entry)}</td>
+        <td>${fmtNum(plan.stop)}</td>
+        <td>${fmtNum(plan.target)}</td>
+        <td>${fmtNum(plan.size, 6)} <span class="muted-cell">(${fmtNum(plan.risk_pct)}% risk)</span></td>
+        <td class="muted-cell">${left == null ? "—" : left + "s"}</td>
+        <td class="ta-right">
+          <button class="btn-mini" data-approve="${esc(r.id)}">APPROVE</button>
+          <button class="btn-mini ghost" data-reject="${esc(r.id)}">REJECT</button>
+        </td></tr>`;
+    }).join("");
+  }
+
+  async function decideApproval(requestId, approve) {
+    const ok = await confirmAction(
+      approve ? `Approve ${requestId}?` : `Reject ${requestId}?`,
+      approve
+        ? "The engine will send this entry at the current price. The plan was computed on the closed bar; if the market moved, the order is refused rather than chased."
+        : "The request is closed for good. Nothing is sent.",
+      approve ? "Approve entry" : "Reject",
+    );
+    if (!ok) return;
+    try {
+      const result = await api(`/api/approvals/${approve ? "approve" : "reject"}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ market: state.market, request_id: requestId, by: "browser" }),
+      });
+      if (result.ok) toast(`Request ${requestId} ${approve ? "approved" : "rejected"}`, false);
+      else toast(`Refused: ${result.reason || "unknown error"}`, true);
+      await Promise.all([loadApprovals(), loadEngine()]);
+    } catch (err) {
+      toast("Approval failed: " + err.message, true);
     }
   }
 
@@ -1189,6 +1265,19 @@
     $("#eng-flat").addEventListener("click", () => engineCall("/api/engine/close-all", { market: state.market }));
     $("#eng-sync").addEventListener("click", () => engineCall("/api/engine/reconcile", { market: state.market }));
     $("#eng-resume").addEventListener("click", () => engineCall("/api/engine/resume", { market: state.market }));
+    $("#approval-rows")?.addEventListener("click", (event) => {
+      const approve = event.target.closest("button[data-approve]");
+      const reject = event.target.closest("button[data-reject]");
+      const button = approve || reject;
+      if (!button) return;
+      button.disabled = true;
+      const id = (approve || reject).dataset[approve ? "approve" : "reject"];
+      decideApproval(id, Boolean(approve)).finally(() => { button.disabled = false; });
+    });
+    loadApprovals();
+    setInterval(() => {
+      if (document.querySelector("#tab-engine.active")) loadApprovals();
+    }, 15000);
     $("#book-rows")?.addEventListener("click", (event) => {
       const button = event.target.closest("button[data-action]");
       if (!button) return;

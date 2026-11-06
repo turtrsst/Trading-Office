@@ -235,5 +235,10 @@
       "chat_id": "",
       "token_env": "TO_TELEGRAM_TOKEN"
     }
+  },
+  "autonomy": {
+    "mode": "ask",
+    "approval_ttl_s": 1800,
+    "_note": "ask = live entries are parked and need a Telegram/browser approval; auto = send immediately, but only when the venue is paper or the execution gate is armed (arm-live) and its fingerprint still matches; off = no gate."
   }
 }

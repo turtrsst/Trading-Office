@@ -754,3 +754,5 @@ canvas { width: 100%; display: block; }
 @media (max-width: 720px) {
   .terminal-header { flex-direction: column; align-items: flex-start; }
 }
+
+.warn-text { color: var(--amber); }

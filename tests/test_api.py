@@ -350,3 +350,49 @@ def test_engine_autostart_is_off_by_default_and_starts_when_configured():
     finally:
         server_module._SETTINGS_OVERRIDE = saved
         server_module._ENGINES.pop("crypto", None)
+
+
+# --------------------------------------------------------------------------- autonomy surface
+def test_approvals_endpoint_lists_and_decides(client):
+    from trading_office.api import server as server_module
+
+    engine = server_module._engine("crypto")
+    request = {
+        "id": "testreq01", "market": "crypto", "symbol": "BTC/USDT:USDT", "side": "LONG",
+        "score": 7, "reasons": ["trend_alignment +2"], "plan": {"entry": 68000, "stop": 67000,
+        "target": 70000, "size": 0.01, "risk_pct": 0.3, "rr": 2.0},
+        "bar_time": "2026-11-06T10:00:00+07:00",
+        "created_at": server_module._iso_now(), "expires_at": server_module._iso_now(),
+        "status": "pending",
+    }
+    engine.state.add_approval(request)
+
+    listed = client.get("/api/approvals?market=crypto").json()
+    assert any(row["id"] == "testreq01" for row in listed["requests"])
+    assert listed["mode"] in ("ask", "auto", "off")
+    assert "allowed" in listed["entries_gate"]
+
+    rejected = client.post("/api/approvals/reject",
+                           json={"market": "crypto", "request_id": "testreq01"}).json()
+    assert rejected["ok"] is True
+    assert engine.state.get_approval("testreq01")["status"] == "rejected"
+    engine.state.approvals_path.unlink(missing_ok=True)
+
+
+def test_arm_live_requires_confirmation_and_rotates_with_the_gate(client):
+    from trading_office.api import server as server_module
+
+    engine = server_module._engine("crypto")
+    refused = client.post("/api/autonomy/arm", json={"market": "crypto"}).json()
+    assert refused["ok"] is False and "confirm" in refused["reason"]
+
+    armed = client.post("/api/autonomy/arm", json={"market": "crypto", "confirm": True}).json()
+    assert armed["ok"] is True and armed["grant"]["armed"] is True
+    assert len(armed["grant"]["fingerprint"]) == 16
+    # paper is still paper: arming never turns a simulated venue into a live one
+    assert armed["entries"]["gate"] == "paper"
+
+    disarmed = client.post("/api/autonomy/disarm",
+                           json={"market": "crypto", "by": "test"}).json()
+    assert disarmed["entries"]["allowed"] is True and disarmed["entries"]["gate"] == "paper"
+    engine.state.set_setting("live_entry_grant", {})
