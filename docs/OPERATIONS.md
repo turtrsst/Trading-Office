@@ -73,6 +73,7 @@ so a dead bot cannot leave a naked position, and `clientOrderId` is deterministi
 ```
 state/
   crypto/  signals.json positions.json cooldowns.json ledger.jsonl account.json
+           snapshot.json snapshot_reconciled.json runtime.json
   idx/     (same)
 ```
 
@@ -106,6 +107,21 @@ python -m trading_office.cli reconcile --market crypto --close-orphans
 `partial_done` is written *before* the next bar, so a partial can never execute twice; a
 partial that is smaller than the venue's `amount_to_precision` step is skipped instead of
 rounded up.
+
+### Two sources of truth (`snapshot.json`)
+
+`positions.json` is the live file, but a crash between two writes (partial close, stop
+move) can leave it one step behind. Every position change therefore also writes
+`state/<market>/snapshot.json` (`{source, saved_at, positions}`), and `startup_sync()`:
+
+1. merges `positions.json` over `snapshot.json` per symbol (the freshest write wins) and
+   restores anything the in-memory engine lost (`restored_from_disk` in the report),
+2. then reconciles that against the venue (venue size/entry win),
+3. then writes `snapshot_reconciled.json` — the *venue truth* — which the next boot
+   prefers when it is newer than the local snapshot.
+
+So the order of authority is: **venue → reconciled snapshot → local snapshot → positions.json**.
+No position is ever resurrected from a stale file without the exchange agreeing to it.
 
 ### Kill switch (daily loss / loss streak)
 
@@ -202,13 +218,28 @@ Adjust the model per market in `profiles.<market>.execution_costs` (`latency_ms`
 ## Live equity & drawdown dashboard
 
 `GET /api/metrics?market=crypto` returns parallel `timestamps` / `equity` / `drawdown`
-arrays (plus `series` with `peak` and `drawdown_pct`, and a `performance` block) built from
-the ledger — no separate history file to corrupt, and it survives a restart. The Live
-Engine tab polls it every 2 s and draws the equity area and the drawdown band with the
-repo's own canvas module (`web/charts.js`), so no CDN or internet access is needed:
+arrays, a `series` with `peak` and `drawdown_pct` per point, a `performance` block and a
+compact `kpi` block, all built from the ledger — no separate history file to corrupt, and it
+survives a restart. `WS /api/ws/metrics?market=…` pushes the identical frame once per
+second, so the Live Engine tab does not poll for metrics at all:
+
+```
+GET  /api/metrics       → {status, equity[], drawdown_pct[], series[], kpi{}, performance{}}
+WS   /api/ws/metrics    → {type:"metrics", seq, ...the same payload}   (1 Hz)
+```
+
+The tab is a two-column CSS grid: a 280 px **KPI sidebar** (win rate, profit factor, total
+trades, plus max DD / net profit / equity and a websocket status dot) next to the equity
+and drawdown canvases and the open-position list. Charting is `web/charts.js` (plain
+canvas) — no CDN, works offline and behind the preview proxy.
+
+**Reconnect** uses exponential backoff with jitter: `min(30 s, 1 s × 2^(attempt−1)) + 0–400
+ms`, counter reset on `open`. While the socket is down the cards fall back to one HTTP
+`/api/metrics` read, so the dashboard never shows stale numbers without saying so
+(the status dot turns amber and the chart header shows `http fallback`).
 
 ```sh
-curl -s 'localhost:8000/api/metrics?market=crypto' | jq '{status, performance}'
+curl -s 'localhost:8000/api/metrics?market=crypto' | jq '{status, kpi}'
 curl -s 'localhost:8000/api/performance?market=idx'
 ```
 

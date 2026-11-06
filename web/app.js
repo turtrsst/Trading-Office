@@ -9,6 +9,7 @@
     backtest: null,
     engine: null,
     metrics: null,
+    // (live metrics live in WS.last, see the metrics socket below)
     health: null,
     engineTimer: null,
   };
@@ -562,6 +563,138 @@
       : `<tr><td colspan="10" class="muted">No trades in the out-of-sample window — the filters were strict. Check the skip funnel on the right.</td></tr>`;
   }
 
+  /* ------------------------------------------------------------------ live metrics (WS) */
+  const WS = {
+    sock: null,
+    attempts: 0,
+    base: 1000,          // 1 s
+    cap: 30000,          // 30 s
+    timer: null,
+    last: null,          // last frame, so a tab switch can repaint without waiting
+    healthy: false,
+  };
+
+  function wsUrl() {
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${proto}//${window.location.host}/api/ws/metrics?market=${encodeURIComponent(state.market)}`;
+  }
+
+  function setWsStatus(text, tone) {
+    const label = $("#ws-status-indicator");
+    const dot = $("#ws-dot");
+    if (label) label.textContent = text;
+    if (dot) dot.className = "dot" + (tone ? " " + tone : "");
+  }
+
+  function connectMetricsSocket() {
+    if (WS.sock && (WS.sock.readyState === WebSocket.OPEN || WS.sock.readyState === WebSocket.CONNECTING)) return;
+    clearTimeout(WS.timer);
+    let sock;
+    try {
+      sock = new WebSocket(wsUrl());
+    } catch (err) {
+      scheduleReconnect("constructor failed");
+      return;
+    }
+    WS.sock = sock;
+    setWsStatus(WS.attempts ? `reconnecting (attempt ${WS.attempts + 1})…` : "connecting…", "warn");
+
+    sock.onopen = () => {
+      WS.attempts = 0;
+      WS.healthy = true;
+      setWsStatus("live · websocket", "live");
+    };
+    sock.onmessage = (event) => {
+      let frame;
+      try { frame = JSON.parse(event.data); } catch (err) { return; }
+      if (frame.type === "stale") { setWsStatus("stale connection, reconnecting…", "warn"); return; }
+      if (frame.type !== "metrics") return;
+      WS.last = frame;
+      renderMetrics(frame);
+      // answer the server ping so it knows this tab is alive
+      if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ type: "pong", seq: frame.seq }));
+      setWsStatus("live · websocket", "live");
+    };
+    sock.onclose = (event) => {
+      WS.healthy = false;
+      // a clean close after a market switch is not a failure: just reconnect
+      scheduleReconnect(`closed (${event.code || "?"})`);
+    };
+    sock.onerror = () => {
+      WS.healthy = false;
+      setWsStatus("socket error", "off");
+      try { sock.close(); } catch (err) { /* onclose handles the retry */ }
+    };
+  }
+
+  function scheduleReconnect(reason) {
+    WS.attempts += 1;
+    const backoff = Math.min(WS.cap, WS.base * Math.pow(2, WS.attempts - 1));
+    const jitter = Math.random() * 400;                 // desync many tabs
+    const delay = Math.round(backoff + jitter);
+    setWsStatus(`offline · retrying in ${(delay / 1000).toFixed(1)}s`, "warn");
+    if (reason) console.warn("[metrics ws]", reason);
+    clearTimeout(WS.timer);
+    WS.timer = setTimeout(connectMetricsSocket, delay);
+    // while the socket is down, keep the cards honest with a single HTTP snapshot
+    api(`/api/metrics?market=${state.market}`).then((frame) => {
+      WS.last = { ...frame, type: "metrics", transport: "http" };
+      renderMetrics(WS.last);
+    }).catch(() => {});
+  }
+
+  function closeMetricsSocket() {
+    clearTimeout(WS.timer);
+    if (WS.sock) { try { WS.sock.close(); } catch (err) { /* ignore */ } }
+    WS.sock = null;
+    WS.healthy = false;
+  }
+
+  function fmtFactor(value) {
+    if (value === null || value === undefined) return "—";
+    return Number.isFinite(value) ? value.toFixed(2) : "∞";
+  }
+
+  function renderMetrics(frame) {
+    const kpi = frame.kpi || (frame.performance
+      ? {
+          win_rate: frame.performance.win_rate_pct,
+          profit_factor: frame.performance.profit_factor,
+          total_trades: frame.performance.trades,
+          max_drawdown_pct: frame.performance.max_drawdown_pct,
+          net_profit_pct: frame.performance.net_profit_pct,
+          equity: frame.performance.ending_equity,
+        }
+      : {});
+    const wr = Number(kpi.win_rate || 0);
+    const pf = kpi.profit_factor;
+    const set = (id, value) => { const el = $("#" + id); if (el) el.textContent = value; };
+    set("kpi-win-rate", kpi.total_trades ? `${wr.toFixed(1)}%` : "—");
+    set("kpi-profit-factor", fmtFactor(pf));
+    set("kpi-total-trades", kpi.total_trades ?? 0);
+    set("kpi-win-rate-s", kpi.total_trades ? `${Math.round((wr / 100) * kpi.total_trades)} winners` : "no closed trades yet");
+    set("kpi-profit-factor-s", pf == null ? "no losing trade in the sample" : pf >= 1.5 ? "healthy (≥ 1.5)" : "below 1.5");
+    set("kpi-max-dd", `${Number(kpi.max_drawdown_pct || 0).toFixed(2)}%`);
+    set("kpi-net-profit", `${Number(kpi.net_profit_pct || 0).toFixed(2)}%`);
+    set("kpi-equity", fmtNum(kpi.equity));
+    const wrCard = $("#kpi-win-rate")?.closest(".kpi-card");
+    if (wrCard) wrCard.dataset.tone = !kpi.total_trades ? "" : wr >= 50 ? "good" : "bad";
+    const pfCard = $("#kpi-profit-factor")?.closest(".kpi-card");
+    if (pfCard) pfCard.dataset.tone = pf == null ? "blue" : pf >= 1.5 ? "blue" : "bad";
+
+    const series = frame.series || [];
+    const equity = series.map((p) => p.equity);
+    const dd = series.map((p) => p.drawdown_pct || 0);
+    if (equity.length > 1) {
+      Charts.area($("#live-equity"), equity, { baseline: equity[0] });
+      Charts.drawdown($("#live-drawdown"), dd);
+    }
+    const worst = dd.length ? Math.max(...dd) : 0;
+    set("eng-dd-meta", `max ${worst.toFixed(2)}% · now ${(dd[dd.length - 1] || 0).toFixed(2)}%`);
+    set("eng-equity-meta",
+      `${equity.length} points${frame.transport === "http" ? " · http fallback" : " · live"}`);
+  }
+
   /* ------------------------------------------------------------------ engine */
   async function engineCall(path, body) {
     try {
@@ -580,13 +713,10 @@
 
   async function loadEngine() {
     try {
-      const [data, metrics] = await Promise.all([
-        api(`/api/engine/status?market=${state.market}`),
-        api(`/api/metrics?market=${state.market}`).catch(() => null),
-      ]);
+      const data = await api(`/api/engine/status?market=${state.market}`);
       state.engine = data;
-      state.metrics = metrics;
-      renderEngine(data, metrics);
+      renderEngine(data, WS.last);
+      if (!WS.healthy) connectMetricsSocket();
     } catch (err) {
       toast("Engine status failed: " + err.message, true);
     }
@@ -624,25 +754,17 @@
           </div></div>`).join("")
       : `<div class="empty">No open positions.</div>`;
 
-    const series = (metrics && metrics.series) || data.equity_curve || [];
-    const curve = series.map((p) => p.equity);
-    const drawdowns = series.map((p) => p.drawdown_pct || 0);
-    if (curve.length > 1) Charts.area($("#live-equity"), curve, { baseline: curve[0] });
-    if (drawdowns.length > 1) Charts.drawdown($("#live-drawdown"), drawdowns);
-    $("#eng-equity-meta").textContent =
-      `${curve.length} points · ${st.last_cycle_at ? new Date(st.last_cycle_at).toLocaleTimeString("id-ID") : "not started"}`;
-    const worst = Math.max(0, ...drawdowns);
-    $("#eng-dd-meta").textContent = `max ${worst.toFixed(2)}% · now ${(drawdowns[drawdowns.length - 1] || 0).toFixed(2)}%`;
-
+    // charts + KPI cards are driven by the websocket frame (or its HTTP fallback)
+    if (!metrics) renderMetrics({ series: data.equity_curve || [], performance: data.performance });
     const perf = (metrics && metrics.performance) || data.performance || {};
     $("#eng-perf").innerHTML = [
-      stat("Profit factor", perf.profit_factor == null ? "—" : perf.profit_factor, "gross win / loss",
+      stat("Profit factor", fmtFactor(perf.profit_factor), "gross win ÷ loss",
         (perf.profit_factor || 0) >= 1.5 ? "good" : perf.profit_factor == null ? "" : "bad"),
-      stat("Win rate", `${perf.win_rate_pct ?? 0}%`, `${perf.trades ?? 0} closed trades`),
       stat("Net profit", `${(perf.net_profit_pct ?? 0).toFixed(2)}%`, `equity ${fmtNum(perf.ending_equity)}`,
         (perf.net_profit_pct || 0) >= 0 ? "good" : "bad"),
-      stat("Max drawdown", `${perf.max_drawdown_pct ?? 0}%`, "peak to trough (equity curve)",
-        (perf.max_drawdown_pct || 0) > 10 ? "bad" : ""),
+      stat("Scans / orders", `${st.scans ?? 0} / ${st.orders ?? 0}`, "bar-locked", ""),
+      stat("Last cycle", st.last_cycle_at ? new Date(st.last_cycle_at).toLocaleTimeString("id-ID") : "not started",
+        st.running ? "loop running" : "loop stopped", st.running ? "good" : ""),
     ].join("");
 
     const ledger = (data.ledger || []).slice().reverse().slice(0, 60);
@@ -763,7 +885,13 @@
     state.tab = name;
     $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === name));
     $$(".panel").forEach((p) => p.classList.toggle("active", p.id === "tab-" + name));
-    if (name === "engine") loadEngine();
+    if (name === "engine") {
+      loadEngine();
+      connectMetricsSocket();
+      if (WS.last) renderMetrics(WS.last);
+    } else {
+      closeMetricsSocket();
+    }
     if (name === "api") loadApiTab();
     if (name === "bandar" && !state.bandar) loadBandar();
   }
@@ -776,7 +904,13 @@
     $("#bt-market").value = market;
     loadHealth();
     loadScreen();
-    if (state.tab === "engine") loadEngine();
+    if (state.tab === "engine") {
+      // the socket URL embeds the market, so a switch needs a fresh connection
+      closeMetricsSocket();
+      WS.attempts = 0;
+      loadEngine();
+      connectMetricsSocket();
+    }
   }
 
   /* ------------------------------------------------------------------ boot */
@@ -798,15 +932,18 @@
     window.addEventListener("resize", () => {
       if (state.analysis && state.tab === "analysis") renderAnalysis(state.analysis);
       if (state.backtest && state.tab === "backtest") renderBacktest(state.backtest);
-      if (state.engine && state.tab === "engine") renderEngine(state.engine);
+      if (state.engine && state.tab === "engine") {
+        renderEngine(state.engine, WS.last);
+        if (WS.last) renderMetrics(WS.last);
+      }
     });
   }
 
   setInterval(tickClock, 1000);
-  // the engine tab polls the metrics endpoint every 2 s so equity/drawdown move live
+  // metrics arrive over the websocket; this only refreshes the engine *status* card
   setInterval(() => {
-    if (state.tab === "engine" && (state.engine?.status?.running || state.metrics)) loadEngine();
-  }, 2000);
+    if (state.tab === "engine") loadEngine();
+  }, 5000);
   tickClock();
   bind();
   loadHealth().then(() => {

@@ -245,18 +245,46 @@
         <div id="eng-reconcile" class="reconcile"></div>
       </div>
 
-      <div class="split">
-        <div class="card">
-          <div class="card-head"><h3>Open positions</h3></div>
-          <div id="eng-positions" class="positions"></div>
-        </div>
-        <div class="card">
-          <div class="card-head"><h3>Equity</h3><span class="muted small" id="eng-equity-meta"></span></div>
-          <canvas id="live-equity" height="170"></canvas>
-          <div class="card-head" style="margin-top:10px">
-            <h3>Drawdown</h3><span class="muted small" id="eng-dd-meta"></span>
+      <!-- KPI sidebar (280px) | equity + drawdown charts (1fr) -->
+      <div class="dashboard-grid">
+        <aside class="kpi-sidebar">
+          <div class="kpi-card" data-tone="good">
+            <span class="kpi-k">Win rate</span>
+            <b class="kpi-v" id="kpi-win-rate">—</b>
+            <span class="kpi-s" id="kpi-win-rate-s">no closed trades yet</span>
           </div>
-          <canvas id="live-drawdown" height="110"></canvas>
+          <div class="kpi-card" data-tone="blue">
+            <span class="kpi-k">Profit factor</span>
+            <b class="kpi-v" id="kpi-profit-factor">—</b>
+            <span class="kpi-s" id="kpi-profit-factor-s">gross win ÷ gross loss</span>
+          </div>
+          <div class="kpi-card" data-tone="amber">
+            <span class="kpi-k">Total trades</span>
+            <b class="kpi-v" id="kpi-total-trades">0</b>
+            <span class="kpi-s" id="kpi-total-trades-s">closed, this account</span>
+          </div>
+          <div class="kpi-mini">
+            <div><span>Max DD</span><b id="kpi-max-dd">0.00%</b></div>
+            <div><span>Net profit</span><b id="kpi-net-profit">0.00%</b></div>
+            <div><span>Equity</span><b id="kpi-equity">—</b></div>
+          </div>
+          <div class="ws-status"><span class="dot" id="ws-dot"></span>
+            <span id="ws-status-indicator">connecting…</span></div>
+        </aside>
+
+        <div class="charts-container">
+          <div class="card">
+            <div class="card-head"><h3>Equity</h3><span class="muted small" id="eng-equity-meta"></span></div>
+            <canvas id="live-equity" height="190"></canvas>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Drawdown</h3><span class="muted small" id="eng-dd-meta"></span></div>
+            <canvas id="live-drawdown" height="120"></canvas>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Open positions</h3><span class="muted small">one per symbol, mandatory stop</span></div>
+            <div id="eng-positions" class="positions"></div>
+          </div>
         </div>
       </div>
 

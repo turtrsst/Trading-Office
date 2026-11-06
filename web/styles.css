@@ -603,3 +603,50 @@ canvas { width: 100%; display: block; }
 .ledger-row .ev.partial { color: var(--accent); }
 .ledger-row .ev.reconciliation { color: var(--blue); }
 .ledger-row .ev.cost_deferred { color: var(--amber); }
+
+/* ---- KPI sidebar + chart grid (live engine tab) ---- */
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .dashboard-grid { grid-template-columns: 1fr; }
+}
+.kpi-sidebar { display: flex; flex-direction: column; gap: 10px; }
+.kpi-card {
+  position: relative;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+  padding: 14px 16px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.kpi-card .kpi-k { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.kpi-card .kpi-v { font-size: 26px; line-height: 1.1; font-variant-numeric: tabular-nums; color: var(--accent); }
+.kpi-card .kpi-s { font-size: 11px; color: var(--dim); }
+.kpi-card[data-tone="blue"] { border-left-color: var(--blue); }
+.kpi-card[data-tone="blue"] .kpi-v { color: var(--blue); }
+.kpi-card[data-tone="amber"] { border-left-color: var(--amber); }
+.kpi-card[data-tone="amber"] .kpi-v { color: var(--amber); }
+.kpi-card[data-tone="bad"] { border-left-color: var(--red); }
+.kpi-card[data-tone="bad"] .kpi-v { color: var(--red); }
+.kpi-mini {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+}
+.kpi-mini div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.kpi-mini span { font-size: 10px; letter-spacing: .04em; text-transform: uppercase; color: var(--dim); }
+.kpi-mini b { font-size: 13px; font-variant-numeric: tabular-nums; color: var(--text); }
+.ws-status {
+  display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--muted);
+  padding: 8px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+}
+.ws-status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+.ws-status .dot.live { background: var(--accent); box-shadow: 0 0 0 3px rgba(46, 230, 168, .16); }
+.ws-status .dot.warn { background: var(--amber); box-shadow: 0 0 0 3px rgba(245, 181, 68, .16); }
+.ws-status .dot.off { background: var(--red); box-shadow: 0 0 0 3px rgba(255, 93, 115, .16); }
+.charts-container { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.charts-container canvas { width: 100%; display: block; }

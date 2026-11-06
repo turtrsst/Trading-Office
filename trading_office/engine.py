@@ -420,6 +420,7 @@ class TradingEngine:
         with self.lock:
             self.positions[symbol] = position
         self.state.save_position(symbol, position.to_dict())
+        self._persist_snapshot()
         payload["execution"] = {"filled": fill.to_dict(), "position": position.to_dict()}
         self._emit({"event": "trade_opened", "market": self.market, "symbol": symbol,
                     "position": position.to_dict(), "fill": fill.to_dict()})
@@ -466,6 +467,7 @@ class TradingEngine:
             "max_daily_loss_pct": max_daily,
             "max_consecutive_losses": max_streak,
             "resumed_on": self._guard_resumed_on,
+            "venue": getattr(self.broker, "name", "paper") if not isinstance(self.broker, PaperBroker) else "paper",
         }
         return self.status.guard
 
@@ -571,6 +573,53 @@ class TradingEngine:
             return None
 
     # ------------------------------------------------------------------ startup reconciliation
+    def _restore_local_state(self) -> dict[str, Any]:
+        """Rebuild open positions from disk *before* comparing with the venue.
+
+        ``state/positions.json`` is written on every change, but a crash between the two
+        writes (partial close, stop move) can leave it behind. The snapshot carries the
+        same data plus the last-exit bars, and `startup_sync` merges the two by symbol
+        (venue size wins). Returns a small report for the caller.
+        """
+        on_disk = self.state.positions()
+        snapshot = self.state.load_snapshot()
+        merged = dict(snapshot.get("positions") or {})
+        merged.update(on_disk)  # the freshest write always wins
+        restored = 0
+        with self.lock:
+            for symbol, raw in merged.items():
+                if symbol in self.positions:
+                    continue
+                try:
+                    position = Position.from_dict(raw)
+                except Exception:
+                    continue
+                if not position.entry or not position.size:
+                    continue
+                self.positions[symbol] = position
+                restored += 1
+        if restored:
+            self.state.restore_positions(
+                {sym: pos.to_dict() for sym, pos in self.positions.items()}
+            )
+        return {
+            "restored_from_disk": restored,
+            "disk_positions": len(on_disk),
+            "snapshot_source": snapshot.get("source"),
+        }
+
+    def _persist_snapshot(self, source: str = "local") -> None:
+        try:
+            self.state.save_snapshot(
+                {
+                    "positions": {sym: pos.to_dict() for sym, pos in self.positions.items()},
+                    "last_exit_bar": {},
+                },
+                source=source,
+            )
+        except Exception:  # never let a snapshot write break trading
+            pass
+
     def startup_sync(self, *, adopt_untracked: bool = False, close_orphans: bool = False) -> dict[str, Any]:
         """Reconcile persisted state with the venue before trading starts.
 
@@ -588,6 +637,7 @@ class TradingEngine:
         we never authorised: reported, adopted only when asked).
         """
         timeframe = str(self.profile.get("timeframe", ""))
+        restored_local = self._restore_local_state()
         venue = self._venue_positions()
         venue_by_symbol: dict[str, dict[str, Any]] = {}
         for row in venue or []:
@@ -599,6 +649,8 @@ class TradingEngine:
             "market": self.market,
             "mode": self.mode,
             "venue_available": venue is not None,
+            "state_source": restored_local.get("snapshot_source") or "local",
+            "restored_from_disk": restored_local["restored_from_disk"],
             "symbols": [],
             "adopted": [],
             "restored": [],
@@ -684,6 +736,8 @@ class TradingEngine:
                 report["closed"].append({**row, "reason": "untracked position closed on request"})
             report["untracked"] = []
 
+        # the venue truth becomes the new baseline for the next crash
+        self._persist_snapshot(source="reconciled" if report["venue_available"] else "local")
         self.reconciled = report
         self.status.reconciled = {
             k: len(v) for k, v in report.items() if isinstance(v, list)
@@ -758,6 +812,7 @@ class TradingEngine:
                         continue
                     position.stop = action.new_stop
                     self.state.save_position(symbol, position.to_dict())
+                    self._persist_snapshot()
                 elif action.kind == "partial":
                     fraction = float(action.fraction or 0.5)
                     slice_size = partial_size(position, fraction, self.market, self.profile.get("size_step"))
@@ -774,6 +829,7 @@ class TradingEngine:
                     position.partial_price = float(result["price"])
                     self.status.partials += 1
                     self.state.save_position(symbol, position.to_dict())
+                    self._persist_snapshot()
                     self.state.append_ledger(
                         {"event": "partial", "market": self.market, "symbol": symbol, **result}
                     )
@@ -797,6 +853,7 @@ class TradingEngine:
             trade.pnl = round(float(trade.pnl) + float(position.realised_pnl), 4)
             trade.meta = {**trade.meta, "banked_partial_pnl": round(position.realised_pnl, 4)}
         self.state.drop_position(symbol, exit_bar=dt.datetime.now(dt.timezone.utc).isoformat())
+        self._persist_snapshot()
         self.state.append_ledger(
             {"event": "trade_closed", "market": self.market, **trade.to_dict()}
         )

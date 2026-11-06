@@ -94,6 +94,7 @@ class Broker(Protocol):
 
 # --------------------------------------------------------------------------- paper
 class PaperBroker:
+    name = "paper"
     """Deterministic paper broker used by the UI, the CLI and the backtester."""
 
     def __init__(
@@ -334,6 +335,7 @@ class PaperBroker:
 
 # --------------------------------------------------------------------------- ccxt
 class CcxtBroker:
+    name = "ccxt"
     """Live/testnet perpetual futures through ``ccxt`` (bybit, binance, bitget, okx)."""
 
     def __init__(

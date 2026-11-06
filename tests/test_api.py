@@ -224,3 +224,27 @@ def test_engine_restores_positions_after_restart(tmp_path):
     again = TradingEngine(market="crypto", settings=settings, symbols=["TEST/USDT:USDT"], state_dir=tmp_path)
     assert "TEST/USDT:USDT" in again.positions
     assert again.positions["TEST/USDT:USDT"].entry == first.positions["TEST/USDT:USDT"].entry
+
+
+def test_metrics_payload_carries_the_kpi_block(client):
+    body = client.get("/api/metrics?market=crypto").json()
+    assert {"win_rate", "profit_factor", "total_trades"} <= set(body["kpi"])
+    assert len(body["drawdown"]) == len(body["drawdown_pct"]) == len(body["equity"])
+
+
+def test_websocket_pushes_metrics_frames(client):
+    with client.websocket_connect("/api/ws/metrics?market=crypto") as ws:
+        first = ws.receive_json()
+        assert first["type"] == "metrics" and first["seq"] == 1
+        assert {"equity", "drawdown_pct", "kpi", "series"} <= set(first)
+        ws.send_text('{"type":"pong"}')  # the client keeps the connection alive
+        second = ws.receive_json()
+        assert second["seq"] == 2
+        assert second["market"] == "crypto"
+
+
+def test_websocket_can_switch_market(client):
+    with client.websocket_connect("/api/ws/metrics?market=idx") as ws:
+        frame = ws.receive_json()
+        assert frame["market"] == "idx"
+        assert "total_trades" in frame["kpi"]

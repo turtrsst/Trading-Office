@@ -24,13 +24,14 @@ same tools as plain JSON so any agent can read the schema without an MCP client.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import threading
 from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -354,12 +355,62 @@ def create_app() -> FastAPI:
             "timestamps": [p.get("ts") for p in curve],
             "equity": [p["equity"] for p in curve],
             "drawdown": [p.get("drawdown_pct", 0.0) for p in curve],
+            "drawdown_pct": [p.get("drawdown_pct", 0.0) for p in curve],
             "peak": [p.get("peak") for p in curve],
             "series": curve,
             "performance": perf,
+            # compact KPI block: what the sidebar cards read (and what a WS frame carries)
+            "kpi": {
+                "win_rate": perf["win_rate_pct"],
+                "profit_factor": perf["profit_factor"],
+                "total_trades": perf["trades"],
+                "max_drawdown_pct": perf["max_drawdown_pct"],
+                "net_profit_pct": perf["net_profit_pct"],
+                "equity": perf["ending_equity"],
+            },
             "starting_equity": perf["starting_equity"],
             "updated_at": _iso_now(),
         }
+
+    # ------------------------------------------------------------------ live websocket
+    @app.websocket("/api/ws/metrics")
+    async def ws_metrics(websocket: WebSocket, market: str = "crypto") -> None:
+        """Push the equity/drawdown series + KPI block once per second.
+
+        Cheaper and lower-latency than polling, and the frame is the *same* JSON as
+        ``GET /api/metrics`` (plus ``type``/``seq``) so one render path serves both
+        transports. The client ack/ping keeps a half-dead connection from lingering:
+        a client that stops answering is dropped after three missed cycles.
+        """
+        await websocket.accept()
+        seq = 0
+        misses = 0
+        interval = 1.0  # one frame per second, *regardless* of how fast the client answers
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                cycle_start = loop.time()
+                payload = live_metrics(market, limit=120)  # type: ignore[arg-type]
+                seq += 1
+                await websocket.send_json({"type": "metrics", "seq": seq, "ts": _iso_now(), **payload})
+                try:
+                    # a client may send {"type":"pong"} or anything; only liveness matters
+                    await asyncio.wait_for(websocket.receive_text(), timeout=interval)
+                    misses = 0
+                except asyncio.TimeoutError:
+                    misses += 1
+                    if misses >= 3:
+                        await websocket.send_json({"type": "stale", "ts": _iso_now(),
+                                                   "detail": "client did not answer 3 pings"})
+                        break
+                # pace the loop: an eager client must not turn this into a busy stream
+                remaining = interval - (loop.time() - cycle_start)
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+        except WebSocketDisconnect:
+            pass
+        except Exception:  # pragma: no cover - transport level
+            pass
 
     @app.get("/api/performance")
     def performance(market: Literal["crypto", "idx"] = "crypto") -> dict[str, Any]:

@@ -83,6 +83,14 @@ class StateStore:
     def settings_path(self) -> Path:
         return self.root / "runtime.json"
 
+    @property
+    def snapshot_path(self) -> Path:
+        return self.root / "snapshot.json"
+
+    @property
+    def reconciled_path(self) -> Path:
+        return self.root / "snapshot_reconciled.json"
+
     # ------------------------------------------------------------------ bar locks
     @staticmethod
     def key(symbol: str, timeframe: str, bar_time: str) -> str:
@@ -133,6 +141,50 @@ class StateStore:
         with self._lock:
             return _read_json(self.cooldowns_path, {}).get(symbol)
 
+    # ------------------------------------------------------------------ snapshots
+    def snapshot_state(self, source: str = "local") -> dict[str, Any]:
+        """Everything ``startup_sync`` must be able to put back, in one dict.
+
+        A restart (or a crash mid-partial) must not depend on reconstructing anything from
+        the ledger: the exact local truth is written here before the first order and
+        updated on every position write.
+        """
+        return {
+            "source": source,
+            "saved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "positions": self.positions(),
+            "last_exit_bar": _read_json(self.cooldowns_path, {}),
+        }
+
+    def save_snapshot(self, snapshot: dict[str, Any], source: str = "local") -> None:
+        with self._lock:
+            payload = {
+                "source": source,
+                "saved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "positions": snapshot.get("positions") or {},
+                "last_exit_bar": snapshot.get("last_exit_bar") or {},
+            }
+            if source == "local":
+                _atomic_write(self.snapshot_path, payload)
+            else:
+                _atomic_write(self.reconciled_path, payload)
+                self.last_source = source
+
+    def load_snapshot(self, prefer_reconciled: bool = True) -> dict[str, Any]:
+        """Local truth, with the reconciled venue truth preferred when it is newer."""
+        local = _read_json(self.snapshot_path, {}) or {}
+        venue = _read_json(self.reconciled_path, {}) if prefer_reconciled else {}
+        if not venue:
+            return {**local, "source": local.get("source") or "local"}
+        if not local:
+            return venue
+        return venue if str(venue.get("saved_at") or "") >= str(local.get("saved_at") or "") else local
+
+    def restore_positions(self, positions: dict[str, Any]) -> int:
+        with self._lock:
+            _atomic_write(self.positions_path, positions or {})
+        return len(positions or {})
+
     # ------------------------------------------------------------------ ledger
     def append_ledger(self, event: dict[str, Any]) -> None:
         with self._lock:
@@ -181,7 +233,8 @@ class StateStore:
     def reset(self, *, keep_ledger: bool = True) -> None:
         with self._lock:
             for path in (self.signals_path, self.positions_path, self.cooldowns_path,
-                         self.account_path, self.settings_path):
+                         self.account_path, self.settings_path, self.snapshot_path,
+                         self.reconciled_path):
                 if path.exists():
                     path.unlink()
             if not keep_ledger and self.ledger_path.exists():

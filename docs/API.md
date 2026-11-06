@@ -135,7 +135,8 @@ With `oos = 0` it returns a single `BacktestResult` (`metrics`, `trades`,
 | `POST /api/engine/close-all` | `{"market":"crypto"}` | flatten everything |
 | `POST /api/engine/reconcile` | `{"market":"crypto","adopt":false,"close_orphans":false}` | compare `state/positions.json` with the exchange (the boot-time `startup_sync()`) |
 | `GET /api/cost-model?market=crypto` | — | the fill model: latency, slippage coefficients/caps, gap thresholds, auction windows, partial-TP defaults |
-| `GET /api/metrics?market=crypto&limit=200` | — | `status`, parallel `timestamps`/`equity`/`drawdown`, `series[{ts,equity,peak,drawdown_pct}]`, `performance` |
+| `GET /api/metrics?market=crypto&limit=200` | — | `status`, parallel `timestamps`/`equity`/`drawdown`, `series[{ts,equity,peak,drawdown_pct}]`, `performance`, `kpi{win_rate, profit_factor, total_trades, max_drawdown_pct, net_profit_pct, equity}` |
+| `WS /api/ws/metrics?market=crypto` | — | the same JSON as `/api/metrics` pushed once per second with `{type:"metrics", seq}`; the client answers `{"type":"pong"}` and is dropped after 3 unanswered cycles |
 | `GET /api/performance?market=crypto` | — | profit factor, max drawdown, win rate, net profit % of the live/paper book |
 | `GET /api/engine/kill-switch?market=crypto` | — | daily-loss and consecutive-loss breaker state (`blocked`, `reasons`, `day_pnl`) |
 | `POST /api/engine/resume` | `{"market":"crypto"}` | human override of the breaker for the current day (ledgered) |

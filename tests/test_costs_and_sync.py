@@ -556,3 +556,65 @@ def test_a_flash_crash_bar_makes_the_fill_coefficient_climb(settings):
     k, stress = costs.slippage_coefficient(atr=atr_now, atr_baseline=baseline, cfg=bt.cost_cfg)
     assert stress > 1.5
     assert k > bt.cost_cfg.atr_mult
+
+
+# --------------------------------------------------------------------------- crash restore
+def test_startup_sync_restores_from_the_snapshot_when_positions_json_is_lost(tmp_path, settings):
+    """A crash between two writes must not lose the position: the snapshot + venue win."""
+    from tests.test_api import _ready_payload
+
+    root = tmp_path / "crash"
+    engine = TradingEngine(market="crypto", settings=settings, symbols=["TEST/USDT:USDT"], state_dir=root)
+    engine._handle_entry("TEST/USDT:USDT", _ready_payload(settings))
+    size = engine.positions["TEST/USDT:USDT"].size
+    state_dir = engine.state.root
+    assert (state_dir / "snapshot.json").exists()
+
+    (state_dir / "positions.json").unlink()  # the crash lost the last write
+
+    fresh = TradingEngine(market="crypto", settings=settings, symbols=["TEST/USDT:USDT"], state_dir=root)
+    fresh.broker.positions["TEST/USDT:USDT"] = {
+        "symbol": "TEST/USDT:USDT", "side": "long", "entry": 100.05, "size": size,
+        "stop": 98.5, "target": 104.5, "margin": 100.0, "fees": 0.0, "order": {},
+    }
+    report = fresh.startup_sync()
+    assert report["restored_from_disk"] == 1
+    assert [r["symbol"] for r in report["restored"]] == ["TEST/USDT:USDT"]
+    assert report["closed"] == [] and report["untracked"] == []
+    # the venue's entry wins over the stale local one
+    assert fresh.positions["TEST/USDT:USDT"].entry == pytest.approx(100.05)
+    # and the reconciled truth becomes the baseline for the next restart
+    assert (state_dir / "snapshot_reconciled.json").exists()
+
+
+def test_startup_sync_still_closes_ghosts_that_the_snapshot_remembers(tmp_path, settings):
+    from tests.test_api import _ready_payload
+
+    root = tmp_path / "ghost"
+    engine = TradingEngine(market="crypto", settings=settings, symbols=["TEST/USDT:USDT"], state_dir=root)
+    engine._handle_entry("TEST/USDT:USDT", _ready_payload(settings))
+    state_dir = engine.state.root
+    (state_dir / "positions.json").unlink()
+
+    fresh = TradingEngine(market="crypto", settings=settings, symbols=["TEST/USDT:USDT"], state_dir=root)
+    report = fresh.startup_sync()  # venue is flat: the restored ghost must be dropped
+    assert report["restored_from_disk"] == 1
+    assert [r["symbol"] for r in report["closed"]] == ["TEST/USDT:USDT"]
+    assert fresh.positions == {}
+
+
+def test_snapshot_is_written_on_every_position_change(tmp_path, settings):
+    import json
+
+    from tests.test_api import _ready_payload
+
+    engine = TradingEngine(market="crypto", settings=settings, symbols=["TEST/USDT:USDT"],
+                           state_dir=tmp_path / "snap")
+    engine._handle_entry("TEST/USDT:USDT", _ready_payload(settings))
+    path = engine.state.snapshot_path
+    saved = json.loads(path.read_text())
+    assert "TEST/USDT:USDT" in saved["positions"]
+    engine.broker.modify_stop("TEST/USDT:USDT", 99.0)
+    engine.positions["TEST/USDT:USDT"].stop = 99.0
+    engine._persist_snapshot()
+    assert json.loads(path.read_text())["positions"]["TEST/USDT:USDT"]["stop"] == 99.0
