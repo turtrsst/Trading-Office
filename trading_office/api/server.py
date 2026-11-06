@@ -55,17 +55,31 @@ CRYPTO = SCREENER.crypto
 
 _ENGINES: dict[str, TradingEngine] = {}
 _ENGINE_LOCK = threading.RLock()
+#: set by tests / a hot reconfiguration; takes precedence over the file-backed SETTINGS
+_SETTINGS_OVERRIDE: Settings | None = None
+
+
+def _settings() -> Settings:
+    """The live settings.
+
+    A module global is fine for a process, but not for tests or for a config reload while
+    the server is running: a Python reload re-executes the module and would silently
+    replace the very object a test (or an operator) just patched. An explicit override
+    slot keeps that observable instead of magic.
+    """
+    return _SETTINGS_OVERRIDE or SETTINGS
 
 
 # --------------------------------------------------------------------------- helpers
 def _engine(market: str) -> TradingEngine:
     with _ENGINE_LOCK:
         if market not in _ENGINES:
+            settings = _settings()
             _ENGINES[market] = TradingEngine(
                 market=market,
-                settings=SETTINGS,
-                execute=not bool(SETTINGS.get("execution.dry_run", True)),
-                state_dir=SETTINGS.get("engine.state_dir", "state"),
+                settings=settings,
+                execute=not bool(settings.get("execution.dry_run", True)),
+                state_dir=settings.get("engine.state_dir", "state"),
             )
         return _ENGINES[market]
 
@@ -148,6 +162,49 @@ class EngineReconcileRequest(BaseModel):
     close_orphans: bool = False
 
 
+# --------------------------------------------------------------------------- lifecycle
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Start/stop the engine loops with the server process.
+
+    The engine is a background thread, not an asyncio task: ccxt and the IDX client are
+    blocking, and one slow provider call inside the event loop would freeze the websocket
+    that feeds the dashboard — exactly the failure this project is built to avoid. The
+    separation that matters is the *synchronous executor*: `/api/metrics` uses
+    ``def``/``run_in_threadpool``, so a manual CLOSE never runs on the event loop and the
+    1 Hz stream keeps its cadence while the trade is being booked.
+
+    ``engine.auto_start_engine`` (default off) makes a supervised deployment start the
+    loop by itself; without it the web terminal comes up idle and the operator presses Start.
+    """
+    # resolved at lifespan time, not at import time: the flag is part of the running config
+    settings = _settings()
+    autostart = bool(settings.get("engine.auto_start_engine", False))
+    markets = settings.get("engine.auto_start_markets") or ["crypto"]
+    started: list[str] = []
+    if autostart:
+        for market in markets:
+            if market not in ("crypto", "idx"):
+                continue
+            try:
+                engine = _engine(str(market))
+                engine.start(background=True)
+                started.append(str(market))
+            except Exception as exc:  # noqa: BLE001 - never block the API from starting
+                print(f"[engine] could not autostart {market}: {exc}")
+    try:
+        yield
+    finally:
+        for market, engine in list(_ENGINES.items()):
+            try:
+                engine.stop()
+            except Exception:
+                pass
+
+
 # --------------------------------------------------------------------------- app
 def create_app() -> FastAPI:
     app = FastAPI(
@@ -157,7 +214,9 @@ def create_app() -> FastAPI:
             "Expert-Advisor style trading engine: market filter -> signal -> risk -> "
             "execution, for IDX equities and crypto perpetual futures."
         ),
+        lifespan=_lifespan,
     )
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -188,7 +247,26 @@ def create_app() -> FastAPI:
             # presence only: never the key itself, never a prefix of it
             "secrets": _secrets_report(),
             "state_encryption": secure_state.status(),
+            "alerts": _alerts_summary(),
         }
+
+    @app.get("/api/alerts")
+    def alerts_status() -> dict[str, Any]:
+        """What the out-of-band channel would send, and whether it can (never the token)."""
+        engine = _engine("crypto")
+        alerter = getattr(engine, "alerter", None)
+        status = alerter.status() if alerter is not None else {"enabled": False}
+        if alerter is not None:
+            status["chat"] = alerter.chat_fingerprint()
+            status["recent"] = [
+                {"event": row.get("event"), "ok": row.get("ok"), "error": row.get("error")}
+                for row in (alerter.sink or [])[-5:]
+            ]
+        return status
+
+    @app.get("/api/engine/heartbeat")
+    def engine_heartbeat(market: Literal["crypto", "idx"] = "crypto") -> dict[str, Any]:
+        return _engine(market).heartbeat()
 
     @app.get("/api/security")
     def security() -> dict[str, Any]:
@@ -404,6 +482,7 @@ def create_app() -> FastAPI:
             "active_trades": engine.active_trades(marks),
             "open_orders": engine.open_orders(),
             "execution_gate": engine.execution_gate(),
+            "heartbeat": engine.heartbeat(),
             "updated_at": _iso_now(),
         }
 
@@ -567,6 +646,17 @@ def _backtest_data(market: str, symbol: str, bars: int) -> dict[str, Any]:
 
 def _idx_ok() -> bool:
     return IDX.available()
+
+
+def _alerts_summary() -> dict[str, Any]:
+    try:
+        alerter = getattr(_engine("crypto"), "alerter", None)
+        if alerter is None:
+            return {"enabled": False, "configured": False}
+        status = alerter.status()
+        return {k: status[k] for k in ("enabled", "configured", "channel", "cooldown_s")}
+    except Exception:
+        return {"enabled": False, "configured": False}
 
 
 def _secrets_report() -> dict[str, Any]:

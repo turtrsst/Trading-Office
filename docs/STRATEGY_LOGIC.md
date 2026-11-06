@@ -348,3 +348,36 @@ and its break-even move are emitted together):
 
 > This is engineering software, not financial advice. The paper/backtest numbers are
 > simulations and past performance does not imply future returns.
+
+## Execution costs in the backtest (both sides)
+
+Slippage is charged where a real order would pay it, with the same calibrated model on
+every fill:
+
+| Fill | Cost charged | Why |
+| --- | --- | --- |
+| Entry (next bar open) | full model: base + volatility (ATR%) + impact + shock multiplier, plus half-spread | market order into a known book |
+| Take profit / partial | **0** | resting limit order: it fills at its price or not at all |
+| Gap-through stop | **0 extra** | already priced by `gap_adjusted_stop` (the jump *is* the slippage) |
+| Stop / trail / time / invalidation / end-of-data | **0.6 ×** model | market exit into a moving book; cheaper than an entry panic, not free |
+
+Calibration check on 900-bar crypto windows (OOS 35 %): the model charges ≈7.6 bps entry
+and ≈2.9–4.5 bps exit, i.e. ≈11–12 bps round trip at ATR ≈0.8–1.2 %. A flat
+`0.1 × ATR per fill` rule would charge 15–24 bps round trip — roughly 2× — and would
+manufacture a losing strategy out of a break-even one (on SOL that is −0.16 % of equity
+over 6 trades). The coefficient is not a matter of taste: it is measured, and the report
+shows `entry slippage bps` / `exit slippage bps` separately so the assumption is auditable
+(`exit_slippage_bps` also rides on every trade row).
+
+Why the OOS slice is **not** cut before running: EMA-200 / ATR-50 warm-up lives in the
+in-sample bars. Slicing first leaves the OOS run with undefined indicators (it produced
+0 trades when tried). Indicators are warmed on the full series, the split only decides
+*when entries may start*, and no parameter is ever selected on OOS data.
+
+## IDX auto-rejection (ARA/ARB)
+
+`profiles.idx.auto_reject_pct` (default 25 %) is a **veto** in the market filter: if the
+day's move against the previous close has already reached the band, no entry is attempted —
+the exchange would reject the order anyway. It is configuration because the real bands are
+asymmetric per price level and change by regulation; set it from the broker's own feed when
+known, and the gate reports `auto-rejection: +9.12% vs 7.0% daily band` in the skip funnel.

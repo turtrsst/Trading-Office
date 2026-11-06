@@ -195,7 +195,9 @@
       "leverage": 1,
       "atr_soft_cap_pct": 4.0,
       "extreme_spread_mult": 1.6,
-      "size_step": 100
+      "size_step": 100,
+      "auto_reject_pct": 25.0,
+      "_auto_reject_note": "ARA/ARB symmetric band for the automated rule; IDX bands are asymmetric per price level and change by regulation, so set this from the broker's own feed when known."
     }
   },
   "execution": {
@@ -215,5 +217,23 @@
     "universe_limit": 40,
     "cache_ttl_seconds": 120,
     "offline": false
+  },
+  "alerts": {
+    "enabled": false,
+    "channel": "telegram",
+    "cooldown_s": 300,
+    "timeout_s": 5,
+    "events": [
+      "guard_set",
+      "guard_clear",
+      "engine_error",
+      "reconciliation",
+      "watchdog_trip",
+      "kill_switch_trip"
+    ],
+    "telegram": {
+      "chat_id": "",
+      "token_env": "TO_TELEGRAM_TOKEN"
+    }
   }
 }

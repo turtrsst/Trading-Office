@@ -197,6 +197,9 @@ class BacktestResult:
                      if t.get("entry_slippage_bps") is not None]
                 ), 3,
             ) if any(t.get("entry_slippage_bps") is not None for t in self.trades) else None,
+            "avg_exit_slippage_bps": round(
+                statistics.mean([float(t.get("exit_slippage_bps") or 0.0) for t in self.trades]), 3
+            ) if self.trades else None,
             "avg_bars_held": round(statistics.mean([t["bars_held"] for t in self.trades]), 1)
             if self.trades
             else 0.0,
@@ -295,6 +298,34 @@ class Backtester:
             {"kind": "slippage", **estimate.to_dict(), "notional": round(notional, 2)}
         )
         return estimate
+
+    def _exit_slippage_bps(self, *, bar: dict[str, Any], atr: float,
+                          notional: float) -> float:
+        """Slippage charged on the way out.
+
+        Entry slippage alone flatters a backtest: the stop would always fill exactly at
+        the stop price, which is the one fill a real book is most likely to miss. The same
+        cost model runs on exits, but **liquidity-seeking exits are cheaper**: a resting
+        take-profit is a limit fill, and a stop is a market order into a book that is
+        already moving. Both are represented instead of assuming the best case.
+        """
+        estimate = costs.estimate_slippage(
+            price=float(bar.get("close") or 0.0) or 1.0,
+            atr=atr, notional=notional, quote_volume=bar.get("quote_volume"),
+            cfg=self.cost_cfg, atr_baseline=None,
+        )
+        self.cost_events.append({"kind": "slippage", **estimate.to_dict(), "side": "exit"})
+        return estimate.slippage_bps
+
+    @staticmethod
+    def _exit_kind_factor(reason: str) -> float:
+        """How much of the modelled slippage a given exit actually pays."""
+        text = (reason or "").lower()
+        if "take profit" in text or "partial" in text or "target" in text:
+            return 0.0  # resting limit order: filled at its own price or not at all
+        if "gap" in text:
+            return 0.0  # gap openings are already priced by gap_adjusted_stop
+        return 0.6  # stop / time / invalidation exits are market orders
 
     def _atr_baseline(self, closed: Sequence[dict[str, Any]]) -> float | None:
         """Mean ATR over the last ``shock_baseline_bars`` bars — the shock reference.
@@ -606,6 +637,12 @@ class Backtester:
                                 exit_price, exit_reason = fill, "partial closed the whole position"
 
                 if exit_price is not None:
+                    # exits pay slippage too (see _exit_kind_factor for the per-reason share)
+                    exit_slip_bps = self._exit_slippage_bps(
+                        bar=bar, atr=atr_now, notional=abs(exit_price * position.size)
+                    ) * self._exit_kind_factor(exit_reason)
+                    if exit_slip_bps:
+                        exit_price *= 1 - (1 if long else -1) * exit_slip_bps / 10_000.0
                     fee = self._commission("sell" if long else "buy", abs(exit_price * position.size))
                     direction = 1.0 if long else -1.0
                     gross = (exit_price - position.entry) * position.size * direction
@@ -647,6 +684,7 @@ class Backtester:
                         "bars_held": position.bars_held,
                         "rr_planned": round(abs(position.target - position.entry) / rpu, 2),
                         "entry_slippage_bps": position.meta.get("slippage_bps"),
+                        "exit_slippage_bps": round(exit_slip_bps, 3),
                     }
                     result.trades.append(trade)
                     closed_today.append(trade)
@@ -763,6 +801,13 @@ class Backtester:
             last = bars[min(last_i, len(bars) - 1)]
             exit_price = float(last["close"])
             long = position.side == "long"
+            # a forced exit is a market exit: it pays the same slippage a live one would
+            exit_slip_bps = self._exit_slippage_bps(
+                bar=last, atr=atr_now if "atr_now" in locals() else 0.0,
+                notional=abs(exit_price * position.size),
+            ) * self._exit_kind_factor("end of data")
+            if exit_slip_bps:
+                exit_price *= 1 - (1 if long else -1) * exit_slip_bps / 10_000.0
             fee = self._commission("sell" if long else "buy", abs(exit_price * position.size))
             gross = (exit_price - position.entry) * position.size * (1 if long else -1)
             pnl = gross - fee - float(position.meta.get("fees", 0.0))
@@ -788,6 +833,8 @@ class Backtester:
                     if initial_size
                     else 0.0,
                     "reason": "end of data",
+                    "entry_slippage_bps": position.meta.get("slippage_bps"),
+                    "exit_slippage_bps": round(exit_slip_bps, 3),
                     "entry_reason": " | ".join(position.meta.get("reasons", [])),
                     "opened_at": position.opened_at,
                     "closed_at": str(last["time"]),

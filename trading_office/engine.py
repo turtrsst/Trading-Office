@@ -119,6 +119,10 @@ class TradingEngine:
         )
         self.on_event = on_event
         self.lock = threading.RLock()
+        # out-of-band alerting: disabled and inert unless config + environment say otherwise
+        from .alerts import Alerter
+
+        self.alerter: Alerter | None = Alerter.from_settings(self.settings, market)
 
         equity = float(
             self.settings.get(
@@ -184,11 +188,13 @@ class TradingEngine:
         self.status.running = True
         self.status.started_at = dt.datetime.now(dt.timezone.utc).isoformat()
         poll = float(self.settings.get("execution.poll_seconds", 15))
+        self._last_beat = time.time()
         self._emit({"event": "engine_started", "market": self.market, "mode": self.mode})
         try:
             while not self._stop.is_set():
                 try:
                     self.cycle()
+                    self._last_beat = time.time()
                 except Exception as exc:  # keep the loop alive, log loudly
                     self.status.last_errors.append(f"{type(exc).__name__}: {exc}")
                     self._emit({"event": "engine_error", "error": str(exc)})
@@ -196,6 +202,43 @@ class TradingEngine:
         finally:
             self.status.running = False
             self._emit({"event": "engine_stopped", "market": self.market})
+
+    def heartbeat(self) -> dict[str, Any]:
+        """Is the loop actually cycling?
+
+        ``status.running`` only means the thread object exists. A cycle wedged inside a
+        provider call looks perfectly healthy from the outside — the web UI keeps serving,
+        the badge stays green, and no order is ever managed again. This compares the last
+        cycle timestamp with the configured poll interval, and exposes the verdict so both
+        the supervisor and the UI can act on it.
+        """
+        poll = float(self.settings.get("execution.poll_seconds", 15))
+        # a cycle may legitimately take a few polls (rate limits, retries); allow 3 + slack
+        limit = max(60.0, poll * 3.0 + 30.0)
+        last = self.status.last_cycle_at
+        silent = None
+        if last:
+            try:
+                stamp = dt.datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+                silent = (dt.datetime.now(dt.timezone.utc) - stamp).total_seconds()
+            except ValueError:
+                silent = None
+        age = (time.time() - getattr(self, "_last_beat", 0.0)) if getattr(self, "_last_beat", 0) else None
+        silent_s = max([v for v in (silent, age) if v is not None], default=None)
+        ok = not self.status.running or silent_s is None or silent_s <= limit
+        if not ok:
+            self._emit({
+                "event": "watchdog_trip", "market": self.market,
+                "silent_s": round(silent_s or 0, 1), "limit_s": limit,
+                "last_cycle_at": last,
+            })
+        return {
+            "ok": ok,
+            "running": self.status.running,
+            "silent_s": round(silent_s, 1) if silent_s is not None else None,
+            "limit_s": limit,
+            "last_cycle_at": last,
+        }
 
     # ------------------------------------------------------------------ one cycle
     def cycle(self) -> dict[str, Any]:
@@ -475,7 +518,30 @@ class TradingEngine:
                 break
         max_daily = float(self.settings.get("engine.max_daily_loss_pct", 2.0))
         max_streak = int(self.settings.get("engine.max_consecutive_losses", 4))
-        daily_loss_pct = (-today_pnl / day_start * 100.0) if day_start > 0 and today_pnl < 0 else 0.0
+
+        # Daily loss must be measured against the equity the day OPENED with, not against
+        # (equity - realised pnl). The second form silently understates the loss whenever
+        # the book carries margin: with 3x leverage a -1.5% move in the positions is -4.5%
+        # of equity, and against a realised-only baseline that reads as -1.5%, so a -3%
+        # breaker never fires. The mark is written once per day and survives restarts.
+        mark = self.state.get_setting("day_start_equity") or {}
+        if isinstance(mark, dict) and str(mark.get("day")) == day and float(mark.get("equity") or 0) > 0:
+            day_start = float(mark["equity"])
+            basis = "day_open_mark"
+        else:
+            # first look today (fresh process, or first run): realised P&L is already in
+            # equity, so subtracting it recovers the opening balance of the cash book
+            day_start = equity - today_pnl
+            try:
+                self.state.set_setting("day_start_equity", {
+                    "day": day, "equity": round(day_start, 4),
+                    "at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                })
+            except Exception:
+                pass
+            basis = "first_look_of_day"
+        daily_loss_pct = ((day_start - equity) / day_start * 100.0) if day_start > 0 else 0.0
+        daily_loss_pct = max(0.0, daily_loss_pct)
         resumed_today = self._guard_resumed_on == day
         reasons = []
         if not resumed_today:
@@ -483,6 +549,7 @@ class TradingEngine:
                 reasons.append(f"daily loss {daily_loss_pct:.2f}% >= {max_daily:.2f}%")
             if streak >= max_streak:
                 reasons.append(f"{streak} consecutive losses >= {max_streak}")
+        was_blocked = bool((self.status.guard or {}).get("blocked"))
         self.status.guard = {
             "blocked": bool(reasons),
             "reasons": reasons,
@@ -492,9 +559,18 @@ class TradingEngine:
             "consecutive_losses": streak,
             "max_daily_loss_pct": max_daily,
             "max_consecutive_losses": max_streak,
+            "day_start_equity": round(day_start, 2),
+            "basis": basis,
+            "unrealised_included": True,
             "resumed_on": self._guard_resumed_on,
             "venue": getattr(self.broker, "name", "paper") if not isinstance(self.broker, PaperBroker) else "paper",
         }
+        # emit on the transition only: a breaker that fires every cycle would spam the
+        # notifier (and rate-limit itself out of usefulness)
+        if self.status.guard["blocked"] and not was_blocked:
+            self._emit({"event": "guard_set", "market": self.market, **self.status.guard})
+        elif was_blocked and not self.status.guard["blocked"]:
+            self._emit({"event": "guard_clear", "market": self.market, **self.status.guard})
         return self.status.guard
 
     def resume(self) -> dict[str, Any]:
@@ -1097,6 +1173,11 @@ class TradingEngine:
 
     # ------------------------------------------------------------------ events
     def _emit(self, event: dict[str, Any]) -> None:
+        if self.alerter is not None:
+            try:
+                self.alerter.notify(event)   # off the hot path, deduplicated inside
+            except Exception:
+                pass
         if self.on_event:
             try:
                 self.on_event(event)

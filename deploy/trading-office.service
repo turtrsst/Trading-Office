@@ -1,0 +1,49 @@
+# Linux equivalent of the NSSM/Windows-Service recipe, with the parts that matter for a
+# trading bot: a watchdog that acts on a *stalled* loop (not just a dead process), a
+# rotating log, and a hard stop timeout so a wedged cycle cannot hang a shutdown.
+#
+#   sudo cp deploy/trading-office.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now trading-office
+#   journalctl -u trading-office -f          # or tail logs/trading-office.log
+#
+# On Windows Server the equivalent is NSSM with the same arguments (see docs/OPERATIONS.md):
+#   nssm install TradingOffice  C:\trading_office\.venv\Scripts\python.exe -m trading_office.cli supervise --port 8000
+[Unit]
+Description=Trading Office (web terminal + paper/live engine loop)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=trading
+WorkingDirectory=/opt/trading-office
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/opt/trading-office/.env
+# supervise = restart with backoff + heartbeat probe + rotating log (trading_office/supervisor.py)
+ExecStart=/opt/trading-office/.venv/bin/python -m trading_office.cli supervise --host 127.0.0.1 --port 8000 --log logs/trading-office.log
+Restart=always
+RestartSec=5
+# give the engine time to finish reconciling before a restart
+TimeoutStopSec=45
+KillSignal=SIGTERM
+# a wedged event loop must not survive a stop request
+KillMode=mixed
+# the supervisor already rotates its own log; journald keeps the boot-time messages
+StandardOutput=journal
+StandardError=journal
+
+# --- hardening: the bot needs the network and its own state directory, nothing else
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/trading-office/state /opt/trading-office/logs
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

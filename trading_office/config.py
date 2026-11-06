@@ -32,6 +32,9 @@ DEFAULTS: dict[str, Any] = {
         "cooldown_bars": 3,
         "equity_idr": 100_000_000,
         "equity_usdt": 1_000.0,
+        # supervised deployments start the loop with the server; interactive ones do not
+        "auto_start_engine": False,
+        "auto_start_markets": ["crypto"],
     },
     "market_filter": {
         "trend_ema": 200,

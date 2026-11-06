@@ -234,6 +234,59 @@ Adjust the model per market in `profiles.<market>.execution_costs` (`latency_ms`
 `shock_atr_mult`, `shock_slippage_mult`, `gap_reject_atr`, `gap_reject_spread_mult`,
 `gap_fill_fraction`, `gap_cooldown_bars`, `max_risk_multiplier`, `auction_windows`).
 
+## Keeping it alive 24/7
+
+Two layers, because they answer different questions.
+
+| Layer | Question it answers | Where |
+| --- | --- | --- |
+| `trading-office supervise` | *did the process die, and is the loop still cycling?* | `trading_office/supervisor.py` |
+| systemd / NSSM / Task Scheduler | *is the supervisor itself running after a reboot?* | `deploy/trading-office.service` |
+
+```bash
+python -m trading_office.cli supervise --port 8000 --log logs/trading-office.log
+```
+
+* **Restart with backoff** (2 s → 120 s cap) when the child exits, so a crash loop cannot
+  spin the CPU or re-hit the venue every second.
+* **Heartbeat probe, not process poll:** every 20 s it reads `/api/engine/heartbeat`. After
+  3 consecutive failures (and a 45 s startup grace) it kills and restarts the child. This
+  is the failure an external service manager cannot see: the API answers, the badge is
+  green, and no stop has been managed for an hour.
+* **Rotating log** (`RotatingFileHandler`, 10 MB × 5). A 24/7 deployment runs out of disk
+  before it runs out of CPU, and an unrotated stdout redirect is how that happens.
+
+`engine.auto_start_engine` (default **off**) makes an unsupervised `serve` start the loop by
+itself; the shipped config leaves it off so opening the dashboard never starts trading.
+The lifespan hook starts and stops the loop with the process, so a supervisor restart
+cannot leave a second engine attached to the same state directory.
+
+Linux unit: `deploy/trading-office.service` (hardened, `Restart=always`,
+`TimeoutStopSec=45`). Windows Server: see the appendix below.
+
+## Out-of-band alerts (Telegram)
+
+The dashboard only helps while somebody is looking at it. `alerts` in
+`config/settings.json` + `TO_TELEGRAM_TOKEN` in `.env` add the second pair of eyes:
+
+| Event | Severity | When |
+| --- | --- | --- |
+| `guard_set` | critical | daily-loss / loss-streak breaker trips (**on the transition only**) |
+| `engine_error` | critical | an exception escaped a cycle |
+| `watchdog_trip` | critical | the loop stopped beating past its limit |
+| `reconciliation` | warning | `startup_sync` found a mismatch |
+| `guard_clear` | info | operator resumed trading |
+
+```bash
+trading-office doctor          # → "alerts   off — set alerts.enabled + TO_TELEGRAM_TOKEN + chat_id"
+GET /api/alerts                # enabled/configured/cooldown + the last 5 attempts (never the token)
+```
+
+Rules that are deliberate: disabled by default; sending happens on a daemon thread with a
+5 s timeout so a dead network can never stall a cycle; identical alerts are deduplicated
+for `cooldown_s` (otherwise a wedged provider gets the bot rate-limited); the bot token
+lives in the environment, never in config or in a log line.
+
 ## Secrets: `.env`, credentials, and state at rest
 
 Three secrets matter and each has exactly one home:
@@ -269,6 +322,22 @@ Details that are easy to get wrong:
   it is rewritten. Ledger lines are appended encrypted once a key is present.
 * `GET /api/security` and `doctor` report `set` / `via` / `length` / an 8-character
   fingerprint. No endpoint returns a secret or a prefix of it.
+
+## Kill switch: what "daily loss" is measured against
+
+`engine.max_daily_loss_pct` is checked in `guard_state()` and read by the UI as
+`status.guard`. Two details matter more than the threshold:
+
+* **Basis = equity at the day's open**, persisted as `day_start_equity` in `runtime.json`
+  and reused across restarts. Measuring against `equity - realised_pnl` instead
+  understates the loss whenever margin is deployed: a −1.5 % move on 3× notional is
+  −4.5 % of equity, and the realised-only baseline reads it as −1.5 %, so a −3 % breaker
+  never fires in the one scenario that needs it (a gap straight through the stop).
+* **Unrealised P&L counts.** A gap leaves the whole loss open; the breaker must see it
+  before the exit is even attempted.
+
+`guard_state()` returns `basis` (`day_open_mark` / `first_look_of_day`) and
+`day_start_equity` so the number on screen can be audited.
 
 ## Manual controls (CLOSE / CANCEL)
 
@@ -320,3 +389,49 @@ curl -s 'localhost:8000/api/performance?market=idx'
 
 Open positions contribute an unrealised mark to the last point; a flat book ends the curve
 at the last closed trade.
+
+## Appendix: Windows Server 2016 (NSSM, or Task Scheduler)
+
+Nothing in the project requires Linux, but a Windows deployment needs a process manager —
+`systemd` does not exist there. Both recipes below run the *same* command as the Linux
+unit, so the supervision, heartbeat probe and log rotation behave identically.
+
+**NSSM (a real service, survives logout, restarts on crash)**
+
+```bat
+C:\tools\nssm.exe install TradingOffice ^
+  C:\trading_office\.venv\Scripts\python.exe ^
+  -m trading_office.cli supervise --port 8000 --log C:\trading_office\logs\trading-office.log
+C:\tools\nssm.exe set TradingOffice AppDirectory C:\trading_office
+C:\tools\nssm.exe set TradingOffice Start SERVICE_AUTO_START
+C:\tools\nssm.exe set TradingOffice AppExit Default Restart
+C:\tools\nssm.exe set TradingOffice AppThrottle 5000
+net start TradingOffice
+```
+
+Set `TO_API_KEY` / `TO_API_SECRET` / `TO_STATE_ENCRYPTION_KEY` as **system environment
+variables** (or point `TO_ENV_FILE` at a `.env` outside the repo). Do not rely on a `.env`
+inside the checkout if the service account cannot read it.
+
+**Task Scheduler (no extra binary)**
+
+1. Create Task → *Run whether user is logged on or not*, *Run with highest privileges*.
+2. Trigger: **At startup**. Action: the `python.exe` above with the same arguments,
+   *Start in* `C:\trading_office`.
+3. Conditions: uncheck *Start the task only if the computer is on AC power* (a UPS still
+   reports AC, but laptops do not).
+4. Settings: *If the task fails, restart every* 1 minute, *Attempt restart up to* 3 times;
+   *Stop the task if it runs longer than* → **disabled** (it is supposed to run forever).
+
+`Ctrl+C`, `SIGTERM` and the Windows *Stop service* action all reach the same supervisor
+shutdown path: the child gets `SIGTERM`/`terminate`, then a hard kill after
+`shutdown_grace_s` (10 s), so a wedged engine cannot pin the machine in "stopping".
+
+### What this appendix does **not** cover
+
+MetaTrader 5. There is no MT5 execution path in this codebase (it is Windows-only, and the
+repo's venue abstraction is `paper` / `ccxt`); a `MT5_*` variable is reported as *ignored*
+by `doctor` and `/api/security` rather than silently accepted. If an MT5 venue is ever
+added, it needs the zombie-terminal watchdog described in the design notes — an MT5 Python
+call talks to `terminal64.exe` over IPC, so a frozen GUI looks like a healthy process that
+rejects every order.

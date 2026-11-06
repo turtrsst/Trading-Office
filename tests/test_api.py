@@ -320,3 +320,33 @@ def test_health_reports_encryption_and_secret_presence(client):
     body = client.get("/api/health").json()
     assert "secrets" in body and "state_encryption" in body
     assert "set" in body["secrets"]["TO_API_KEY"]
+
+
+def test_engine_autostart_is_off_by_default_and_starts_when_configured():
+    """A supervised deployment should not need somebody to press Start."""
+    from trading_office.api import server as server_module
+
+    # default: the API must come up idle, not start trading as a side effect of a request.
+    # The shipped config file is the contract (this checkout may have it switched on for
+    # the supervised deployment, which is exactly the point of the flag).
+    from trading_office.config import DEFAULTS
+
+    assert DEFAULTS["engine"].get("auto_start_engine", False) is False
+
+    from trading_office.config import Settings
+
+    saved = server_module._SETTINGS_OVERRIDE
+    raw = {**server_module.SETTINGS.raw,
+           "engine": {**server_module.SETTINGS.raw.get("engine", {}),
+                      "auto_start_engine": True, "auto_start_markets": ["crypto"]}}
+    server_module._SETTINGS_OVERRIDE = Settings(raw=raw, path=server_module.SETTINGS.path)
+    try:
+        server_module._ENGINES.pop("crypto", None)
+        with TestClient(server_module.app):
+            engine = server_module._ENGINES.get("crypto")
+            assert engine is not None and engine.status.running is True
+        # leaving the context stops the loop (no thread survives the server)
+        assert server_module._ENGINES["crypto"].status.running is False
+    finally:
+        server_module._SETTINGS_OVERRIDE = saved
+        server_module._ENGINES.pop("crypto", None)

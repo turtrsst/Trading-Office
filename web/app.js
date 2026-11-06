@@ -159,6 +159,9 @@
     } else {
       badge.className = "health-badge is-quiet";
       text.textContent = loaded ? `${loaded} key(s) loaded` : "plaintext · no API keys";
+      if (health.alerts && health.alerts.enabled && health.alerts.configured) {
+        text.textContent += " · alerts on";
+      }
       badge.title = "Set TO_STATE_ENCRYPTION_KEY to encrypt state/ at rest; "
         + "TO_API_KEY / TO_API_SECRET (or CCXT_API_KEY / CCXT_SECRET_KEY) for live execution.";
     }
@@ -626,6 +629,25 @@
       : `<tr><td colspan="10" class="muted">No trades in the out-of-sample window — the filters were strict. Check the skip funnel on the right.</td></tr>`;
   }
 
+  /* ------------------------------------------------------------------ debug hooks
+     The console has no access to anything inside this IIFE, which made the toast/action
+     workflow impossible to exercise without waiting for a real trade. These hooks are the
+     supported way to drive the UI from DevTools — deliberately small, read-mostly, and
+     namespaced so they cannot collide with a page global. The state-changing ones go
+     through the same code path as the buttons (including the confirm dialog). */
+  window.TO = Object.freeze({
+    version: "1.0.0",
+    toast: (message, tone) => toast(String(message), tone === "error", tone === "warn" ? "warn" : undefined),
+    health: (state, meta) => setHealth(state, meta),
+    reconnect: () => { closeMetricsSocket(); connectMetricsSocket(); },
+    frame: () => WS.last,
+    refresh: () => loadEngine(),
+    openPosition: () => closePosition,
+    cancel: () => cancelOrder,
+    // UI-only dry run of the close flow with a fake row: never touches the backend
+    previewClose: (symbol) => closePosition(String(symbol || "BTC/USDT:USDT"), { preview: true }),
+  });
+
   /* ------------------------------------------------------------------ live metrics (WS) */
   const WS = {
     sock: null,
@@ -872,15 +894,28 @@
     const gate = frame.execution_gate || {};
     set("book-meta", `${(frame.active_trades || []).length} position(s) · ${(frame.open_orders || []).length} resting order(s)`
       + (gate.note ? ` · ${gate.note}` : ""));
+
+    // an alive websocket can sit on top of a wedged engine loop: the heartbeat says which
+    const beat = frame.heartbeat || {};
+    if (beat.ok === false) {
+      setHealth("warn", `engine loop silent ${beat.silent_s}s (limit ${beat.limit_s}s)`);
+      set("eng-healthy-note", "loop stalled");
+    } else if (beat.running) {
+      set("eng-healthy-note", `loop healthy · last cycle ${beat.silent_s ?? 0}s ago`);
+    }
   }
 
-  async function closePosition(symbol) {
+  async function closePosition(symbol, options) {
     const ok = await confirmAction(
       `Close ${symbol}?`,
       "A reduce-only market order will flatten this position at the current price. The resting stop/target are cancelled and the trade is booked in the ledger.",
       "Close position",
     );
     if (!ok) return;
+    if (options && options.preview) {
+      toast(`Preview only — ${symbol} was not sent to the backend.`, false, "warn");
+      return;
+    }
     try {
       const result = await api("/api/trade/close", {
         method: "POST",

@@ -290,6 +290,26 @@ def evaluate(
     if not sess_ok:
         reasons.append("session: " + "; ".join(parts))
 
+    # ---------------------------------------------------------------- 3b. IDX auto-rejection
+    # ARA/ARB: IDX halts a name when it moves beyond the daily band, and every order sent
+    # into a halted name is rejected. The band itself changes by price level and by
+    # regulation, so it is configuration, not a constant — but the *check* belongs here,
+    # next to the other reasons an entry must not be attempted.
+    ara_ok = True
+    ara_note = ""
+    if ctx.market == "idx" and ctx.prev_close:
+        band = float(profile.get("auto_reject_pct", 0.0) or 0.0)
+        if band > 0:
+            move_pct = (ctx.price - ctx.prev_close) / ctx.prev_close * 100.0
+            if abs(move_pct) >= band:
+                ara_ok = False
+                ara_note = (f"auto-rejection: {move_pct:+.2f}% vs {band:.1f}% daily band "
+                            f"(an order here is rejected by the exchange)")
+            else:
+                ara_note = f"auto-rejection band {move_pct:+.2f}% / ±{band:.1f}% (ok)"
+    if ara_ok and ara_note:
+        parts.append(ara_note)
+
     # ---------------------------------------------------------------- 4. spread / liquidity
     bps, estimated = spread_bps(ctx)
     max_bps = float(profile.get("max_spread_bps", 8.0))
@@ -329,11 +349,15 @@ def evaluate(
     if not (spread_ok and liq_ok):
         reasons.append("spread: " + "; ".join(sp_parts))
 
+    # auto-rejection is a veto, not a tally: a rejected order is not a near miss
+    if not ara_ok:
+        reasons.append(ara_note)
+
     # ---------------------------------------------------------------- tally
     passed_count = sum(1 for c in checks if c.passed)
     required = int(config.get("min_filters_passed", 3))
     mandatory_ok = direction is not None or not config.get("require_trend_filter", True)
-    overall = passed_count >= required and mandatory_ok
+    overall = passed_count >= required and mandatory_ok and ara_ok
     if overall and direction is None:
         reasons.append("trend filter mandatory but flat")
     return FilterResult(

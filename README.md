@@ -245,10 +245,22 @@ trading_office/
   backtest/engine.py          bar-by-bar backtester + walk-forward
   cli.py                      terminal
 web/                          the web terminal (no build step, no frameworks)
-tests/                        103 unit + API tests, all offline
+tests/                        125 unit + API tests, all offline
 docs/                         strategy logic, API, MCP, operations
 scripts/make_demo_data.py     writes data/*.json for the backtester
 ```
+
+## Running 24/7
+
+```bash
+python -m trading_office.cli supervise --port 8000 --log logs/trading-office.log
+```
+
+Restart-with-backoff when the process dies, a heartbeat probe that restarts it when the
+engine **loop** stops cycling (the failure an external service manager cannot see),
+rotating logs, and optional Telegram alerts on breaker trips / cycle errors / watchdog
+events. Linux unit in `deploy/trading-office.service`; Windows (NSSM / Task Scheduler)
+recipes in `docs/OPERATIONS.md`.
 
 ## Secrets & state at rest
 
@@ -270,7 +282,7 @@ trading-office doctor     # shows credential presence + whether state/ is sealed
 
 ```sh
 pip install pytest httpx
-python -m pytest -q           # 103 passed, entirely offline
+python -m pytest -q           # 125 passed, entirely offline
 ```
 
 The suite covers indicator maths, each filter's pass/block path, the no-trigger veto, the

@@ -404,3 +404,75 @@ def test_walk_forward_keeps_oos_separate(settings):
     # every OOS trade must be inside the unseen slice
     for trade in oos["trades"]:
         assert trade["opened_at"] >= report["split_time"]
+
+
+# --------------------------------------------------------------------------- exit-side costs
+def _bt(market="crypto"):
+    from trading_office.backtest.engine import Backtester
+    from trading_office.config import Settings
+
+    return Backtester(market=market, settings=Settings.load())
+
+
+def test_exit_slippage_is_charged_on_market_exits_only():
+    bt = _bt()
+    # resting limit fills (take profit / partial) and gap openings are already priced
+    assert bt._exit_kind_factor("take profit hit") == 0.0
+    assert bt._exit_kind_factor("partial 50% at 2R") == 0.0
+    assert bt._exit_kind_factor("stop loss (gap through)") == 0.0
+    # market exits pay a share of the model, not zero and not the full entry cost
+    for reason in ("stop loss hit", "trailing stop hit (profit locked)", "time stop: 96 bars",
+                   "invalidation: opposite signal", "end of data"):
+        factor = bt._exit_kind_factor(reason)
+        assert 0.0 < factor < 1.0, reason
+
+
+def test_exit_slippage_bps_scale_with_atr_without_double_counting_entry():
+    bt = _bt()
+    bar = {"close": 100.0, "high": 101.0, "low": 99.0}
+    quiet = bt._exit_slippage_bps(bar=bar, atr=0.5, notional=1500.0)
+    wild = bt._exit_slippage_bps(bar=bar, atr=3.0, notional=1500.0)
+    assert 0.0 < quiet < wild
+    # and it is recorded for the cost report, tagged as an exit
+    kinds = [e for e in bt.cost_events if e.get("kind") == "slippage"]
+    assert kinds and all(e.get("side") == "exit" for e in kinds)
+
+
+def test_walk_forward_reports_exit_slippage_for_every_trade():
+    from trading_office.api.server import _backtest_data
+    from trading_office.backtest import walk_forward
+    from trading_office.config import Settings
+
+    data = _backtest_data("crypto", "SOL/USDT:USDT", 600)
+    report = walk_forward(market="crypto", symbol="SOL/USDT:USDT", bars=data["bars"][-600:],
+                          settings=Settings.load(), oos_fraction=0.35)
+    oos = report["out_of_sample"]
+    assert oos["trades"], "expected at least one OOS trade on SOL"
+    for trade in oos["trades"]:
+        assert "exit_slippage_bps" in trade
+        assert trade["exit_slippage_bps"] >= 0.0
+    assert oos["metrics"]["avg_exit_slippage_bps"] is not None
+    assert oos["metrics"]["avg_exit_slippage_bps"] < oos["metrics"]["avg_entry_slippage_bps"]
+
+
+def test_idx_auto_rejection_vetoes_an_entry():
+    """A halted name must not receive an order: ARA/ARB is a veto, not a tally point."""
+    settings = Settings.load()
+    bars = list(reversed(trend_bars(260)))  # rising series -> long bias, all gates warm
+    ctx = _ctx(bars, bars)
+    ctx.market = "idx"
+    ctx.prev_close = 100.0
+    ctx.price = 109.0          # +9 % on the day
+    ctx.tick_size = 25.0
+
+    profile = {**settings.profile("idx"), "sessions": []}
+    config = settings.merged("market_filter", "engine")
+
+    profile["auto_reject_pct"] = 25.0
+    inside = market_filter.evaluate(ctx, profile=profile, config=config)
+    assert not any("auto-rejection" in reason for reason in inside.reasons)
+
+    profile["auto_reject_pct"] = 7.0   # tighter band: +9 % is beyond it
+    beyond = market_filter.evaluate(ctx, profile=profile, config=config)
+    assert beyond.passed is False
+    assert any("auto-rejection" in reason for reason in beyond.reasons)

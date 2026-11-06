@@ -371,6 +371,7 @@ def cmd_backtest(args: argparse.Namespace, settings: Settings) -> int:
         ["sharpe", ins["sharpe"], m["sharpe"]],
         ["partials (2R)", ins.get("partials", 0), m.get("partials", 0)],
         ["entry slippage bps", ins.get("avg_entry_slippage_bps"), m.get("avg_entry_slippage_bps")],
+        ["exit slippage bps", ins.get("avg_exit_slippage_bps"), m.get("avg_exit_slippage_bps")],
         ["gap-through stops", ins.get("gap_stops", 0), m.get("gap_stops", 0)],
     ]
     print(table(["METRIC", "IN-SAMPLE (used for selection)", "OUT-OF-SAMPLE (unseen)"], rows, ["l", "r", "r"]))
@@ -431,12 +432,19 @@ def _security_checks(settings: Settings) -> list[tuple[str, bool, str]]:
     have = sum(1 for entry in creds.values() if entry["set"])
     via = ", ".join(f"{k} via {v['via']}" for k, v in creds.items() if v["set"]) or "none"
     sealing = secure_state.status()
+    from .alerts import Alerter
+
+    alerter = Alerter.from_settings(settings)
     return [
         (".env", env_file["found"],
          f"{env_file['file']} · {env_file['loaded']} key(s)" if env_file["found"]
          else "not found — copy .env.example to .env (variables also work without it)"),
         ("credentials", have == len(creds),
          f"{have}/{len(creds)} loaded ({via}); live execution stays off until both exist"),
+        ("alerts", alerter.enabled and alerter.configured,
+         f"{alerter.channel} ready · {len(alerter.events)} event(s), {alerter.cooldown_s:.0f}s cooldown"
+         if alerter.enabled and alerter.configured
+         else "off — set alerts.enabled + TO_TELEGRAM_TOKEN + chat_id for 24/7 alerting"),
         ("state at rest", bool(sealing.get("encrypted")),
          f"{sealing.get('algorithm')} via {sealing.get('source')}" if sealing.get("encrypted")
          else "plaintext state/ — set TO_STATE_ENCRYPTION_KEY to seal it"),
@@ -467,6 +475,24 @@ def cmd_doctor(args: argparse.Namespace, settings: Settings) -> int:
     print(dim("  and labels every row with its source."))
     print()
     return 0
+
+
+def cmd_supervise(args: argparse.Namespace, settings: Settings) -> int:
+    """Keep the API + engine loop alive, and restart it when the loop stops cycling."""
+    from .supervisor import Supervisor, SupervisorConfig, configure_logging, serve_command
+
+    info = configure_logging(args.log, level="INFO")
+    config = SupervisorConfig(
+        command=serve_command(host=args.host, port=args.port),
+        host="127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host,
+        port=args.port, market=args.market, log_file=info["file"],
+    )
+    print(f"  supervisor: http://{args.host}:{args.port} · log {info['file']} "
+          f"(rotating {info['max_bytes'] // (1024*1024)} MB × {info['backups']})")
+    print(f"  probes /api/engine/heartbeat every {config.check_interval_s:.0f}s · "
+          f"restart after {config.max_stalled_checks} failed beats")
+    supervisor = Supervisor(config)
+    return supervisor.run(max_restarts=args.max_restarts or None)
 
 
 def cmd_serve(args: argparse.Namespace, settings: Settings) -> int:
@@ -664,6 +690,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("supervise", help="run the API under a restarting, heartbeat-checking supervisor")
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--market", choices=["idx", "crypto"], default="crypto")
+    p.add_argument("--log", default="logs/trading-office.log", help="rotating log file")
+    p.add_argument("--max-restarts", dest="max_restarts", type=int, default=0,
+                   help="give up after N restarts (0 = never)")
+    p.set_defaults(func=cmd_supervise)
 
     p = sub.add_parser("doctor", help="check providers, config and execution mode")
     p.set_defaults(func=cmd_doctor)

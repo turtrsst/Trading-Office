@@ -766,3 +766,175 @@ def test_plaintext_state_keeps_working_when_encryption_is_enabled(tmp_path, monk
     assert secure_state.looks_encrypted(store.positions_path.read_bytes()) is True
     assert store.positions()["TLKM"]["entry"] == 3250.0
     secure_state._key._cache = None
+
+
+# --------------------------------------------------------------------------- kill switch basis
+def test_daily_loss_uses_the_day_open_mark_not_just_realised_pnl(tmp_path, settings):
+    """A gap leaves the whole loss unrealised; the breaker must still see it."""
+    from tests.test_api import _ready_payload
+
+    engine = TradingEngine(market="crypto", settings=settings, symbols=["GAP/USDT:USDT"],
+                           state_dir=tmp_path / "gap", execute=True)
+    engine._handle_entry("GAP/USDT:USDT", _ready_payload(settings, symbol="GAP/USDT:USDT"))
+    position = engine.positions["GAP/USDT:USDT"]
+    day_open = engine.broker.equity({position.symbol: position.entry})
+
+    # 8R gap straight through the stop: nothing is realised, the loss is purely unrealised
+    marked = day_open + (position.entry - 8 * position.risk_per_unit - position.entry) * position.size
+    assert marked < day_open * 0.98
+    engine.broker.equity = lambda marks=None, value=marked: value  # type: ignore[assignment]
+
+    guard = engine.guard_state()
+    assert guard["basis"] == "day_open_mark"
+    assert guard["daily_loss_pct"] > 2.0
+    assert guard["blocked"] is True
+    assert any("daily loss" in reason for reason in guard["reasons"])
+    # the old baseline (equity - realised pnl) would have measured zero here
+    assert engine.state.closed_trades() == []
+
+
+def test_kill_switch_refuses_new_entries_once_daily_loss_is_hit(tmp_path, settings):
+    from tests.test_api import _ready_payload
+
+    engine = TradingEngine(market="crypto", settings=settings, symbols=["GAP/USDT:USDT"],
+                           state_dir=tmp_path / "gap2", execute=True)
+    engine._handle_entry("GAP/USDT:USDT", _ready_payload(settings, symbol="GAP/USDT:USDT"))
+    position = engine.positions["GAP/USDT:USDT"]
+    day_open = engine.broker.equity({position.symbol: position.entry})
+    marked = day_open - 0.03 * day_open
+    engine.broker.equity = lambda marks=None, value=marked: value  # type: ignore[assignment]
+
+    engine.positions.pop(position.symbol, None)  # the slot is free again
+    payload = _ready_payload(settings, symbol="GAP/USDT:USDT")
+    payload["bar_time"] = "2026-11-07T12:00:00+07:00"
+    engine._handle_entry(payload["symbol"], payload)
+
+    assert position.symbol not in engine.positions
+    skips = [e for e in engine.state.ledger(20) if e.get("event") == "skip"]
+    assert any("kill switch" in str(e.get("reason")) for e in skips)
+
+
+def test_day_open_mark_survives_a_restart(tmp_path, settings):
+    """The mark is persisted, so a restart mid-day does not reset the daily budget."""
+    from tests.test_api import _ready_payload
+
+    state_dir = tmp_path / "restart"
+    engine = TradingEngine(market="crypto", settings=settings, symbols=["GAP/USDT:USDT"],
+                           state_dir=state_dir, execute=True)
+    engine._handle_entry("GAP/USDT:USDT", _ready_payload(settings, symbol="GAP/USDT:USDT"))
+    first = engine.guard_state()
+    # entering the position already consulted the guard, so the mark exists by now; either
+    # label means "written today by this process", which is what has to survive the restart
+    assert first["basis"] in ("first_look_of_day", "day_open_mark")
+
+    reborn = TradingEngine(market="crypto", settings=settings, symbols=["GAP/USDT:USDT"],
+                           state_dir=state_dir, execute=True)
+    again = reborn.guard_state()
+    assert again["basis"] == "day_open_mark"
+    assert again["day_start_equity"] == pytest.approx(first["day_start_equity"], rel=1e-6)
+
+
+# --------------------------------------------------------------------------- out-of-band alerting
+def _alerter(**kwargs):
+    from trading_office.alerts import Alerter
+
+    sent = []
+
+    def transport(text, chat_id):
+        sent.append((text, chat_id))
+        return {"ok": True, "status": 200}
+
+    base = dict(enabled=True, token="t0ken", chat_id="42", market="crypto",
+                cooldown_s=0, transport=transport)
+    base.update(kwargs)
+    alerter = Alerter(**base)
+    return alerter, sent
+
+
+def test_alerter_is_inert_when_disabled_or_unconfigured():
+    from trading_office.alerts import Alerter
+
+    off = Alerter(enabled=False, token="t", chat_id="1")
+    assert off.notify({"event": "guard_set"}) == {"sent": False, "reason": "disabled"}
+    assert "disabled" in str(off.status()["reason"])
+
+    unconfigured = Alerter(enabled=True, token="", chat_id="")
+    assert unconfigured.notify({"event": "guard_set"})["reason"].startswith("not configured")
+    assert unconfigured.sink == []
+
+
+def test_alerter_formats_and_delivers_critical_events():
+    alerter, sent = _alerter(events=("guard_set", "reconciliation"))
+    out = alerter.notify({"event": "guard_set", "market": "crypto", "day_pnl": -30.5,
+                          "daily_loss_pct": 3.05, "consecutive_losses": 2,
+                          "reasons": ["daily loss 3.05% >= 3.00%"]},
+                         blocking=True)
+    assert out["sent"] is True
+    text, chat_id = sent[-1]
+    assert chat_id == "42"
+    assert "[CRITICAL]" in text and "daily loss 3.05% >= 3.00%" in text
+    assert "3.05" in text and "-30.5" in text
+
+    # an event outside the configured list is filtered, not sent
+    assert alerter.notify({"event": "trade_opened"}, blocking=True)["reason"] == "filtered"
+
+
+def test_alerter_deduplicates_within_its_cooldown():
+    alerter, sent = _alerter(cooldown_s=300)
+    event = {"event": "guard_set", "reasons": ["x"]}
+    assert alerter.notify(event, blocking=True)["sent"] is True
+    assert alerter.notify(event, blocking=True) == {"sent": False, "reason": "filtered"}
+    assert len(sent) == 1
+    # a different symbol is a different alert
+    assert alerter.notify({**event, "symbol": "SOL/USDT:USDT"}, blocking=True)["sent"] is True
+
+
+def test_alerter_survives_a_failing_transport():
+    from trading_office.alerts import Alerter
+
+    def boom(text, chat_id):
+        raise TimeoutError("no route to host")
+
+    alerter = Alerter(enabled=True, token="t", chat_id="1", cooldown_s=0, transport=boom,
+                      events=("engine_error",))
+    out = alerter.notify({"event": "engine_error", "error": "boom"}, blocking=True)
+    assert out["sent"] is False and "TimeoutError" in out["error"]
+    assert alerter.sink and alerter.sink[0]["ok"] is False
+
+
+def test_engine_emits_guard_set_once_on_the_transition(tmp_path, settings):
+    from tests.test_api import _ready_payload
+
+    seen = []
+    engine = TradingEngine(market="crypto", settings=settings, symbols=["GAP/USDT:USDT"],
+                           state_dir=tmp_path / "alert-guard", execute=True,
+                           on_event=seen.append)
+    engine._handle_entry("GAP/USDT:USDT", _ready_payload(settings, symbol="GAP/USDT:USDT"))
+    position = engine.positions["GAP/USDT:USDT"]
+    day_open = engine.broker.equity({position.symbol: position.entry})
+    engine.broker.equity = lambda marks=None, v=day_open * 0.95: v  # type: ignore[assignment]
+
+    engine.guard_state()
+    engine.guard_state()
+    engine.guard_state()
+    guard_events = [e for e in seen if e.get("event") == "guard_set"]
+    assert len(guard_events) == 1  # once, not once per cycle
+    assert guard_events[0]["blocked"] is True
+
+
+def test_heartbeat_flags_a_wedged_loop(tmp_path, settings):
+    import datetime as dt
+
+    engine = TradingEngine(market="crypto", settings=settings, symbols=["X/USDT:USDT"],
+                           state_dir=tmp_path / "hb")
+    engine.status.running = True
+    engine._last_beat = 0.0
+    engine.status.last_cycle_at = (dt.datetime.now(dt.timezone.utc)
+                                   - dt.timedelta(hours=2)).isoformat()
+    beat = engine.heartbeat()
+    assert beat["ok"] is False and beat["silent_s"] > beat["limit_s"]
+
+    engine.status.last_cycle_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    engine._last_beat = __import__("time").time()
+    engine.settings.raw.setdefault("execution", {})["poll_seconds"] = 15
+    assert engine.heartbeat()["ok"] is True
