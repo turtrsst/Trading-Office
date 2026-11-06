@@ -57,6 +57,8 @@
   function confirmAction(title, body, okLabel) {
     const dialog = $("#confirm-dialog");
     if (!dialog || typeof dialog.showModal !== "function") {
+      // last-resort path for a browser without <dialog>; the UI we ship always has it
+      if (typeof window.confirm !== "function") return Promise.resolve(false);
       return Promise.resolve(window.confirm(`${title}\n\n${body}`));
     }
     $("#confirm-title").textContent = title;
