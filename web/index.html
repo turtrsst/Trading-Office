@@ -224,6 +224,7 @@
             one-position-per-symbol rule and the client order id.</p>
         </div>
         <div class="row-actions">
+          <button class="btn accent" id="analyse-run" title="Scan every watched symbol on the last closed bar. Read-only: nothing is sent.">Analyse market</button>
           <button class="btn" id="eng-start">Start</button>
           <button class="btn ghost" id="eng-stop">Stop</button>
           <button class="btn ghost" id="eng-cycle">Run one cycle</button>
@@ -303,6 +304,30 @@
             <div class="card-head"><h3>Drawdown</h3><span class="muted small" id="eng-dd-meta"></span></div>
             <canvas id="live-drawdown" height="120"></canvas>
           </div>
+        </div>
+      </div>
+
+      <div class="card" id="analyse-card">
+        <div class="card-head">
+          <h3>Analyse → confirm</h3>
+          <span class="muted small" id="analyse-meta">one click scans every watched symbol; nothing is sent until you confirm</span>
+        </div>
+        <p class="muted small" id="analyse-gate" style="margin:-4px 0 10px">
+          Analysis uses the last <b>closed</b> bar and the same four gates the bot trades on.
+        </p>
+        <div class="table-scroll">
+          <table class="book-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Call</th><th>Score</th><th>Entry</th><th>Stop</th>
+                <th>Target</th><th>RR</th><th>Risk</th><th>vs HTF</th>
+                <th class="ta-right">Action</th>
+              </tr>
+            </thead>
+            <tbody id="analyse-rows">
+              <tr class="empty-row"><td colspan="10" id="analyse-empty">Press <b>Analyse market</b> to scan the watchlist.</td></tr>
+            </tbody>
+          </table>
         </div>
       </div>
 

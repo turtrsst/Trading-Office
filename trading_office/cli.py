@@ -567,6 +567,76 @@ def _engine_for_cli(market: str, settings: Settings):
                          state_dir=settings.get("engine.state_dir", "state"))
 
 
+def cmd_trade(args: argparse.Namespace, settings: Settings) -> int:
+    """Analyse the watchlist, then (only with --confirm) execute one setup.
+
+    Same contract as the two buttons in the web terminal, and the same code: ``analyse``
+    is read-only, ``--confirm`` re-checks that the bar and the plan have not moved. Without
+    ``--confirm`` this command cannot place an order, which is what makes it safe to run in
+    a loop or paste into a chat.
+    """
+    from . import confirm as confirm_mod
+
+    engine = _engine_for_cli(args.market, settings)
+
+    if args.confirm:
+        outcome = confirm_mod.confirm(engine, {"symbol": args.confirm, "side": args.side,
+                                               "analysis_id": args.analysis_id,
+                                               "bar_time": args.bar})
+        if args.json:
+            print(json.dumps(outcome, indent=2, default=str))
+            return 0 if outcome.get("ok") else 1
+        if outcome.get("ok"):
+            position = outcome.get("position") or {}
+            print(f"  {green('opened')} {outcome['side']} {outcome['symbol']} "
+                  f"@ {money(position.get('entry'))} · stop {money(position.get('stop'))} "
+                  f"· target {money(position.get('target'))}")
+            return 0
+        print(f"  {red('not executed')} {outcome.get('reason')}")
+        return 1
+
+    board = confirm_mod.analyse_all(engine)
+    if args.json:
+        print(json.dumps(board, indent=2, default=str))
+        return 0
+    venue = "PAPER" + (" · synthetic data" if board["paper"] else "") if board["paper"] else (
+        "LIVE · armed" if board["entries_gate"].get("allowed") else "LIVE · not armed")
+    print()
+    print(bold(f"  ANALYSE · {board['market'].upper()}") +
+          dim(f"   {board['analysed']} symbols · {board['tradeable']} executable · "
+              f"{board['mode']} · {venue} · {board['elapsed_s']}s"))
+    guard = board["guard"]
+    if guard.get("blocked"):
+        print(f"  {red('guard OPEN')} {dim('; '.join(guard.get('reasons') or []))}")
+    print(dim("  " + "─" * 104))
+    header = f"  {'SYMBOL':<16}{'CALL':<7}{'SCORE':<7}{'ENTRY':<12}{'STOP':<12}{'TARGET':<12}{'RR':<6}{'RISK':<8}"
+    print(bold(header))
+    for row in board["rows"]:
+        plan = row.get("plan") or {}
+        action = row["action"]
+        coloured = LABEL_COLORS.get(action, dim)(f"{action:<7}") if action in ("LONG", "SHORT") else dim(f"{action:<7}")
+        rr = f"{row['rr']:.2f}" if row.get("rr") else "—"
+        risk_pct = f"{row['risk_pct']:.2f}%" if row.get("risk_pct") is not None else "—"
+        cells = (f"  {row['symbol']:<16}{coloured}"
+                 f"{str(row.get('score') or 0) + '/9':<7}"
+                 f"{money(plan.get('entry')):<12}{money(plan.get('stop')):<12}"
+                 f"{money(plan.get('target')):<12}{rr:<6}{risk_pct:<8}")
+        note = "" if row["executable"] else dim(f"  ← {row['block_text']}")
+        print(cells + note)
+    if board["tradeable"]:
+        first = next(r for r in board["rows"] if r["executable"])
+        print()
+        print(dim("  confirm one (the bar and the plan are re-checked):"))
+        print(f"    trading-office trade --market {board['market']} --confirm {first['symbol']}"
+              f" --analysis-id {first['id']}")
+        print(dim(f"    (bar {first['bar_time']} — add --bar {first['bar_time']} to refuse a "
+                  f"stale click)")) 
+    else:
+        print()
+        print(dim("  nothing executable on this bar — no plan, no signal, or a guard is closed"))
+    return 0
+
+
 def cmd_approvals(args: argparse.Namespace, settings: Settings) -> int:
     from .state import StateStore
 
@@ -836,6 +906,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("disarm-live", help="revoke the live-entry grant immediately")
     p.add_argument("--market", choices=["idx", "crypto"], default="crypto")
     p.set_defaults(func=cmd_disarm_live)
+
+    p = sub.add_parser("trade", help="analyse the watchlist, then confirm one setup")
+    p.add_argument("--market", choices=["idx", "crypto"], default="crypto")
+    p.add_argument("--confirm", default="", metavar="SYMBOL",
+                   help="execute this symbol's analysis (re-checks the bar first)")
+    p.add_argument("--analysis-id", default="",
+                   help="fingerprint from the analysis table; a mismatch is refused")
+    p.add_argument("--bar", default="",
+                   help="closed bar the analysis was made on; a newer bar is refused")
+    p.add_argument("--side", choices=["LONG", "SHORT"], default=None)
+    p.set_defaults(func=cmd_trade)
 
     p = sub.add_parser("approvals", help="list or decide queued trade requests")
     p.add_argument("action", nargs="?", choices=["list", "approve", "reject"], default="list")

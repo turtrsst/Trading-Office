@@ -396,3 +396,40 @@ def test_arm_live_requires_confirmation_and_rotates_with_the_gate(client):
                            json={"market": "crypto", "by": "test"}).json()
     assert disarmed["entries"]["allowed"] is True and disarmed["entries"]["gate"] == "paper"
     engine.state.set_setting("live_entry_grant", {})
+
+
+# --------------------------------------------------------------------------- analyse → confirm
+def test_analyse_endpoint_is_read_only_and_ranked(client):
+    body = client.get("/api/analyse?market=crypto").json()
+    assert body["analysed"] >= 1
+    assert body["market"] == "crypto"
+    assert body["paper"] in (True, False)
+    assert "entries_gate" in body and "guard" in body
+    scores = [abs(row.get("score") or 0) for row in body["rows"]]
+    assert scores == sorted(scores, reverse=True)
+    for row in body["rows"]:
+        assert row["action"] in ("LONG", "SHORT", "WAIT", "BLOCKED", "ERROR")
+        assert "executable" in row and "block_text" in row
+        if row["executable"]:
+            assert row["id"], "an executable row must carry a confirm fingerprint"
+            assert row["plan"]["stop"] > 0, "no plan without a hard stop"
+
+
+def test_confirm_endpoint_refuses_a_symbol_it_cannot_see(client):
+    body = client.post("/api/analyse/confirm",
+                       json={"market": "crypto", "symbol": "NOT/REAL", "analysis_id": "x"}).json()
+    assert body["ok"] is False
+    assert body["block"] == "symbol"
+    assert "watchlist" in body["reason"]
+
+
+def test_confirm_endpoint_refuses_a_tampered_fingerprint(client):
+    board = client.get("/api/analyse?market=crypto").json()
+    executable = next((r for r in board["rows"] if r["executable"]), None)
+    if executable is None:                       # quiet market: nothing to confirm, which is fine
+        pytest.skip("no executable setup in this market snapshot")
+    body = client.post("/api/analyse/confirm",
+                       json={"market": "crypto", "symbol": executable["symbol"],
+                             "analysis_id": "0" * 16}).json()
+    assert body["ok"] is False
+    assert "analyse again" in body["reason"]

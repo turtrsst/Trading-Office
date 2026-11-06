@@ -9,6 +9,7 @@
     backtest: null,
     engine: null,
     metrics: null,
+    analyse: null,          // last Analyse market board (the confirm buttons read this)
     // (live metrics live in WS.last, see the metrics socket below)
     health: null,
     engineTimer: null,
@@ -649,6 +650,9 @@
     // UI-only dry run of the close flow with a fake row: never touches the backend
     previewClose: (symbol) => closePosition(String(symbol || "BTC/USDT:USDT"), { preview: true }),
     approvals: () => loadApprovals(),
+    analyse: () => loadAnalyse(),
+    confirmAnalysis: (symbol) => confirmAnalysis(symbol),
+    analyseBoard: () => state.analyse,
     decideApproval: (id, approve) => decideApproval(String(id), approve !== false),
   });
 
@@ -906,6 +910,104 @@
       set("eng-healthy-note", "loop stalled");
     } else if (beat.running) {
       set("eng-healthy-note", `loop healthy · last cycle ${beat.silent_s ?? 0}s ago`);
+    }
+  }
+
+  /* ------------------------------------------------------------------ analyse → confirm */
+  // One click scans every watched symbol on the last CLOSED bar, using the same four gates
+  // the bot trades on (/api/analyse is read-only). Each row carries an analysis_id; the
+  // confirm button sends it back, and the server refuses if the bar or the plan moved.
+  // That is what makes the click mean "this exact setup" instead of "whatever is live now".
+  async function loadAnalyse() {
+    const button = $("#analyse-run");
+    const rows = $("#analyse-rows");
+    if (button) button.disabled = true;
+    if (rows) rows.innerHTML = `<tr class="empty-row"><td colspan="10">Scanning ${esc(state.market.toUpperCase())}…</td></tr>`;
+    try {
+      const board = await api(`/api/analyse?market=${state.market}`);
+      state.analyse = board;
+      renderAnalyse(board);
+      toast(`${board.analysed} symbol(s) analysed · ${board.tradeable} executable`, board.tradeable === 0);
+    } catch (err) {
+      if (rows) rows.innerHTML = `<tr class="empty-row"><td colspan="10">Analysis failed: ${esc(err.message)}</td></tr>`;
+      toast("Analysis failed: " + err.message, true);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  function renderAnalyse(board) {
+    const rows = $("#analyse-rows");
+    const gate = board.entries_gate || {};
+    const guard = board.guard || {};
+    const simulated = (board.rows || []).some((r) => r.data_simulated);
+    const venue = board.paper
+      ? (simulated ? "PAPER · synthetic data" : "PAPER")
+      : (gate.allowed ? "LIVE · armed" : "LIVE · not armed");
+    const bits = [`${board.analysed} analysed · ${board.tradeable} executable`,
+                  `${board.mode} · ${venue}`,
+                  `${board.elapsed_s}s`];
+    if (guard.blocked) bits.push(`guard OPEN — ${(guard.reasons || []).join("; ")}`);
+    set("analyse-meta", bits.join(" · "));
+    if (!rows) return;
+    if (!board.rows.length) {
+      rows.innerHTML = `<tr class="empty-row"><td colspan="10">No symbols configured for this market.</td></tr>`;
+      return;
+    }
+    rows.innerHTML = board.rows.map((r) => {
+      const blocked = !r.executable;
+      const trend = [r.ltf_trend, r.htf_trend].filter(Boolean).join(" / ") || "—";
+      const plan = r.plan || {};
+      const btn = r.executable
+        ? `<button class="btn-mini confirm" data-confirm="${esc(r.symbol)}">CONFIRM &amp; ${esc(r.action)}</button>`
+        : `<span class="muted-cell">${esc(r.block_text || "not executable")}</span>`;
+      return `<tr${blocked ? ' class="row-muted"' : ""}>
+        <td class="sym">${esc(r.symbol)}</td>
+        <td>${chip(r.action)}</td>
+        <td>${r.score == null ? "—" : `${r.score}/${r.max_score || 9}`}</td>
+        <td>${fmtNum(plan.entry == null ? r.entry : plan.entry, 4)}</td>
+        <td>${fmtNum(plan.stop == null ? r.stop : plan.stop, 4)}</td>
+        <td>${fmtNum(plan.target == null ? r.target : plan.target, 4)}</td>
+        <td>${r.rr == null ? "—" : Number(r.rr).toFixed(2)}</td>
+        <td>${r.risk_pct == null ? "—" : Number(r.risk_pct).toFixed(2) + "%"}</td>
+        <td class="muted-cell">${esc(trend)}</td>
+        <td class="ta-right">${btn}</td></tr>`;
+    }).join("");
+  }
+
+  async function confirmAnalysis(symbol) {
+    const board = state.analyse;
+    const row = board && (board.rows || []).find((r) => r.symbol === symbol);
+    if (!row) { toast("Analyse again: that row is gone", true); return; }
+    const plan = row.plan || {};
+    const entry = plan.entry == null ? row.entry : plan.entry;
+    const stop = plan.stop == null ? row.stop : plan.stop;
+    const target = plan.target == null ? row.target : plan.target;
+    const ok = await confirmAction(
+      `${row.action} ${symbol}?`,
+      `${row.score}/9 · entry ${fmtNum(entry, 4)} · stop ${fmtNum(stop, 4)}`
+      + ` · target ${fmtNum(target, 4)} · ${Number(row.rr || 0).toFixed(2)}R`
+      + ` · risk ${Number(row.risk_pct || 0).toFixed(2)}% of equity.`
+      + `\n\nBar: ${row.bar_time} (closed). If a new bar has closed since this scan, the order is refused`
+      + ` and you will be asked to analyse again.`,
+      `Confirm ${row.action}`,
+    );
+    if (!ok) return;
+    try {
+      const result = await api("/api/analyse/confirm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ market: state.market, symbol, side: row.action,
+                               analysis_id: row.id, bar_time: row.bar_time, by: "browser" }),
+      });
+      if (result.ok) {
+        toast(`${result.side} ${symbol} opened — the stop is live on the book`, false);
+      } else {
+        toast(`Not executed: ${result.reason || "refused"}`, true);
+      }
+      await Promise.all([loadAnalyse(), loadApprovals(), loadEngine()]);
+    } catch (err) {
+      toast("Confirm failed: " + err.message, true);
     }
   }
 
@@ -1265,6 +1367,13 @@
     $("#eng-flat").addEventListener("click", () => engineCall("/api/engine/close-all", { market: state.market }));
     $("#eng-sync").addEventListener("click", () => engineCall("/api/engine/reconcile", { market: state.market }));
     $("#eng-resume").addEventListener("click", () => engineCall("/api/engine/resume", { market: state.market }));
+    $("#analyse-run").addEventListener("click", loadAnalyse);
+    $("#analyse-rows")?.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-confirm]");
+      if (!button) return;
+      button.disabled = true;
+      confirmAnalysis(button.dataset.confirm).finally(() => { button.disabled = false; });
+    });
     $("#approval-rows")?.addEventListener("click", (event) => {
       const approve = event.target.closest("button[data-approve]");
       const reject = event.target.closest("button[data-reject]");

@@ -246,10 +246,32 @@ trading_office/
   backtest/engine.py          bar-by-bar backtester + walk-forward
   cli.py                      terminal
 web/                          the web terminal (no build step, no frameworks)
-tests/                        164 unit + API tests, all offline
+tests/                        186 unit + API tests, all offline
 docs/                         strategy logic, API, MCP, operations
 scripts/make_demo_data.py     writes data/*.json for the backtester
 ```
+
+## Analyse → confirm (the operator in the loop)
+
+Two buttons in the **Live Engine** tab: **Analyse market** scans every watched symbol on the
+last *closed* bar and ranks it (call, score, entry, stop, target, RR, risk %), then
+**Confirm & LONG/SHORT** sends exactly that setup. Same four gates as the unattended bot —
+`/api/analyse` is read-only, and the confirm goes through the same `_handle_entry`, so the
+hard stop, the RR floor, the one-position-per-symbol rule, the bar lock, the kill switch and
+the autonomy gate all still apply.
+
+The click is bound to what was on screen: the request sends a fingerprint
+(`symbol|bar|side|size`) and the server **recomputes** the analysis before sending, so a
+stale card is refused ("analyse again") instead of becoming a trade at a different price.
+Rows that cannot be executed say why (`no setup`, `position open`, `kill switch`,
+`live not armed`, `synthetic data on a live venue`). Paper fills immediately; a live venue
+still needs `arm-live --yes`, and `autonomy.mode=ask` parks the click for a second approval.
+
+```bash
+python -m trading_office.cli trade --market crypto      # the same board in the terminal
+```
+
+Endpoint contract: [docs/API.md](docs/API.md) → *Analyse → confirm*.
 
 ## Autonomous mode (approve from Telegram)
 
@@ -307,7 +329,7 @@ trading-office doctor     # shows credential presence + whether state/ is sealed
 
 ```sh
 pip install pytest httpx
-python -m pytest -q           # 164 passed, entirely offline
+python -m pytest -q           # 186 passed, entirely offline
 ```
 
 The suite covers indicator maths, each filter's pass/block path, the no-trigger veto, the

@@ -756,3 +756,13 @@ canvas { width: 100%; display: block; }
 }
 
 .warn-text { color: var(--amber); }
+
+/* ---- analyse → confirm: the board the operator reads before sending anything ---- */
+.book-table tbody tr.row-muted td { color: var(--dim); }
+.book-table tbody tr.row-muted td.sym { color: var(--muted); }
+.book-table .btn-mini.confirm {
+  border-color: rgba(46, 230, 168, .45); background: rgba(46, 230, 168, .14); color: var(--accent);
+}
+.book-table .btn-mini.confirm:hover { background: rgba(46, 230, 168, .24); }
+.book-table .btn-mini[disabled] { opacity: .55; cursor: progress; }
+#analyse-meta { text-align: right; }

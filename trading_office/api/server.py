@@ -11,6 +11,8 @@ may call it from anywhere)::
     GET  /api/symbol/{market}/{sym}  one-symbol deep dive (all four gates + context)
     GET  /api/candles/{market}/{sym} candles + indicators for the chart
     POST /api/backtest               run the backtester on a symbol (in-sample / OOS)
+    GET  /api/analyse                analyse every watched symbol (read-only, ranked)
+    POST /api/analyse/confirm        execute the analysis the operator confirmed
     GET  /api/engine/status          live engine state
     POST /api/engine/start|stop      control the live (paper by default) engine
     POST /api/engine/cycle           run exactly one scan cycle
@@ -149,6 +151,22 @@ class EngineRequest(BaseModel):
 class ApprovalDecisionRequest(BaseModel):
     market: Literal["crypto", "idx"] = "crypto"
     request_id: str
+    by: str = "browser"
+
+
+class ConfirmTradeRequest(BaseModel):
+    """What the operator's click authorises.
+
+    Only identifiers travel: ``analysis_id`` is the fingerprint of the card that was shown
+    (symbol + closed bar + side + size) and ``bar_time`` catches a click that outlived its
+    bar. The plan itself is recomputed server-side, so a modified request cannot change the
+    size, the stop or the target.
+    """
+    market: Literal["crypto", "idx"] = "crypto"
+    symbol: str
+    side: str | None = None
+    analysis_id: str = ""
+    bar_time: str = ""
     by: str = "browser"
 
 
@@ -334,6 +352,32 @@ def create_app() -> FastAPI:
             "entries_gate": engine.execution_gate()["entries"],
             "requests": engine.state.approvals(status=None if status == "all" else status),
         }
+
+    @app.get("/api/analyse")
+    def analyse(market: Literal["crypto", "idx"] = "crypto") -> dict[str, Any]:
+        """Analyse every watched symbol on the newest **closed** bar and rank it.
+
+        Read-only: this endpoint scans, it never trades. Each row carries an ``analysis_id``
+        that :func:`confirm_trade` verifies, so the plan a human approves is the plan that
+        was displayed.
+        """
+        from .. import confirm as confirm_mod
+
+        return confirm_mod.analyse_all(_engine(market))
+
+    @app.post("/api/analyse/confirm")
+    def confirm_trade(req: ConfirmTradeRequest) -> dict[str, Any]:
+        """Execute the analysis the operator just confirmed (paper and live alike).
+
+        Live venues still go through the autonomy gate and the armed grant: a click is
+        consent inside an armed setup, never a way to arm one.
+        """
+        from .. import confirm as confirm_mod
+
+        engine = _engine(req.market)
+        return confirm_mod.confirm(engine, {"symbol": req.symbol, "side": req.side,
+                                             "analysis_id": req.analysis_id,
+                                             "bar_time": req.bar_time}, by=req.by)
 
     @app.post("/api/approvals/approve")
     def approve(req: ApprovalDecisionRequest) -> dict[str, Any]:

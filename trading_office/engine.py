@@ -156,6 +156,8 @@ class TradingEngine:
             open_positions=len(self.positions),
         )
         self.last_scans: dict[str, dict[str, Any]] = {}
+        #: the last "analyse market" board (read-only view, kept for the UI and tests)
+        self.last_analysis: dict[str, Any] = {}
         self.cost_cfg = costs.CostConfig.for_market(market, self.profile)
         self.gap_cooldowns: dict[str, int] = {}  # symbol -> cycles of entry block left
         self.reconciled: dict[str, Any] = {}  # last startup_sync() report
@@ -331,9 +333,19 @@ class TradingEngine:
         }
 
     # ------------------------------------------------------------------ scan + execute
-    def scan(self, symbol: str) -> dict[str, Any]:
+    def evaluate(self, symbol: str, *, record: bool = False) -> dict[str, Any]:
+        """Run the four gates on the newest closed bar — **without trading**.
+
+        ``scan()`` is this function plus the execution step. They are split because a
+        read-only caller (the Analyse button, an agent asking "what would you do?") must
+        not be able to place an order by accident, and because duplicating the gate
+        pipeline for the UI would mean the UI could propose something the bot would never
+        trade. ``record=True`` is what makes the scan visible in the ledger and in
+        ``last_scans``; analysis on demand leaves no trace.
+        """
         data = self.fetch(symbol)
-        self.status.scans += 1
+        if record:
+            self.status.scans += 1
         result = scan_symbol(
             symbol=symbol,
             market=self.market,
@@ -358,6 +370,8 @@ class TradingEngine:
                 f"gap cooldown: {self.gap_cooldowns[symbol]} cycle(s) left after a shock"
             ] + payload["reasons"][:2]
             payload["executable"] = False
+        if not record:
+            return payload
         self.last_scans[symbol] = payload
         self.state.append_ledger(
             {
@@ -372,6 +386,11 @@ class TradingEngine:
                 "source": payload["source"],
             }
         )
+        return payload
+
+    def scan(self, symbol: str) -> dict[str, Any]:
+        """Evaluate one symbol and act on it (the loop's entry point)."""
+        payload = self.evaluate(symbol, record=True)
         execut_ok = payload.get("executable", payload["action"] != "SHORT" or self.market == "crypto")
         if payload["action"] in ("LONG", "SHORT") and execut_ok:
             self._handle_entry(symbol, payload)

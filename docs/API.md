@@ -33,6 +33,55 @@ from.
 The MCP tool catalog as plain JSON (name, description, parameters) plus copy-paste
 registration snippets — for agents that cannot speak MCP.
 
+## Analyse → confirm (the two buttons in the Live Engine tab)
+
+`GET /api/analyse` and `POST /api/analyse/confirm` exist so an operator can ask the bot
+what it sees, then authorise exactly one setup. They are **not** a second trading path: the
+analysis runs the same four gates and the confirm goes through the same `_handle_entry` as
+the unattended loop, so every guard (hard stop, RR floor, one position per symbol, bar lock,
+cost check, kill switch, autonomy gate) still applies.
+
+| Endpoint | Body | What happens |
+| --- | --- | --- |
+| `GET /api/analyse?market=crypto` | — | scans every watched symbol on the newest **closed** bar; read-only, nothing is sent, nothing is written to the ledger. Rows are ranked by `\|score\|` |
+| `POST /api/analyse/confirm` | `{"market","symbol","side","analysis_id","bar_time","by"}` | recomputes the analysis, verifies the fingerprint, then sends **one** order |
+
+A row looks like this (truncated):
+
+```json
+{"symbol": "XRP/USDT:USDT", "action": "LONG", "score": 7, "max_score": 9,
+ "executable": true, "block": "", "block_text": "",
+ "bar_time": "2026-11-06T10:00:00+07:00", "source": "ccxt", "data_simulated": false,
+ "plan": {"entry": 2.4135, "stop": 2.355, "target": 2.53, "size": 120.0, "rr": 2.0, "risk_pct": 0.5},
+ "rr": 2.0, "risk_pct": 0.5, "id": "e11de92d5b0c7a41",
+ "reasons": ["trend_alignment +2", "trigger +2"], "warnings": []}
+```
+
+**The request carries identifiers, never numbers.** `analysis_id` is
+`sha256(symbol|bar_time|side|size)[:16]`; the size, stop and target are recomputed
+server-side, so an edited request cannot change them. `bar_time` catches a click that
+outlived its bar.
+
+| `block` | `executable` | Meaning |
+| --- | --- | --- |
+| `""` | `true` | a real setup: the confirm button is shown |
+| `wait` | `false` | no signal on this bar (the common case) |
+| `no_plan` | `false` | signal, but the risk gate refused (RR or cost) |
+| `position` | `false` | a position is already open on this symbol |
+| `kill_switch` | `false` | the daily-loss / streak breaker is open |
+| `gate` | `false` | live venue not armed (`arm-live --yes`) |
+| `synthetic` | `false` | demo data on a **live** venue — analysis only (allowed on paper) |
+| `error` / `symbol` | `false` | the feed failed, or the symbol is not in the watchlist |
+
+Every refusal is a normal `200` with `ok: false`, `reason` and `block`, so a UI can explain
+it instead of showing a blank failure. CLI equivalent (same module):
+
+```bash
+python -m trading_office.cli trade --market crypto                     # the board
+python -m trading_office.cli trade --confirm XRP/USDT:USDT \
+  --analysis-id e11de92d5b0c7a41 --bar 2026-11-06T10:00:00+07:00        # one order
+```
+
 ## Autonomy & approvals
 
 An unattended entry only reaches a live venue through these endpoints. Paper always fills
