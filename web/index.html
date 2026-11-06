@@ -226,11 +226,20 @@
           <button class="btn" id="eng-start">Start</button>
           <button class="btn ghost" id="eng-stop">Stop</button>
           <button class="btn ghost" id="eng-cycle">Run one cycle</button>
+          <button class="btn ghost" id="eng-sync">Reconcile</button>
           <button class="btn danger" id="eng-flat">Flatten</button>
         </div>
       </div>
 
       <div class="stat-strip" id="eng-stats"></div>
+
+      <div class="card">
+        <div class="card-head">
+          <h3>Startup reconciliation</h3>
+          <span class="muted small">state/positions.json vs the exchange — adopt orphans, drop ghosts, flag missing stops</span>
+        </div>
+        <div id="eng-reconcile" class="reconcile"></div>
+      </div>
 
       <div class="split">
         <div class="card">

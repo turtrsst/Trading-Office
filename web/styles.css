@@ -587,3 +587,19 @@ canvas { width: 100%; display: block; }
   .action-row { grid-template-columns: 1fr; }
   .table .why { display: none; }
 }
+
+/* ---- startup reconciliation grid (live engine tab) ---- */
+.reconcile { display: flex; flex-direction: column; gap: 10px; }
+.recon-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+.recon-cell {
+  border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 2px; background: rgba(255, 255, 255, 0.015);
+}
+.recon-cell .k { font-size: 11px; letter-spacing: .04em; text-transform: uppercase; opacity: .65; }
+.recon-cell b { font-size: 18px; font-variant-numeric: tabular-nums; }
+.recon-cell.warn { border-color: rgba(245, 181, 68, 0.45); background: rgba(245, 181, 68, 0.09); }
+.recon-cell.warn b { color: var(--amber); }
+.recon-cell.good b { color: var(--accent); }
+.ledger-row .ev.partial { color: var(--accent); }
+.ledger-row .ev.reconciliation { color: var(--blue); }
+.ledger-row .ev.cost_deferred { color: var(--amber); }

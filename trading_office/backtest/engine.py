@@ -8,8 +8,13 @@ Rules that keep the simulation honest:
   stop, the stop fills at the open, not at the stop price.
 * Stops and targets are checked against the bar's high/low, with the pessimistic
   assumption that the stop is hit first when both are inside the same bar.
-* Commissions, spread and slippage come from the market profile, so the equity curve is
-  net of costs.
+* Commissions, spread and slippage come from the market profile **and from the cost
+  model in :mod:`trading_office.costs`**: slippage scales with ATR% and with the size's
+  share of the bar's volume, a ``latency_ms`` delay moves the fill off the open, and a
+  partial take profit fills at its target price but still pays the taker fee.
+* Gaps are not free: a stop that is jumped fills at the open plus
+  ``gap_fill_fraction`` of the jump, and a gap wider than ``gap_reject_atr`` blocks new
+  entries for ``gap_cooldown_bars`` bars — the same guard the live engine applies.
 * The market filter, signal scoring, risk sizing and trade management are the *same*
   functions the live engine calls — there is no parallel "test" logic.
 
@@ -30,7 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from .. import indicators as ind
+from .. import costs, indicators as ind
 from .. import market_filter, risk, signals
 from ..config import Settings, idx_tick_size
 from ..management import Position, manage_position
@@ -115,6 +120,7 @@ class BacktestResult:
     rejections: dict[str, int] = field(default_factory=dict)
     filters_blocked: dict[str, int] = field(default_factory=dict)
     signals_by_bar: list[dict[str, Any]] = field(default_factory=list)
+    cost_report: dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ metrics
     @property
@@ -165,11 +171,20 @@ class BacktestResult:
             "sharpe": round(sharpe, 2),
             "long_trades": sum(1 for t in self.trades if t["side"] == "long"),
             "short_trades": sum(1 for t in self.trades if t["side"] == "short"),
+            "partials": sum(int(t.get("partials") or 0) for t in self.trades),
+            "gap_stops": sum(1 for t in self.trades if "gap" in str(t.get("reason", ""))),
+            "avg_entry_slippage_bps": round(
+                statistics.mean(
+                    [float(t["entry_slippage_bps"]) for t in self.trades
+                     if t.get("entry_slippage_bps") is not None]
+                ), 3,
+            ) if any(t.get("entry_slippage_bps") is not None for t in self.trades) else None,
             "avg_bars_held": round(statistics.mean([t["bars_held"] for t in self.trades]), 1)
             if self.trades
             else 0.0,
             "rejections": dict(sorted(self.rejections.items(), key=lambda kv: -kv[1])),
             "filters_blocked": dict(sorted(self.filters_blocked.items(), key=lambda kv: -kv[1])),
+            "costs": self.cost_report,
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -186,6 +201,7 @@ class BacktestResult:
             "trades": self.trades,
             "equity_curve": self.equity_curve,
             "signals_by_bar": self.signals_by_bar,
+            "cost_model": self.cost_report.get("model"),
         }
 
 
@@ -212,6 +228,8 @@ class Backtester:
         self.risk_cfg.setdefault("max_leverage", self.profile.get("leverage", 1) if market == "idx" else self.risk_cfg.get("max_leverage", 3))
         self.mgmt_cfg = self.settings.section("management")
         self.engine_cfg = self.settings.section("engine")
+        self.cost_cfg = costs.CostConfig.for_market(market, self.profile)
+        self.cost_events: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------ helpers
     def _equity_start(self) -> float:
@@ -226,10 +244,52 @@ class Backtester:
             return notional * pct / 100.0
         return notional * float(p.get("commission_bps", 5.5)) / 10_000.0
 
+    def _quote_volume(self, bars: Sequence[dict[str, Any]], window: int = 20) -> float | None:
+        recent = [float(b.get("volume") or 0) * float(b["close"]) for b in bars[-window:]]
+        recent = [v for v in recent if v > 0]
+        if not recent:
+            return None
+        return sorted(recent)[len(recent) // 2]
+
+    def _slippage(self, *, price: float, atr: float, notional: float,
+                  quote_volume: float | None) -> costs.SlippageEstimate:
+        estimate = costs.estimate_slippage(
+            price=price, atr=atr, notional=notional, quote_volume=quote_volume, cfg=self.cost_cfg
+        )
+        self.cost_events.append(
+            {"kind": "slippage", **estimate.to_dict(), "notional": round(notional, 2)}
+        )
+        return estimate
+
     def _spread_bps(self, bar: dict[str, Any], tick: float | None) -> float:
         if tick and bar["close"]:
             return 2.0 * tick / bar["close"] * 10_000.0
         return float(self.profile.get("slippage_bps", 2.0))
+
+    # ------------------------------------------------------------------ cost report
+    def _cost_report(self) -> dict[str, Any]:
+        """What execution actually cost: slippage distribution, latency drag, gap events."""
+        slips = [e["slippage_bps"] for e in self.cost_events if e.get("kind") == "slippage"]
+        latencies = [
+            abs(e["latency"]["moved_bps"]) for e in self.cost_events
+            if e.get("kind") == "entry" and e.get("latency")
+        ]
+        gaps = [e for e in self.cost_events if e.get("kind") == "gap_guard"]
+        partials = [e for e in self.cost_events if e.get("kind") == "partial"]
+        return {
+            "model": self.cost_cfg.to_dict(),
+            "entries": sum(1 for e in self.cost_events if e.get("kind") == "entry"),
+            "slippage_bps": costs.quantiles(slips, (0.5, 0.9, 1.0)) if slips else {},
+            "slippage_capped": sum(
+                1 for e in self.cost_events if e.get("kind") == "slippage" and e.get("capped")
+            ),
+            "latency_adverse_bps": costs.quantiles(latencies, (0.5, 0.9, 1.0)) if latencies else {},
+            "latency_ms": self.cost_cfg.latency_ms,
+            "gap_guards": len(gaps),
+            "gap_examples": gaps[:3],
+            "partial_fills": len(partials),
+            "partial_pnl": round(sum(float(e.get("pnl", 0.0)) for e in partials), 2),
+        }
 
     # ------------------------------------------------------------------ main loop
     def run(
@@ -245,6 +305,7 @@ class Backtester:
         bars = [b for b in bars if b.get("close") and b.get("high") and b.get("low")]
         if len(bars) < 120:
             raise ValueError(f"need at least 120 bars, got {len(bars)}")
+        self.cost_events = []
         factor = int(htf_factor or self.profile.get("htf_factor", 8 if self.market == "crypto" else 5))
         htf_bars = resample(bars, factor)
         htf_view = align_htf(bars, htf_bars, factor)
@@ -280,6 +341,7 @@ class Backtester:
         current_day: str | None = None
         last_exit_bar: str | None = None
         cooldown = int(self.engine_cfg.get("cooldown_bars", 3))
+        gap_cooldown_until = -1  # bar index until which new entries are blocked (gap shock)
 
         for i in range(first_i, last_i):
             bar = bars[i]
@@ -295,13 +357,33 @@ class Backtester:
 
             # ------------------------------------------------------ fill the pending order
             if pending is not None:
-                fill_price = float(next_bar["open"]) if i + 1 < len(bars) else float(next_bar["close"])
-                slip = float(self.profile.get("slippage_bps", 2.0)) / 10_000.0
-                spread = self._spread_bps(pending["bar"], pending.get("tick"))
-                direction = 1.0 if pending["plan"].side == "long" else -1.0
-                fill_price = fill_price * (1 + direction * (slip + spread / 2 / 10_000.0))
                 plan = pending["plan"]
+                fill_price = float(next_bar["open"]) if i + 1 < len(bars) else float(next_bar["close"])
+                # latency: the order does not arrive instantly, so it fills along the bar's drift
+                latency = costs.apply_latency(
+                    fill_price, bar, latency_ms=self.cost_cfg.latency_ms,
+                    timeframe=str(self.profile.get("timeframe", "15m")),
+                    side="buy" if plan.side == "long" else "sell",
+                )
+                fill_price = latency.fill_price
+                # dynamic slippage: volatility + size against the book
+                spread = self._spread_bps(pending["bar"], pending.get("tick"))
+                notional = fill_price * plan.size
+                slip_est = self._slippage(
+                    price=fill_price, atr=float(pending.get("atr") or 0.0), notional=notional,
+                    quote_volume=pending.get("quote_volume"),
+                )
+                direction = 1.0 if plan.side == "long" else -1.0
+                fill_price = fill_price * (1 + direction * (spread / 2 / 10_000.0))
+                fill_price = (slip_est.fill_price / max(fill_price, 1e-12)) * fill_price
                 fee = self._commission("buy" if plan.side == "long" else "sell", abs(fill_price * plan.size))
+                self.cost_events.append(
+                    {
+                        "kind": "entry", "time": str(bar["time"]), "latency": latency.to_dict(),
+                        "slippage_bps": round(slip_est.slippage_bps, 3), "spread_bps": round(spread, 3),
+                        "fill": round(fill_price, 8), "signal_bar_open": round(float(next_bar["open"]), 8),
+                    }
+                )
                 position = Position(
                     symbol=symbol,
                     market=self.market,
@@ -313,7 +395,16 @@ class Backtester:
                     initial_stop=plan.stop,
                     opened_at=str(bar["time"]),
                     bar_time=str(pending["bar_time"]),
-                    meta={"reasons": pending["reasons"], "fees": fee, "plan": plan.to_dict()},
+                    initial_size=plan.size,
+                    meta={
+                        "reasons": pending["reasons"],
+                        "fees": fee,
+                        "plan": plan.to_dict(),
+                        "planned_entry": plan.entry,
+                        "planned_stop": plan.stop,
+                        "slippage_bps": round(slip_est.slippage_bps, 3),
+                        "latency_ms": self.cost_cfg.latency_ms,
+                    },
                 )
                 pending = None
 
@@ -321,49 +412,95 @@ class Backtester:
             if position is not None:
                 bar_high = float(bar["high"])
                 bar_low = float(bar["low"])
-                spread_bps = self._spread_bps(bar, tick if tick else None)
-                # gap handling: if the bar opens through the stop, fill at the open
+                spread_bps_now = self._spread_bps(bar, tick if tick else None)
+                atr_now = ind.last_defined(
+                    ind.atr(
+                        [b["high"] for b in closed], [b["low"] for b in closed],
+                        [b["close"] for b in closed], int(self.filter_cfg.get("atr_period", 14)),
+                    )
+                ) or 0.0
+
+                # gap shock between sessions -> cooldown for new entries (black-swan guard)
+                guard = costs.gap_guard(
+                    prev_close=float(bars[i - 1]["close"]),
+                    open_price=float(bar["open"]),
+                    atr=atr_now,
+                    spread_bps=spread_bps_now,
+                    max_spread_bps=float(self.profile.get("max_spread_bps", 8.0)),
+                    cfg=self.cost_cfg,
+                )
+                if guard.cooldown and gap_cooldown_until < i:
+                    gap_cooldown_until = i + int(guard.cooldown)
+                    self.cost_events.append(
+                        {"kind": "gap_guard", "time": str(bar["time"]), **guard.to_dict()}
+                    )
+
+                # gap through the stop: the bracket cannot protect a jumped price
                 exit_price = None
                 exit_reason = ""
                 long = position.side == "long"
-                if long:
-                    if float(bar["open"]) <= position.stop:
-                        exit_price, exit_reason = float(bar["open"]), "stop loss (gap)"
-                    elif bar_low <= position.stop:
-                        exit_price, exit_reason = position.stop, "stop loss"
-                    elif float(bar["open"]) >= position.target:
-                        exit_price, exit_reason = float(bar["open"]), "take profit (gap)"
-                    elif bar_high >= position.target:
-                        exit_price, exit_reason = position.target, "take profit"
-                else:
-                    if float(bar["open"]) >= position.stop:
-                        exit_price, exit_reason = float(bar["open"]), "stop loss (gap)"
-                    elif bar_high >= position.stop:
-                        exit_price, exit_reason = position.stop, "stop loss"
-                    elif float(bar["open"]) <= position.target:
-                        exit_price, exit_reason = float(bar["open"]), "take profit (gap)"
-                    elif bar_low <= position.target:
-                        exit_price, exit_reason = position.target, "take profit"
+                jumped = (
+                    float(bar["open"]) <= position.stop if long
+                    else float(bar["open"]) >= position.stop
+                )
+                if jumped:
+                    exit_price = costs.gap_adjusted_stop(
+                        exit_price=position.stop, next_open=float(bar["open"]),
+                        side=position.side, cfg=self.cost_cfg, atr=atr_now,
+                    )
+                    exit_reason = "stop loss (gap through)"
 
                 if exit_price is None:
                     actions = manage_position(
                         position,
                         closed_bar=bar,
                         price=float(bar["close"]),
-                        atr=ind.last_defined(ind.atr([b["high"] for b in closed], [b["low"] for b in closed],
-                                                     [b["close"] for b in closed], int(self.filter_cfg.get("atr_period", 14)))) or 0.0,
+                        atr=atr_now,
                         now=now,
                         mgmt_cfg=self.mgmt_cfg,
                         profile=self.profile,
-                        spread_bps=spread_bps,
+                        spread_bps=spread_bps_now,
                         opposite_signal=False,
                         tick_size=idx_tick_size(bar["close"]) if tick else None,
+                        size_step=self.profile.get("size_step"),
                     )
                     for action in actions:
                         if action.kind == "close":
                             exit_price, exit_reason = action.price or float(bar["close"]), action.reason
                         elif action.kind == "modify_stop" and action.new_stop:
                             position.stop = action.new_stop
+                        elif action.kind == "partial":
+                            # a limit take profit fills at its own price, fees still apply
+                            fill = action.pnl_target_price or action.price or float(
+                                bar["high"] if long else bar["low"]
+                            )
+                            slice_size = position.size * float(action.fraction or 0.5)
+                            if slice_size <= 0:
+                                continue
+                            gross = (fill - position.entry) * slice_size * (1.0 if long else -1.0)
+                            fee = self._commission("sell" if long else "buy", abs(fill * slice_size))
+                            position.realised_pnl += gross - fee
+                            position.size = round(position.size - slice_size, 12)
+                            position.meta["partials"] = position.meta.get("partials", []) + [
+                                {
+                                    "fraction": action.fraction,
+                                    "size": round(slice_size, 8),
+                                    "fill": round(fill, 8),
+                                    "pnl": round(gross - fee, 2),
+                                    "at": str(bar["time"]),
+                                }
+                            ]
+                            # banked profit counts towards equity immediately
+                            equity += gross - fee
+                            self.cost_events.append(
+                                {
+                                    "kind": "partial", "time": str(bar["time"]),
+                                    "size": round(slice_size, 8), "fill": round(fill, 8),
+                                    "pnl": round(gross - fee, 2), "fee": round(fee, 2),
+                                }
+                            )
+                            if position.size <= 0:
+                                exit_price, exit_reason = fill, "partial closed the whole position"
 
                 if exit_price is not None:
                     fee = self._commission("sell" if long else "buy", abs(exit_price * position.size))
@@ -373,25 +510,34 @@ class Backtester:
                     pnl = gross - total_fee
                     equity += pnl
                     rpu = max(position.risk_per_unit, 1e-12)
+                    initial_size = max(position.initial_size or position.size, 1e-12)
                     trade = {
                         "symbol": symbol,
                         "side": position.side,
+                        # the plan's numbers, not the slip-adjusted fill: the R maths must
+                        # stay anchored to the geometry the risk gate actually approved
                         "entry": round(position.entry, 6),
+                        "planned_entry": round(float(position.meta.get("planned_entry") or position.entry), 6),
+                        "planned_stop": round(float(position.meta.get("planned_stop") or position.initial_stop), 6),
+                        "initial_stop": round(position.initial_stop, 6),
                         "exit": round(exit_price, 6),
                         "stop": round(position.initial_stop, 6),
                         "target": round(position.target, 6),
-                        "size": round(position.size, 6),
-                        "pnl": round(pnl, 2),
+                        "size": round(initial_size, 6),
+                        "size_left": round(position.size, 6),
+                        "pnl": round(pnl + position.realised_pnl, 2),
+                        "pnl_runner": round(pnl, 2),
+                        "pnl_banked": round(position.realised_pnl, 2),
                         "fees": round(total_fee, 2),
-                        "r_multiple": round(pnl / (rpu * position.size), 3) if position.size else 0.0,
+                        "partials": len(position.meta.get("partials", [])),
+                        "r_multiple": round((pnl + position.realised_pnl) / (rpu * initial_size), 3),
                         "reason": exit_reason,
                         "entry_reason": " | ".join(position.meta.get("reasons", [])),
                         "opened_at": position.opened_at,
                         "closed_at": str(bar["time"]),
                         "bars_held": position.bars_held,
-                        "rr_planned": round(
-                            abs(position.target - position.entry) / rpu, 2
-                        ),
+                        "rr_planned": round(abs(position.target - position.entry) / rpu, 2),
+                        "entry_slippage_bps": position.meta.get("slippage_bps"),
                     }
                     result.trades.append(trade)
                     closed_today.append(trade)
@@ -422,6 +568,7 @@ class Backtester:
                 stale=False,
                 data_age_s=0,
                 is_trading_day=now.weekday() < 5,
+                gap_cooldown_bars=max(0, gap_cooldown_until - i),
             )
             if tick:
                 ctx.tick_size = idx_tick_size(bar["close"])
@@ -454,6 +601,14 @@ class Backtester:
 
             entry = float(bar["close"])
             spread_bps = self._spread_bps(bar, idx_tick_size(entry) if tick else None)
+            atr_pct_now = (float(sig.atr or 0.0) / entry * 100.0) if entry else None
+            risk_mult = costs.risk_multiplier(
+                spread_bps=spread_bps,
+                max_spread_bps=float(self.profile.get("max_spread_bps", 8.0)),
+                atr_pct=atr_pct_now,
+                profile=self.profile,
+                cfg=self.cost_cfg,
+            )
             decision = risk.build_plan(
                 symbol=symbol,
                 market=self.market,
@@ -468,6 +623,11 @@ class Backtester:
                 spread_bps=spread_bps,
                 tick_size=idx_tick_size(entry) if tick else None,
                 quote_volume=ctx.quote_volume,
+                risk_multiplier=risk_mult,
+                risk_note=(
+                    f"risk scaled {1/risk_mult:.2f}x down: spread {spread_bps:.1f} bps, "
+                    f"ATR {atr_pct_now:.2f}%" if risk_mult != 1.0 else ""
+                ),
             )
             if not decision.approved:
                 for reason in decision.rejections:
@@ -483,6 +643,8 @@ class Backtester:
                 "bar_time": str(bar["time"]),
                 "reasons": sig.reasons_for(sig.action),
                 "tick": idx_tick_size(entry) if tick else None,
+                "atr": float(sig.atr or 0.0),
+                "quote_volume": ctx.quote_volume,
             }
             result.equity_curve.append((str(bar["time"]) + "+signal", equity))
 
@@ -496,6 +658,7 @@ class Backtester:
             pnl = gross - fee - float(position.meta.get("fees", 0.0))
             equity += pnl
             rpu = max(position.risk_per_unit, 1e-12)
+            initial_size = max(position.initial_size or position.size, 1e-12)
             result.trades.append(
                 {
                     "symbol": symbol,
@@ -504,10 +667,16 @@ class Backtester:
                     "exit": round(exit_price, 6),
                     "stop": round(position.initial_stop, 6),
                     "target": round(position.target, 6),
-                    "size": round(position.size, 6),
-                    "pnl": round(pnl, 2),
+                    "size": round(initial_size, 6),
+                    "size_left": round(position.size, 6),
+                    "pnl": round(pnl + position.realised_pnl, 2),
+                    "pnl_runner": round(pnl, 2),
+                    "pnl_banked": round(position.realised_pnl, 2),
                     "fees": round(fee, 2),
-                    "r_multiple": round(pnl / (rpu * position.size), 3) if position.size else 0.0,
+                    "partials": len(position.meta.get("partials", [])),
+                    "r_multiple": round((pnl + position.realised_pnl) / (rpu * initial_size), 3)
+                    if initial_size
+                    else 0.0,
                     "reason": "end of data",
                     "entry_reason": " | ".join(position.meta.get("reasons", [])),
                     "opened_at": position.opened_at,
@@ -519,6 +688,7 @@ class Backtester:
             result.equity_curve.append((str(last["time"]), equity))
 
         result.ending_equity = equity
+        result.cost_report = self._cost_report()
         return result
 
 
@@ -589,6 +759,9 @@ def walk_forward(
         "chosen_params": chosen,
         "in_sample": best[2].to_dict() if best else None,
         "out_of_sample": res_oos.to_dict(),
+        # the execution model is a property of the run, not of the slice: surface it at
+        # the top level too so a caller never has to dig into the OOS block for it
+        "cost_model": bt_oos.cost_cfg.to_dict(),
         "grid": rows,
         "note": (
             "The out-of-sample slice was never used for selection; indicators are warmed up "

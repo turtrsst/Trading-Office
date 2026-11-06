@@ -20,7 +20,29 @@
       0.6,
       2.5
     ],
-    "news_blackout": [],
+    "news_blackout": [
+      {
+        "weekday": 0,
+        "time": "20:30",
+        "minutes": 45,
+        "label": "US data (CPI/NFP week-open)",
+        "tz": "Asia/Jakarta"
+      },
+      {
+        "weekday": 2,
+        "time": "01:00",
+        "minutes": 45,
+        "label": "FOMC statement window",
+        "tz": "Asia/Jakarta"
+      },
+      {
+        "weekday": 4,
+        "time": "19:30",
+        "minutes": 45,
+        "label": "US labour market data",
+        "tz": "Asia/Jakarta"
+      }
+    ],
     "block_weekend_crypto": false
   },
   "signal": {
@@ -53,10 +75,12 @@
   "management": {
     "breakeven_at_r": 1.0,
     "breakeven_buffer_spread": 1.0,
-    "trail_atr_mult": 1.0,
-    "trail_start_r": 1.0,
-    "partial_tp_r": null,
+    "partial_tp_r": 2.0,
     "partial_tp_fraction": 0.5,
+    "partial_be_at_r": 2.0,
+    "trail_atr_mult": 1.5,
+    "trail_step_atr": 0.25,
+    "trail_start_r": 1.0,
     "max_bars_in_trade_crypto": 96,
     "max_bars_in_trade_idx": 15,
     "exit_on_opposite_signal": true,
@@ -89,7 +113,23 @@
         "SOL/USDT:USDT",
         "XRP/USDT:USDT"
       ],
-      "max_margin_per_trade_pct": 8.0
+      "max_margin_per_trade_pct": 8.0,
+      "execution_costs": {
+        "latency_ms": 400,
+        "slippage_base_bps": 1.5,
+        "atr_mult": 0.06,
+        "impact_coeff": 1.5,
+        "max_slippage_bps": 45.0,
+        "gap_reject_atr": 2.0,
+        "gap_reject_spread_mult": 3.0,
+        "gap_fill_fraction": 0.5,
+        "gap_cooldown_bars": 3,
+        "max_risk_multiplier": 1.75,
+        "auction_windows": []
+      },
+      "leverage": 3,
+      "atr_soft_cap_pct": 2.5,
+      "extreme_spread_mult": 1.8
     },
     "idx": {
       "timeframe": "1d",
@@ -125,7 +165,33 @@
         "MDKA",
         "GOTO"
       ],
-      "max_margin_per_trade_pct": 20.0
+      "max_margin_per_trade_pct": 20.0,
+      "execution_costs": {
+        "latency_ms": 900,
+        "slippage_base_bps": 2.0,
+        "atr_mult": 0.05,
+        "impact_coeff": 2.5,
+        "max_slippage_bps": 80.0,
+        "gap_reject_atr": 1.5,
+        "gap_reject_spread_mult": 2.5,
+        "gap_fill_fraction": 0.75,
+        "gap_cooldown_bars": 2,
+        "max_risk_multiplier": 1.5,
+        "auction_windows": [
+          [
+            "08:45",
+            "09:15"
+          ],
+          [
+            "15:45",
+            "16:15"
+          ]
+        ]
+      },
+      "leverage": 1,
+      "atr_soft_cap_pct": 4.0,
+      "extreme_spread_mult": 1.6,
+      "size_step": 100
     }
   },
   "execution": {
@@ -136,7 +202,8 @@
     "paper": true,
     "dry_run": false,
     "max_order_retries": 2,
-    "poll_seconds": 15
+    "poll_seconds": 15,
+    "max_cost_drift_pct": 40.0
   },
   "idx": {
     "command": "idx",

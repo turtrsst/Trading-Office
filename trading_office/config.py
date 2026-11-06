@@ -35,6 +35,13 @@ DEFAULTS: dict[str, Any] = {
     },
     "market_filter": {
         "trend_ema": 200,
+        # macro windows in which no entry is allowed (see market_filter.in_blackout):
+        # a scheduled release is a gap generator, and a stop cannot protect you across it
+        "news_blackout": [
+            {"weekday": 0, "time": "20:30", "minutes": 45, "label": "US data", "tz": "Asia/Jakarta"},
+            {"weekday": 2, "time": "01:00", "minutes": 45, "label": "FOMC", "tz": "Asia/Jakarta"},
+            {"weekday": 4, "time": "19:30", "minutes": 45, "label": "US labour data", "tz": "Asia/Jakarta"},
+        ],
         "trend_tolerance_atr": 0.25,
         "atr_period": 14,
         "atr_pct_band_mult": [0.6, 2.5],
@@ -71,10 +78,12 @@ DEFAULTS: dict[str, Any] = {
     "management": {
         "breakeven_at_r": 1.0,
         "breakeven_buffer_spread": 1.0,
-        "trail_atr_mult": 1.0,
-        "trail_start_r": 1.0,
-        "partial_tp_r": None,
+        "partial_tp_r": 2.0,
         "partial_tp_fraction": 0.5,
+        "partial_be_at_r": 2.0,
+        "trail_atr_mult": 1.5,
+        "trail_step_atr": 0.25,
+        "trail_start_r": 1.0,
         "max_bars_in_trade_crypto": 96,
         "max_bars_in_trade_idx": 15,
         "exit_on_opposite_signal": True,

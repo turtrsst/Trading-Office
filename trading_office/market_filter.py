@@ -20,6 +20,7 @@ from typing import Any, Iterable, Sequence
 from zoneinfo import ZoneInfo
 
 from . import indicators as ind
+from .costs import CostConfig, gap_guard, is_in_auction, risky_spread_cap
 
 FILTER_NAMES = ("trend", "volatility", "session", "spread")
 
@@ -61,6 +62,10 @@ class MarketContext:
     data_age_s: float | None = None
     stale: bool = False
     demo_data: bool = False  # synthetic series: allowed to trade, but always labelled
+    # black-swan / gap inputs (optional; the guard is skipped when they are absent)
+    prev_close: float | None = None
+    session_open: float | None = None
+    gap_cooldown_bars: int = 0  # set by the engine right after a detected shock
     # misc
     is_trading_day: bool = True
     extra: dict[str, Any] = field(default_factory=dict)
@@ -241,6 +246,29 @@ def evaluate(
     if blackout:
         sess_ok = False
         parts.append(f"news blackout: {blackout}")
+    # gap / extreme-spread guard: after a shock the structure a stop relies on is gone
+    costs_cfg = CostConfig.for_market(ctx.market, profile)
+    if ctx.gap_cooldown_bars > 0:
+        sess_ok = False
+        parts.append(f"gap cooldown: {ctx.gap_cooldown_bars} bars after a shock")
+    if ctx.prev_close and ctx.session_open and ctx.atr > 0:
+        guard = gap_guard(
+            prev_close=ctx.prev_close,
+            open_price=ctx.session_open,
+            atr=ctx.atr,
+            spread_bps=spread_bps(ctx)[0],
+            max_spread_bps=float(profile.get("max_spread_bps", 8.0)),
+            cfg=costs_cfg,
+        )
+        if guard.cooldown:
+            sess_ok = False
+            parts.append(guard.reason)
+        else:
+            parts.append(f"gap {guard.gap_atr:.2f} ATR (ok)")
+    in_auction, auction_label = is_in_auction(now_local, profile, costs_cfg)
+    if in_auction:
+        sess_ok = False
+        parts.append(f"{auction_label}: fills unreliable")
     max_age = float(profile.get("max_tick_age_s", 300))
     if ctx.stale:
         sess_ok = False
@@ -265,8 +293,10 @@ def evaluate(
     # ---------------------------------------------------------------- 4. spread / liquidity
     bps, estimated = spread_bps(ctx)
     max_bps = float(profile.get("max_spread_bps", 8.0))
-    spread_ok = bps <= max_bps
-    sp_parts = [f"spread {bps:.2f} bps{' (estimated)' if estimated else ''} <= {max_bps}"]
+    atr_pct_now = (ctx.atr / ctx.price * 100.0) if ctx.price else None
+    hard_bps = risky_spread_cap(profile, atr_pct_now)
+    spread_ok = bps <= hard_bps
+    sp_parts = [f"spread {bps:.2f} bps{' (estimated)' if estimated else ''} <= {hard_bps:.1f} (normal {max_bps})"]
     if not spread_ok:
         sp_parts.append("spread too wide")
     liq_ok = True
@@ -291,7 +321,7 @@ def evaluate(
             "spread",
             bool(spread_ok and liq_ok),
             value=_round(bps, 2),
-            limit=max_bps,
+            limit=hard_bps,
             detail="; ".join(sp_parts),
             estimated=estimated,
         )
@@ -331,6 +361,7 @@ def build_context_from_bars(
     data_age_s: float | None = None,
     is_trading_day: bool = True,
     demo_data: bool = False,
+    gap_cooldown_bars: int = 0,
 ) -> MarketContext:
     """Assemble a :class:`MarketContext` from closed candles only.
 
@@ -386,6 +417,9 @@ def build_context_from_bars(
         stale=stale,
         demo_data=demo_data,
         is_trading_day=is_trading_day,
+        prev_close=closes[-2] if len(closes) >= 2 else None,
+        session_open=float(bars[-1]["open"]) if bars else None,
+        gap_cooldown_bars=gap_cooldown_bars,
         extra={"fallback_spread_bps": profile.get("slippage_bps", 5.0)},
     )
 

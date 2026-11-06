@@ -362,9 +362,26 @@ def cmd_backtest(args: argparse.Namespace, settings: Settings) -> int:
         ["return %", ins["return_pct"], m["return_pct"]],
         ["max drawdown %", ins["max_drawdown_pct"], m["max_drawdown_pct"]],
         ["sharpe", ins["sharpe"], m["sharpe"]],
+        ["partials (2R)", ins.get("partials", 0), m.get("partials", 0)],
+        ["entry slippage bps", ins.get("avg_entry_slippage_bps"), m.get("avg_entry_slippage_bps")],
+        ["gap-through stops", ins.get("gap_stops", 0), m.get("gap_stops", 0)],
     ]
     print(table(["METRIC", "IN-SAMPLE (used for selection)", "OUT-OF-SAMPLE (unseen)"], rows, ["l", "r", "r"]))
-    print()
+    costs = m.get("costs") or {}
+    if costs:
+        slip = costs.get("slippage_bps") or {}
+        lat = costs.get("latency_adverse_bps") or {}
+        print()
+        print(bold("  EXECUTION COST (OOS)"))
+        print(f"   latency {costs.get('latency_ms', 0):.0f} ms  "
+              f"delay cost p50 {lat.get('p50', 0):.2f} bps / p90 {lat.get('p90', 0):.2f} bps")
+        print(f"   slippage p50 {slip.get('p50', 0):.2f} bps · p90 {slip.get('p90', 0):.2f} bps · "
+              f"worst {slip.get('p100', 0):.2f} bps" +
+              (f" · {costs.get('slippage_capped', 0)} fills at the cap" if costs.get("slippage_capped") else ""))
+        print(f"   gap guard refused {costs.get('gap_guards', 0)} entries · "
+              f"{costs.get('partial_fills', 0)} partials banked "
+              f"({costs.get('partial_pnl', 0):,.2f})")
+        print()
     if m["rejections"] or m["filters_blocked"]:
         print(bold("  WHY TRADES WERE SKIPPED (OOS)"))
         for key, value in list(m["filters_blocked"].items())[:4]:
@@ -373,8 +390,9 @@ def cmd_backtest(args: argparse.Namespace, settings: Settings) -> int:
             print(f"   signal {key:<14} {value}")
         print()
     for t in oos["trades"][-8:]:
-        print(f"   {t['side']:<5} {t['entry']:>10,.2f} → {t['exit']:>10,.2f}  "
-              f"{pct(t['r_multiple']*100, 2):>10} R  {dim(t['reason'][:34])}")
+        print(f"   {t['side']:<5} {t.get('planned_entry') or t['entry']:>10,.2f} → "
+              f"{t.get('planned_stop') or t['stop']:>10,.2f} (stop)  exit {t['exit']:>10,.2f}  "
+              f"{t['r_multiple']:>7,.2f} R  {dim(t['reason'][:30])}")
     print()
     return 0
 
@@ -444,6 +462,58 @@ def cmd_engine(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def cmd_costs(args: argparse.Namespace, settings: Settings) -> int:
+    from . import costs as cost_model
+
+    profile = settings.profile(args.market)
+    cfg = cost_model.CostConfig.for_market(args.market, profile)
+    payload = {
+        "market": args.market,
+        "model": cfg.to_dict(),
+        "spread_cap_bps": float(profile.get("max_spread_bps", 8.0)),
+        "stress_spread_cap_bps": cost_model.risky_spread_cap(profile),
+        "management": settings.section("management"),
+        "example": cost_model.estimate_slippage(
+            price=args.price, atr=args.price * args.atr_pct / 100.0,
+            notional=args.notional, quote_volume=args.quote_volume, cfg=cfg,
+        ).to_dict(),
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    print(bold(f"execution costs · {args.market}"))
+    print(f"  latency      {cfg.latency_ms:.0f} ms")
+    print(f"  slippage     base {cfg.slippage_base_bps:.2f} bps + {cfg.atr_mult:.2f}×ATR% "
+          f"+ {cfg.impact_coeff:.2f}×√participation, cap {cfg.max_slippage_bps:.0f} bps")
+    print(f"  gaps         reject at {cfg.gap_reject_atr:.1f} ATR or "
+          f"{cfg.gap_reject_spread_mult:.1f}× spread; fill {cfg.gap_fill_fraction:.0%} of the gap")
+    print(f"  risk scale   up to {cfg.max_risk_multiplier:.2f}× smaller size when stressed")
+    ex = payload["example"]
+    print(f"  example      {ex['slippage_bps']:.2f} bps on a "
+          f"{args.notional:,.0f} notional at {args.price:,.2f} "
+          f"({'capped' if ex['capped'] else 'uncapped'})")
+    return 0
+
+
+def cmd_reconcile(args: argparse.Namespace, settings: Settings) -> int:
+    from .engine import TradingEngine
+
+    symbols = [s.strip() for s in (args.symbols or "").split(",") if s.strip()] or None
+    engine = TradingEngine(market=args.market, settings=settings, symbols=symbols, execute=False)
+    report = engine.startup_sync(adopt_untracked=args.adopt, close_orphans=args.close_orphans)
+    if args.json:
+        print(json.dumps(report, indent=2, default=str))
+        return 0
+    print(bold(f"reconciliation · {args.market} · {report['mode']}"))
+    print(f"  venue reachable   {report['venue_available']}")
+    for key in ("restored", "adopted", "closed", "untracked", "blocked"):
+        rows = report[key]
+        print(f"  {key:<16} {len(rows)}" + (f"  {[r['symbol'] for r in rows]}" if rows else ""))
+    if report["stops_missing"]:
+        print(red(f"  missing stops     {report['stops_missing']}"))
+    return 0
+
+
 # --------------------------------------------------------------------------- parser
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -508,6 +578,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cycles", type=int, default=0)
     p.add_argument("--no-execute", action="store_true")
     p.set_defaults(func=cmd_engine)
+
+    p = sub.add_parser("costs", help="show the execution-cost model (latency, slippage, gap guards)")
+    p.add_argument("--market", choices=["idx", "crypto"], default="crypto")
+    p.add_argument("--price", type=float, default=100.0)
+    p.add_argument("--atr-pct", dest="atr_pct", type=float, default=1.0)
+    p.add_argument("--notional", type=float, default=1500.0)
+    p.add_argument("--quote-volume", dest="quote_volume", type=float, default=5_000_000.0)
+    p.set_defaults(func=cmd_costs)
+
+    p = sub.add_parser("reconcile", help="compare state/positions.json with the exchange")
+    p.add_argument("--market", choices=["idx", "crypto"], default="crypto")
+    p.add_argument("--symbols", default="")
+    p.add_argument("--adopt", action="store_true", help="start tracking venue positions we do not know")
+    p.add_argument("--close-orphans", dest="close_orphans", action="store_true",
+                   help="close venue positions we never authorised")
+    p.set_defaults(func=cmd_reconcile)
 
     p = sub.add_parser("serve", help="start the web terminal + REST API")
     p.add_argument("--host", default="0.0.0.0")

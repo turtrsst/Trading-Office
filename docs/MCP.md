@@ -58,6 +58,11 @@ do not speak MCP.
 | `idx_ownership` | `symbol` | KSEI holders above 1 % and their monthly change |
 | `idx_corporate_actions` | `symbol` | dividends, splits, bonus, rights, RUPS |
 
+`execution_costs` returns the latency/slippage/gap model (and the partial-TP and trailing
+defaults) for a market. `reconcile_state` runs the same startup reconciliation the engine
+does and returns adopted / restored / closed / untracked / blocked positions plus any
+missing stop order — call it before trusting a position list after a restart.
+
 ## Suggested agent loop
 
 1. `market_overview` — is the tape risk-on or risk-off?

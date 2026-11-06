@@ -78,9 +78,34 @@ state/
 
 - `signals.json` — the per-bar decision locks (bounded to 5 000 entries).
 - `positions.json` — open positions, restored on restart.
-- `ledger.jsonl` — append-only audit trail: `scan`, `skip`, `order`, `manage`,
-  `trade_closed`. This is what the UI's ledger and the equity curve are built from.
+- `ledger.jsonl` — append-only audit trail: `scan`, `skip`, `order`, `manage`, `partial`,
+  `cost_deferred`, `reconciliation`, `trade_closed`. This is what the UI's ledger and the
+  equity curve are built from.
 - Reset a paper account: `rm -rf state/<market>` (the ledger goes with it).
+
+### Recovering from a crash or a restart
+
+The engine calls `startup_sync()` before its first cycle (and the terminal's Live Engine
+tab has a **Reconcile** button that calls the same code path). It compares
+`state/positions.json` with the venue:
+
+```sh
+python -m trading_office.cli reconcile --market crypto            # report only
+python -m trading_office.cli reconcile --market crypto --adopt    # take over venue positions
+python -m trading_office.cli reconcile --market crypto --close-orphans
+```
+
+| Report key | Meaning | What to do |
+| --- | --- | --- |
+| `restored` | state and venue agree | nothing: `initial_stop` / `partial_done` / trail high-water mark were kept |
+| `closed` | state said open, venue is flat | nothing: the trade is booked and the phantom removed |
+| `untracked` | venue position the bot never opened | inspect it; `--adopt` or `--close-orphans` |
+| `blocked` | the venue did not answer | fix credentials/network; no new entries until it answers |
+| `stops_missing` | no resting stop order found | re-bracket manually or let the next management pass move it |
+
+`partial_done` is written *before* the next bar, so a partial can never execute twice; a
+partial that is smaller than the venue's `amount_to_precision` step is skipped instead of
+rounded up.
 
 ## Configuration recipes
 
@@ -129,11 +154,25 @@ then re-run the backtest before trusting it.
 | `position already open for this symbol` | duplicate guard | expected: one position per symbol at a time |
 | `duplicate client_id refused` | a retried order | expected: idempotency working |
 
-## Cost model used by the risk gate and the paper broker
+## Cost model used by the risk gate, the backtest and the paper broker
 
-| market | costs |
-| --- | --- |
-| crypto | 5.5 bps taker per side + slippage 2 bps + half spread per fill |
-| IDX | 0.15 % buy, 0.25 % sell (incl. 0.1 % sales tax) + slippage 5 bps + half spread |
+Fees are fixed; the *fill* is modelled (`trading_office/costs.py`):
 
-The risk gate refuses any target smaller than `3 ×` the round-trip cost.
+| market | fees | latency | slippage (`bps`) | cap | gap reject | cooldown |
+| --- | --- | --- | --- | --- | --- | --- |
+| crypto | 5.5 bps taker per side | 400 ms | `1.5 + 0.06 × ATR% + 1.5 × √participation%` | 45 bps | 2.0 ATR / 3× spread cap | 3 cycles |
+| IDX | 0.15 % buy, 0.25 % sell (incl. 0.1 % sales tax) | 900 ms | `2.0 + 0.05 × ATR% + 2.5 × √participation%` | 80 bps | 1.5 ATR / 2.5× spread cap | 2 sessions |
+
+`participation % = notional / median(quote volume over 20 bars)`. The risk gate still
+refuses any target smaller than `3 ×` the round-trip cost, and the live engine defers an
+entry whose live cost drifted more than 40 % above the plan.
+
+```sh
+python -m trading_office.cli costs --market crypto            # show the model
+python -m trading_office.cli costs --market idx --notional 50000000 --atr-pct 1.8
+```
+
+Adjust the model per market in `profiles.<market>.execution_costs` (`latency_ms`,
+`slippage_base_bps`, `atr_mult`, `impact_coeff`, `max_slippage_bps`, `gap_reject_atr`,
+`gap_reject_spread_mult`, `gap_fill_fraction`, `gap_cooldown_bars`,
+`max_risk_multiplier`, `auction_windows`).

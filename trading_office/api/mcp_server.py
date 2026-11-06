@@ -85,6 +85,41 @@ def run_backtest(
     )
 
 
+def execution_costs(market: Literal["idx", "crypto"] = "crypto") -> dict[str, Any]:
+    """The fill model used by the backtest and the live engine.
+
+    Returns latency, slippage coefficients and caps, the gap-rejection thresholds, the
+    auction windows (IDX) and the partial-TP / trailing defaults — i.e. everything a
+    caller needs to know *why* a fill was priced the way it was.
+    """
+    from .. import costs as cost_model
+
+    profile = _SETTINGS.profile(market)
+    return {
+        "market": market,
+        "model": cost_model.CostConfig.for_market(market, profile).to_dict(),
+        "spread_cap_bps": float(profile.get("max_spread_bps", 8.0)),
+        "stress_spread_cap_bps": cost_model.risky_spread_cap(profile),
+        "management": _SETTINGS.section("management"),
+    }
+
+
+def reconcile_state(
+    market: Literal["idx", "crypto"] = "crypto",
+    adopt: bool = False,
+    close_orphans: bool = False,
+) -> dict[str, Any]:
+    """Reconcile persisted state with the venue (the same call the engine makes on boot).
+
+    Reports adopted / restored / closed / untracked / blocked positions and any position
+    whose resting stop order is missing. ``adopt`` re-attaches tracking to a venue position
+    the bot does not know about; ``close_orphans`` closes those positions instead.
+    """
+    from .server import _engine
+
+    return _engine(market).startup_sync(adopt_untracked=adopt, close_orphans=close_orphans)
+
+
 def idx_bandarmology(symbol: str = "BBCA", period: Literal["1d", "1w", "1m", "3m"] = "1w") -> dict[str, Any]:
     """Broker accumulation/distribution (bandarmology) for one IDX ticker.
 
@@ -151,6 +186,8 @@ TOOLS = {
     "run_backtest": run_backtest,
     "market_overview": market_overview,
     "candles": candles,
+    "execution_costs": execution_costs,
+    "reconcile_state": reconcile_state,
     "idx_bandarmology": idx_bandarmology,
     "idx_broker_summary": idx_broker_summary,
     "idx_foreign_flow": idx_foreign_flow,
@@ -164,6 +201,8 @@ DESCRIPTIONS = {
     "run_backtest": "Walk-forward backtest: parameters chosen in-sample, metrics reported on unseen out-of-sample data.",
     "market_overview": "IHSG indices and breadth, or crypto tickers with spreads.",
     "candles": "Closed candles and indicator series for charting.",
+    "execution_costs": "Latency, ATR/impact slippage, gap guards, auction windows and the partial-TP/trailing defaults.",
+    "reconcile_state": "Compare persisted positions with the exchange: adopt, restore, close or block, and flag missing stops.",
     "idx_bandarmology": "Broker accumulation/distribution (bandarmology) for an IDX ticker.",
     "idx_broker_summary": "Broker summary: the top buyers and sellers of an IDX ticker.",
     "idx_foreign_flow": "Foreign net flow per session with totals and streak.",
@@ -177,6 +216,8 @@ PARAMS = {
     "run_backtest": {"market": "idx|crypto", "symbol": "str", "oos": "float", "bars": "int"},
     "market_overview": {"market": "idx|crypto"},
     "candles": {"market": "idx|crypto", "symbol": "str", "limit": "int"},
+    "execution_costs": {"market": "idx|crypto"},
+    "reconcile_state": {"market": "idx|crypto", "adopt": "bool", "close_orphans": "bool"},
     "idx_bandarmology": {"symbol": "str", "period": "1d|1w|1m|3m"},
     "idx_broker_summary": {"symbol": "str", "date": "YYYY-MM-DD"},
     "idx_foreign_flow": {"symbol": "str", "days": "int"},

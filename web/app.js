@@ -591,7 +591,12 @@
       stat("Orders", st.orders, "bar-locked", st.orders ? "good" : ""),
       stat("Blocked", st.blocked, "filter / signal / risk", st.blocked ? "warn" : ""),
       stat("Positions", st.open_positions, "one per symbol"),
+      stat("Partials", st.partials, "50% at 2R, reduce-only", st.partials ? "good" : ""),
+      stat("Gap blocks", Object.keys(data.gap_cooldowns || {}).length, "black-swan cooldown",
+        Object.keys(data.gap_cooldowns || {}).length ? "warn" : ""),
     ].join("");
+
+    renderReconcile(data.status?.reconciled || {}, data.gap_cooldowns || {});
 
     const positions = data.positions || [];
     $("#eng-positions").innerHTML = positions.length
@@ -618,12 +623,43 @@
       : `<div class="empty">The ledger is empty — start the engine or run one cycle.</div>`;
   }
 
+  function renderReconcile(rec, cooldowns) {
+    const rows = [
+      ["Venue", rec.venue_available === true ? "reachable" : rec.venue_available === false ? "no answer" : "not run yet",
+        rec.venue_available === false ? "warn" : "good"],
+      ["Restored", rec.restored ?? 0, "state matches the exchange"],
+      ["Adopted", rec.adopted ?? 0, "exchange position re-attached"],
+      ["Closed", rec.closed ?? 0, "exchange was flat: ghost dropped"],
+      ["Untracked", rec.untracked ?? 0, "exchange position we never authorised"],
+      ["Blocked", rec.blocked ?? 0, "cannot verify: no new entries"],
+      ["Missing stops", rec.stops_missing ?? 0, "resting stop not found"],
+    ];
+    const gaps = Object.entries(cooldowns);
+    $("#eng-reconcile").innerHTML =
+      `<div class="recon-grid">${rows.map(([k, v, note, tone]) => `
+        <div class="recon-cell ${tone && v ? tone : ""}">
+          <span class="k">${esc(k)}</span>
+          <b>${esc(String(v))}</b>
+          <span class="muted small">${esc(note)}</span>
+        </div>`).join("")}</div>` +
+      (gaps.length
+        ? `<div class="muted small">Entry cooldowns: ${gaps.map(([s, n]) => `${esc(s)} (${n})`).join(", ")}</div>`
+        : "") +
+      (rec.at ? `<div class="muted small">last sync ${new Date(rec.at).toLocaleString("id-ID")}</div>` : "");
+  }
+
   function ledgerBody(e) {
     if (e.event === "scan") return `${e.symbol} ${e.action} score ${e.score}/9 · ${(e.reasons || []).join("; ")}`;
     if (e.event === "skip") return `${e.symbol}: ${e.reason}`;
     if (e.event === "order") return `${e.symbol} ${e.order?.side} ${e.order?.quantity} @ ${e.fill?.price} · ${e.fill?.message}`;
     if (e.event === "trade_closed") return `${e.symbol} ${e.side} pnl ${fmtNum(e.pnl)} (${e.r_multiple}R) · ${e.reason}`;
     if (e.event === "manage") return `${e.symbol} ${e.action?.kind} · ${e.action?.reason}`;
+    if (e.event === "partial") return `${e.symbol} closed ${e.size} @ ${fmtNum(e.price)} · pnl ${fmtNum(e.pnl)} · ${e.reason}`;
+    if (e.event === "reconciliation") {
+      return `venue ${e.venue_available ? "reachable" : "unavailable"} · restored ${e.restored?.length ?? 0} · `
+        + `adopted ${e.adopted?.length ?? 0} · closed ${e.closed?.length ?? 0} · untracked ${e.untracked?.length ?? 0}`;
+    }
+    if (e.event === "cost_deferred") return `${e.symbol}: ${e.reason}`;
     return JSON.stringify(e).slice(0, 140);
   }
 
@@ -646,6 +682,12 @@
       "",
       "# backtest on unseen data (in-sample selection, out-of-sample report)",
       "python -m trading_office.backtest --market crypto --data data/crypto_BTCUSDT_15m.json --oos 0.3",
+      "",
+      "# what a fill really costs (latency, ATR slippage, gap guards)",
+      "python -m trading_office.cli costs --market crypto",
+      "",
+      "# reconcile after a crash/restart (adopt what the exchange really has)",
+      "python -m trading_office.cli reconcile --market crypto --adopt",
       "",
       "# live engine: paper by default, one decision per closed bar",
       "python -m trading_office.engine --market crypto --symbols BTC/USDT:USDT,ETH/USDT:USDT",
@@ -720,6 +762,7 @@
     $("#eng-stop").addEventListener("click", () => engineCall("/api/engine/stop", { market: state.market }));
     $("#eng-cycle").addEventListener("click", () => engineCall("/api/engine/cycle", { market: state.market }));
     $("#eng-flat").addEventListener("click", () => engineCall("/api/engine/close-all", { market: state.market }));
+    $("#eng-sync").addEventListener("click", () => engineCall("/api/engine/reconcile", { market: state.market }));
     window.addEventListener("resize", () => {
       if (state.analysis && state.tab === "analysis") renderAnalysis(state.analysis);
       if (state.backtest && state.tab === "backtest") renderBacktest(state.backtest);

@@ -118,10 +118,27 @@ Every order carries an SL. Portfolio guards: max 4 concurrent positions, 4 % ope
 
 ### 4 · Management & execution
 
-Break-even at 1R (with a cost buffer), ATR trail after 1R, optional partial TP, time stop
-after 96 bars (crypto) / 15 sessions (IDX) if the trade never reached +0.5R, invalidation
-exit on an opposite signal, weekend/close flattening, and exchange-side brackets for live
-crypto orders.
+**Mandatory partial at 2R**: half the position is closed with a reduce-only order and the
+stop moves to **break-even + fees** in the same bar, so the runner cannot lose. The
+remainder then trails `1.5 × ATR` behind the best price (ratchet-only, minimum step
+`0.25 × ATR`). Plus a time stop after 96 bars (crypto) / 15 sessions (IDX) if the trade
+never reached +0.5R, invalidation on an opposite signal, weekend/close flattening, and
+exchange-side brackets for live crypto orders.
+
+### 5 · Costs, gaps and restarts
+
+- Fills are never free or instant: the backtest *and* the live engine apply the same
+  model — `latency (400 ms crypto / 900 ms IDX)` + `base + 0.06 × ATR% + impact × √participation`
+  slippage, capped per market (`45` / `80` bps).
+- Gate 1 refuses entries after a gap of `2.0 ATR` (crypto) / `1.5 ATR` (IDX), or when the
+  spread blows past `3×` its cap, and blocks the symbol for a cooldown; a stop that is
+  gapped through fills *worse* than the stop, and that loss shows up in the results.
+- Size shrinks (up to 1.75×) while the book is stressed, and the live engine re-prices
+  every entry before sending it — a fill that got expensive is deferred, not paid for.
+- **Crash-safe**: on startup the engine reconciles `state/positions.json` against
+  `exchange.fetch_positions()`, restores (or adopts) what really exists, drops ghosts,
+  flags positions without a resting stop, and never re-sells a partial (`partial_done`
+  is persisted).
 
 ---
 
@@ -173,15 +190,19 @@ python -m trading_office.backtest --market idx --data data/idx_BBCA_1d.json --oo
 
 Honesty rules in `trading_office/backtest/`:
 
-- decisions use closed bars only; **fills happen at the next bar's open** with spread,
-  slippage and commission applied;
-- gaps fill at the open, and when a stop and a target sit inside the same bar the **stop**
-  is assumed hit first (pessimistic);
+- decisions use closed bars only; **fills happen at the next bar's open**, moved by a
+  latency drift, then by ATR/impact slippage on top of spread and commission;
+- gaps fill at the open, a stop that is gapped through fills between the stop and the
+  open (never at the stop), and when a stop and a target sit inside the same bar the
+  **stop** is assumed hit first (pessimistic);
 - the OOS report is generated on a slice that never influenced parameter selection, and
   indicators are warmed on the full series so the slice is not handicapped.
 
 Results are reported as trades, win rate, expectancy in R, profit factor, max drawdown,
-Sharpe, and a **funnel of why trades were skipped** (which filter, which signal rule).
+Sharpe, partials taken, gap-through stops, and a **funnel of why trades were skipped**
+(which filter, which signal rule). A cost block reports realised slippage p50/p90/worst,
+the delay cost of the latency model, how many fills hit the slippage cap, and the pnl
+banked by partials — so the execution assumptions are auditable, not folklore.
 
 ---
 
@@ -208,7 +229,7 @@ trading_office/
   backtest/engine.py          bar-by-bar backtester + walk-forward
   cli.py                      terminal
 web/                          the web terminal (no build step, no frameworks)
-tests/                        46 unit + API tests, all offline
+tests/                        72 unit + API tests, all offline
 docs/                         strategy logic, API, MCP, operations
 scripts/make_demo_data.py     writes data/*.json for the backtester
 ```
@@ -217,14 +238,18 @@ scripts/make_demo_data.py     writes data/*.json for the backtester
 
 ```sh
 pip install pytest httpx
-python -m pytest -q           # 46 passed, entirely offline
+python -m pytest -q           # 72 passed, entirely offline
 ```
 
 The suite covers indicator maths, each filter's pass/block path, the no-trigger veto, the
 per-bar state lock, tick rounding, lot sizing, cost rejection, portfolio guards, all five
 management rules, broker idempotency, order placement (one per bar), stop-loss closure,
 position restore after restart, every API endpoint, the engine's bar-lock idempotency and
-the walk-forward split.
+the walk-forward split. On top of that: latency drift, ATR/impact slippage and its cap,
+the gap guard (ATR and spread triggers), gap-through-stop fills, the risk multiplier,
+partial TP at 2R (one action list, reduce-only, break-even ≥ entry + costs), the
+below-minimum partial skip, the ATR ratchet, and every branch of `startup_sync()`
+(restore / close ghost / untracked / adopt / venue-unreachable).
 
 ## Safety
 

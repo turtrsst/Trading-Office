@@ -78,7 +78,9 @@ reported as `SELL` and `executable: false`, because the cash market is long-only
 ## One symbol
 
 ### `GET /api/symbol/{market}/{symbol}`
-Slashes are allowed in `symbol` (`/api/symbol/crypto/ETH/USDT:USDT`). Returns:
+Slashes are allowed in `symbol` (`/api/symbol/crypto/ETH/USDT:USDT`), and `?refresh=true`
+drops the provider cache first. Returns an `execution_costs` block (spread, expected
+slippage, risk multiplier) next to the four gates:
 
 - `scan` — the four gates: `filter.checks[]`, `signal.components[]` with weights,
   `risk.plan` (entry, stop, target, size, lots, RR, costs) or `risk.rejections[]`,
@@ -121,11 +123,13 @@ With `oos = 0` it returns a single `BacktestResult` (`metrics`, `trades`,
 
 | endpoint | body | effect |
 | --- | --- | --- |
-| `GET /api/engine/status?market=crypto` | — | status, broker snapshot, positions, last scans, ledger tail, equity curve |
+| `GET /api/engine/status?market=crypto` | — | status (incl. `status.reconciled` and `status.partials`), broker snapshot, positions, last scans, ledger tail, equity curve, `costs`, `gap_cooldowns` |
 | `POST /api/engine/start` | `{"market":"crypto","symbols":["BTC/USDT:USDT"]}` | starts the background loop |
 | `POST /api/engine/stop` | `{"market":"crypto"}` | stops it |
 | `POST /api/engine/cycle` | `{"market":"idx"}` | exactly one scan cycle (synchronous) |
 | `POST /api/engine/close-all` | `{"market":"crypto"}` | flatten everything |
+| `POST /api/engine/reconcile` | `{"market":"crypto","adopt":false,"close_orphans":false}` | compare `state/positions.json` with the exchange (the boot-time `startup_sync()`) |
+| `GET /api/cost-model?market=crypto` | — | the fill model: latency, slippage coefficients/caps, gap thresholds, auction windows, partial-TP defaults |
 | `GET /api/ledger?market=crypto&limit=120` | — | raw audit trail |
 
 One cycle returns:

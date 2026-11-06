@@ -18,6 +18,7 @@ broker keeps the set of seen ids, so a retry after a network error can never dou
 from __future__ import annotations
 
 import datetime as dt
+import math
 import os
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -209,6 +210,45 @@ class PaperBroker:
         pos["stop"] = float(new_stop)
         return True
 
+    def partial_close(
+        self, symbol: str, size: float, price: float, *, reason: str = "partial take profit"
+    ) -> dict[str, Any] | None:
+        """Reduce a position by ``size`` at ``price``, releasing margin proportionally.
+
+        Returns ``{size, price, pnl, fee, remaining}`` or ``None`` when the symbol has no
+        position / the slice is not smaller than the position.
+        """
+        pos = self.positions.get(symbol)
+        if not pos:
+            return None
+        size = float(size)
+        if size <= 0 or size >= float(pos["size"]) - 1e-12:
+            return None
+        side = "sell" if pos["side"] == "long" else "buy"
+        fill = self._slipped_price(side, price)
+        notional = fill * size
+        fee = self._commission(side, notional)
+        direction = 1.0 if pos["side"] == "long" else -1.0
+        gross = (fill - pos["entry"]) * size * direction
+        share = size / float(pos["size"])
+        margin_release = float(pos.get("margin", 0.0)) * share
+        pos["size"] = float(pos["size"]) - size
+        pos["margin"] = float(pos.get("margin", 0.0)) - margin_release
+        pos["fees"] = float(pos.get("fees", 0.0)) + fee
+        pos.setdefault("partials", []).append(
+            {"size": size, "price": fill, "pnl": gross - fee, "at": dt.datetime.now(dt.timezone.utc).isoformat()}
+        )
+        self.cash += margin_release + gross - fee
+        self.locked_margin = max(0.0, self.locked_margin - margin_release)
+        return {
+            "size": size,
+            "price": fill,
+            "pnl": round(gross - fee, 6),
+            "fee": round(fee, 6),
+            "remaining": round(pos["size"], 12),
+            "reason": reason,
+        }
+
     def close(self, symbol: str, price: float, reason: str, *, fees_override: float | None = None) -> ClosedTrade | None:
         pos = self.positions.pop(symbol, None)
         if not pos:
@@ -240,6 +280,7 @@ class PaperBroker:
             risk_per_unit = float(initial or 0.0)
         r_mult = (pnl / (risk_per_unit * pos["size"])) if risk_per_unit and pos["size"] else 0.0
 
+        banked = sum(float(p.get("pnl", 0.0)) for p in pos.get("partials", []))
         trade = ClosedTrade(
             symbol=symbol,
             market=self.market,
@@ -247,7 +288,7 @@ class PaperBroker:
             entry=pos["entry"],
             exit=exit_price,
             size=pos["size"],
-            pnl=round(pnl, 4),
+            pnl=round(pnl + banked, 4),
             fees=round(total_fees, 4),
             r_multiple=round(r_mult, 4),
             reason=reason,
@@ -366,6 +407,87 @@ class CcxtBroker:
         except Exception as exc:  # pragma: no cover - network/venue
             return Fill(False, "", order.client_id, order.symbol, order.side, 0.0, order.price_hint, 0.0,
                         f"exchange rejected: {exc}")
+
+    def amount_step(self, symbol: str) -> float | None:
+        """Contract step (precision) for partial sizes."""
+        try:
+            market = self.exchange.market(symbol)
+            precision = (market.get("precision") or {}).get("amount")
+            if precision is None:
+                return None
+            if isinstance(precision, int):
+                return 10 ** (-precision)
+            return float(precision)
+        except Exception:  # pragma: no cover - venue specific
+            return None
+
+    def modify_stop(self, symbol: str, new_stop: float) -> dict[str, Any]:
+        """Move the stop of the *whole* position by replacing its stop order.
+
+        Exchanges differ: Bybit accepts ``trading-stop`` edits, Binance wants the algo
+        order cancelled and re-created. We try the edit first and fall back to cancel +
+        re-create, always returning a dict so the engine can ledger what happened.
+        """
+        try:
+            orders = self.exchange.fetch_open_orders(symbol)
+        except Exception as exc:  # pragma: no cover
+            return {"ok": False, "reason": f"cannot list open orders: {exc}"}
+        stops = [
+            o for o in orders
+            if (o.get("type") in ("stop", "stop_market", "conditional", "trading_stop"))
+            or (o.get("info") or {}).get("stopOrderType")
+        ]
+        if not stops:
+            return {"ok": False, "reason": "no resting stop order to move"}
+        stop = stops[0]
+        try:
+            self.exchange.edit_order(stop["id"], symbol, stop.get("type", "stop"), stop.get("side"),
+                                     stop.get("amount"), None,
+                                     {"triggerPrice": self._price(symbol, new_stop)})
+            return {"ok": True, "method": "edit", "order_id": stop.get("id"), "stop": new_stop}
+        except Exception as edit_error:  # pragma: no cover - venue specific
+            try:
+                self.exchange.cancel_order(stop["id"], symbol)
+                raw = self.exchange.create_order(
+                    symbol, stop.get("type", "stop"), stop.get("side"), stop.get("amount"), None,
+                    {"triggerPrice": self._price(symbol, new_stop), "reduceOnly": True},
+                )
+                return {"ok": True, "method": "recreate", "order_id": raw.get("id"), "stop": new_stop}
+            except Exception as exc:
+                return {"ok": False, "reason": f"edit failed ({edit_error}); recreate failed ({exc})"}
+
+    def partial_close(self, symbol: str, size: float, price: float, *, reason: str = "") -> dict[str, Any] | None:
+        """Reduce-only market order for a slice; the venue's amount precision wins."""
+        live = [p for p in self.positions() if p.get("symbol") == symbol]
+        if not live:
+            return None
+        pos = live[0]
+        contracts = float(pos.get("contracts") or 0.0)
+        step = self.amount_step(symbol)
+        qty = min(float(size), contracts)
+        if step:
+            qty = math.floor(qty / step) * step
+        if qty <= 0 or qty >= contracts:
+            return None
+        side = "sell" if pos.get("side") == "long" else "buy"
+        try:  # pragma: no cover - live path
+            raw = self.exchange.create_order(
+                symbol, "market", side, self._amount(symbol, qty), None, {"reduceOnly": True}
+            )
+            fill = float(raw.get("average") or raw.get("price") or price)
+            entry = float(pos.get("entryPrice") or 0.0)
+            direction = 1.0 if pos.get("side") == "long" else -1.0
+            fee = float((raw.get("fee") or {}).get("cost") or 0.0)
+            return {
+                "size": qty,
+                "price": fill,
+                "pnl": round((fill - entry) * qty * direction - fee, 6),
+                "fee": fee,
+                "remaining": round(contracts - qty, 12),
+                "reason": reason,
+            }
+        except Exception:  # pragma: no cover
+            return None
 
     def positions(self) -> list[dict[str, Any]]:
         try:

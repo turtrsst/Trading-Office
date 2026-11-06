@@ -78,6 +78,30 @@ def test_backtest_endpoint_reports_oos(client):
     assert "expectancy_r" in metrics and "max_drawdown_pct" in metrics
 
 
+def test_backtest_reports_execution_costs(client):
+    body = client.post(
+        "/api/backtest", json={"market": "crypto", "symbol": "SOL/USDT:USDT", "oos": 0.3, "bars": 900}
+    ).json()
+    metrics = body["out_of_sample"]["metrics"]
+    costs = metrics["costs"]
+    assert costs["latency_ms"] == 400
+    assert costs["slippage_bps"]["p50"] > 0
+    assert costs["entries"] >= 0
+    assert body["cost_model"]["max_slippage_bps"] == 45.0
+
+
+def test_cost_model_endpoint_and_reconcile(client):
+    model = client.get("/api/cost-model?market=idx").json()
+    assert model["model"]["latency_ms"] == 900
+    assert model["stress_spread_cap_bps"] > model["spread_cap_bps"]
+    report = client.post("/api/engine/reconcile", json={"market": "crypto"}).json()
+    assert report["venue_available"] is True
+    assert "untracked" in report and "stops_missing" in report
+    status = client.get("/api/engine/status?market=crypto").json()
+    assert status["status"]["reconciled"]["venue_available"] is True
+    assert status["costs"]["latency_ms"] == 400
+
+
 def test_engine_cycle_is_idempotent_on_the_same_bar(client):
     first = client.post("/api/engine/cycle", json={"market": "idx", "symbols": ["BBCA"]}).json()
     second = client.post("/api/engine/cycle", json={"market": "idx", "symbols": ["BBCA"]}).json()
@@ -116,7 +140,8 @@ def _ready_payload(settings, symbol="TEST/USDT:USDT"):
         "bar_time": "2026-11-06T10:00:00+07:00", "price": 100.0, "executable": True,
         "reasons": ["trend_alignment +2", "trigger +2", "macd_confirmation +1"],
         "risk": {"approved": True, "plan": plan.to_dict(), "rejections": []},
-        "filter": {"checks": []}, "signal": {}, "indicators": {}, "warnings": [], "source": "synthetic",
+        "filter": {"checks": [{"name": "spread", "value": 3.0, "passed": True}]},
+        "signal": {"atr": 1.0}, "indicators": {}, "warnings": [], "source": "synthetic",
     }
 
 
@@ -164,7 +189,7 @@ def test_engine_management_closes_on_stop(tmp_path, monkeypatch):
     closed = engine.state.closed_trades()
     assert closed and closed[-1]["event"] == "trade_closed"
     assert closed[-1]["pnl"] < 0
-    assert closed[-1]["reason"].startswith("stop loss")
+    assert "stop" in closed[-1]["reason"]
 
 
 def test_engine_restores_positions_after_restart(tmp_path):

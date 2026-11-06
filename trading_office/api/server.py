@@ -36,6 +36,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .. import costs as cost_model
 from .. import indicators as ind
 from ..backtest import Backtester, walk_forward
 from ..config import Settings
@@ -126,6 +127,12 @@ class BacktestRequest(BaseModel):
 class EngineRequest(BaseModel):
     market: Literal["crypto", "idx"] = "crypto"
     symbols: list[str] | None = None
+
+
+class EngineReconcileRequest(BaseModel):
+    market: Literal["crypto", "idx"] = "crypto"
+    adopt: bool = False
+    close_orphans: bool = False
 
 
 # --------------------------------------------------------------------------- app
@@ -260,13 +267,18 @@ def create_app() -> FastAPI:
         limit: int = Query(20, ge=1, le=80),
         symbols: str = "",
         deep: bool = True,
+        refresh: bool = False,
     ) -> dict[str, Any]:
         wanted = [s.strip() for s in symbols.split(",") if s.strip()] or None
+        if refresh:
+            IDX.cache.clear()
         return SCREENER.screen(market, symbols=wanted, limit=limit, deep_context=deep)
 
     @app.get("/api/symbol/{market}/{symbol:path}")
-    def symbol_detail(market: Literal["idx", "crypto"], symbol: str) -> dict[str, Any]:
+    def symbol_detail(market: Literal["idx", "crypto"], symbol: str, refresh: bool = False) -> dict[str, Any]:
         try:
+            if refresh:
+                IDX.cache.clear()
             return SCREENER.analyse(market, symbol)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
@@ -310,6 +322,22 @@ def create_app() -> FastAPI:
         return result
 
     # ------------------------------------------------------------------ engine
+    @app.post("/api/engine/reconcile")
+    def engine_reconcile(req: EngineReconcileRequest) -> dict[str, Any]:
+        engine = _engine(req.market)
+        return engine.startup_sync(adopt_untracked=req.adopt, close_orphans=req.close_orphans)
+
+    @app.get("/api/cost-model")
+    def cost_model_endpoint(market: Literal["crypto", "idx"] = "crypto") -> dict[str, Any]:
+        profile = SETTINGS.profile(market)
+        return {
+            "market": market,
+            "model": cost_model.CostConfig.for_market(market, profile).to_dict(),
+            "spread_cap_bps": float(profile.get("max_spread_bps", 8.0)),
+            "stress_spread_cap_bps": cost_model.risky_spread_cap(profile),
+            "management": SETTINGS.section("management"),
+        }
+
     @app.get("/api/engine/status")
     def engine_status(market: Literal["crypto", "idx"] = "crypto") -> dict[str, Any]:
         engine = _engine(market)

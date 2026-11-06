@@ -48,6 +48,7 @@ class TradePlan:
     stop_source: str = ""
     target_source: str = ""
     caps_applied: list[str] = field(default_factory=list)
+    risk_note: str = ""
     costs: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -126,6 +127,8 @@ def build_plan(
     tick_size: float | None = None,
     quote_volume: float | None = None,
     leverage: float | None = None,
+    risk_multiplier: float = 1.0,
+    risk_note: str = "",
 ) -> RiskDecision:
     """Compute a fully-populated :class:`TradePlan` or explain why the trade is refused."""
     rejections: list[str] = []
@@ -215,7 +218,13 @@ def build_plan(
         )
 
     # ------------------------------------------------------------ 4. size
+    # A stressed tape (wide book, fat ATR) shrinks the budget instead of the discipline:
+    # the distance stays where structure put it, the size absorbs the stress.
     risk_pct = float(risk_cfg.get("risk_per_trade_pct", 1.0))
+    mult = max(0.1, float(risk_multiplier or 1.0))
+    if mult != 1.0:
+        risk_pct = risk_pct / mult
+        caps.append(f"risk_scale_{mult:.2f}x")
     risk_cash = equity * risk_pct / 100.0
     size = risk_cash / stop_distance
     notional = size * entry
@@ -293,6 +302,7 @@ def build_plan(
         stop_source=stop_source,
         target_source=target_source,
         caps_applied=caps,
+        risk_note=risk_note,
         costs={
             "spread_bps": round(spread_bps, 3),
             "round_trip_cost_pct": round(cost_pct * 100.0, 4),

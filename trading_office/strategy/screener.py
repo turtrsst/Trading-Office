@@ -446,12 +446,55 @@ class Screener:
         return {
             "scan": scan.to_dict(),
             "row": row.to_dict(),
+            "execution_costs": self._cost_view(market, scan, data.get("bars") or []),
             "candles": data["bars"][-260:],
             "htf_candles": data["htf_bars"][-120:],
             "quote": data["quote"],
             "context": context,
             "source": data.get("source"),
             "warnings": data.get("warnings") or [],
+        }
+
+
+    def _cost_view(self, market: str, scan: ScanResult, bars: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        """What the fill would cost right now, and whether that changes the size."""
+        from .. import costs as cost_model
+
+        profile = self.settings.profile(market)
+        cfg = cost_model.CostConfig.for_market(market, profile)
+        checks = (scan.filter or {}).get("checks") or []
+        spread_now = next((c.get("value") for c in checks if c.get("name") == "spread"), None) or 0.0
+        atr = float(scan.signal.get("atr") or 0.0)
+        plan = (scan.risk or {}).get("plan") or {}
+        price = float(scan.price or 0.0)
+        notional = float(plan.get("notional") or 0.0)
+        quote_volume = None
+        if bars:
+            recent = sorted(float(b.get("volume") or 0) * float(b["close"]) for b in bars[-20:])
+            quote_volume = recent[len(recent) // 2] if recent else None
+        estimate = cost_model.estimate_slippage(
+            price=price, atr=atr, notional=notional, quote_volume=quote_volume, cfg=cfg
+        )
+        atr_pct = (atr / price * 100.0) if price else None
+        mult = cost_model.risk_multiplier(
+            spread_bps=float(spread_now or 0.0),
+            max_spread_bps=float(profile.get("max_spread_bps", 8.0)),
+            atr_pct=atr_pct,
+            profile=profile,
+            cfg=cfg,
+        )
+        return {
+            "latency_ms": cfg.latency_ms,
+            "spread_bps": round(float(spread_now or 0.0), 2),
+            "expected_slippage_bps": round(estimate.slippage_bps, 2),
+            "slippage_capped": estimate.capped,
+            "risk_multiplier": mult,
+            "risk_note": (
+            f"size scaled {1 / mult:.2f}x down: spread/ATR stress" if mult >= 1.05 else ""
+        ),
+            "partial_tp_r": self.settings.get("management.partial_tp_r"),
+            "trail_atr_mult": self.settings.get("management.trail_atr_mult"),
+            "gap_reject_atr": cfg.gap_reject_atr,
         }
 
 

@@ -162,8 +162,14 @@ class IdxClient:
             return self._cached(f"candles:{symbol}:{period}:{interval}", fetch)
         except IdxUnavailable as exc:
             self.last_error = str(exc)
-            bars = demo.idx_bars(symbol, interval if interval in ("1d", "1wk") else "1d",
-                                 260 if interval != "1wk" else 160)
+            # ask the synthetic provider for what was requested: the backtest needs the
+            # full window (walk-forward warms EMA200 on it), not a hard-coded 260 bars
+            count = {"1y": 260, "2y": 520, "5y": 1250, "10y": 1500}.get(period, 260)
+            bars = demo.idx_bars(
+                symbol,
+                interval if interval in ("1d", "1wk") else "1d",
+                min(count * 5, 1500) if interval == "1wk" else count,
+            )
             return {
                 "bars": bars,
                 "source": "synthetic",

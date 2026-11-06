@@ -61,6 +61,11 @@ without it the entry signals trade against the higher timeframe.
     opening auction noise and the closing auction).
 - Weekend/holiday guard: crypto is 24/7 but *entries* can be disabled on
   Saturday/Sunday (thin books, wide spreads); IDX uses the exchange holiday calendar.
+- **Auction windows (IDX):** `execution_costs.auction_windows` defaults to
+  `08:45–09:15` (pre-opening + opening auction) and `15:45–16:15` (pre-closing +
+  closing auction). No entries inside them: the book is indicative only, so the price
+  you see is not a price you can trade. Crypto has no auction, only the session
+  windows above.
 - **News blackout:** a static list of high-impact windows (`news_blackout`, ISO
   timestamps + minutes-of-day rules) is honoured; the live engine also drops any
   symbol whose data is `stale` (IDX provider warning, crypto feed older than
@@ -76,6 +81,27 @@ without it the entry signals trade against the higher timeframe.
   and minimum traded value `min_daily_value_idr` (default 5 B IDR) for liquidity.
 - If the venue gives no book (delayed IDX data), the filter falls back to
   `estimated_spread_bps = 2 * tick_size / price` and marks the result `estimated`.
+- **Two-level cap.** The normal cap above blocks entries in a merely quiet book; a
+  wider **stress cap** `risky_spread_cap = max_spread_bps × extreme_spread_mult`
+  (1.6× crypto, 1.6× IDX) is what the gap guard uses to recognise a shock. Between the
+  two, entries are allowed but the *size* is scaled down (see 3.5).
+
+### 1.5 Gap & black-swan tolerance
+
+A stop is a request, not a promise: on a gap the market opens through it and the fill
+is worse than the stop, so the realised loss can exceed the 1 % risk budget. Three
+defences, all in `trading_office/costs.py`:
+
+| Defence | Rule | Default |
+| --- | --- | --- |
+| **Gap rejection** | `abs(open − prev_close) / ATR >= gap_reject_atr` → no entry, cooldown | crypto 2.0 ATR, IDX 1.5 ATR |
+| **Spread shock** | `spread_bps >= gap_reject_spread_mult × max_spread_bps` → no entry, cooldown | 3.0× crypto, 2.5× IDX |
+| **Cooldown** | After a rejection the symbol is blocked for `gap_cooldown_bars` cycles | crypto 3, IDX 2 sessions |
+| **Gap through a stop** | If a bar gaps past a resting stop, the exit fills at `stop + f × (open − stop)`, `f = gap_fill_fraction` | 0.5 crypto, 0.75 IDX |
+
+The backtest applies the same table, so a gap loss shows up in the equity curve instead
+of being hidden by an optimistic "filled at the stop" assumption, and
+`metrics()["gap_stops"]` counts them.
 
 ---
 
@@ -166,17 +192,48 @@ Before an order is allowed, expected profit must beat costs:
 (default `cost_multiple = 3`). A setup whose target is inside the cost envelope is
 skipped, not executed — this is the gate that kills most "profitable in theory" bots.
 
+### 3.5 Stress sizing
+
+Volume-weighted risk is not constant through the day. While the book is stressed the
+budget is *divided* by a multiplier (distance unchanged, size smaller):
+
+```
+stress = clamp(2 × (spread / max_spread − 0.5), 0, 1)        # starts at half the cap
+mult   = 1 + 0.5 × stress + 0.25 × (ATR% excess over atr_soft_cap_pct),  clamped
+```
+
+`max_risk_multiplier` caps it at 1.75× (crypto) / 1.5× (IDX), and the plan records
+`risk_scale_{m}x` in `caps_applied` plus a human `risk_note`, so a shrunken position is
+never mistaken for a bug.
+
+### 3.6 Execution-time cost veto
+
+The plan is priced on a closed bar; the fill happens a few hundred milliseconds later.
+The live engine re-prices the fill with the same model before submitting and **defers**
+the entry (the bar lock prevents a second attempt on that bar) when either
+
+- the spread is above the stress cap, or
+- `live cost % > planned round-trip cost % × (1 + execution.max_cost_drift_pct)` (40 %).
+
+Deferrals are written to the ledger as `cost_deferred` with the numbers that caused
+them.
+
 ---
 
 ## 4. Trade Management — "what happens after entry?"
 
 Managed by the engine on each closed bar plus, for trailing, on ticks:
 
+Rule order on every closed bar (first match wins, several can fire in one bar — a partial
+and its break-even move are emitted together):
+
 | Rule | Detail |
 | --- | --- |
-| **Break-even at 1R** | When price reaches `entry + 1R` (long), SL moves to `entry + spread` (covers costs, not just `entry`). |
-| **Trailing after 1R** | Then SL trails `trail_atr_mult * ATR` (default 1.0) behind the best price, but never loosens and never moves inside the structure stop of the last `swing_lookback` bars. |
-| **Partial take profit** | Optional `partial_tp_r` (default 1.5R, 50 % off) — off by default in backtests so results stay comparable. |
+| **1. Hard bracket** | The resting SL/TP are checked first; a gap through the stop uses the gap fill above. |
+| **2. Partial take profit (mandatory)** | At `partial_tp_r` (default **2.0R**) close `partial_tp_fraction` (**50 %**) with a **reduce-only** order. `partial_done` is persisted before the next bar, so a restart can never sell the same half twice. Skipped (never rounded up) when half the position is below the venue minimum / `amount_to_precision` step. |
+| **3. Break-even + costs** | In the same action list: SL → `entry ± (fees + spread buffer)`, i.e. strictly better than entry. That is what makes the runner risk-free. There is no `breakeven_at_r` trigger any more — the move is part of the partial, not a separate hope. |
+| **4. Runner cap (optional)** | If `runner_target_r` is set, the remaining half exits there; left `null` the trade keeps running and the trail decides. |
+| **5. ATR trailing (ratchet-only)** | After `trail_start_r` (1R): `HighestHigh − trail_atr_mult × ATR` (long) / `LowestLow + trail_atr_mult × ATR` (short), `trail_atr_mult = 1.5`. The stop only ever moves in the trade's favour, and only when the improvement exceeds `trail_step_atr × ATR` (0.25) so it is not rewritten on every tick. |
 | **Time stop** | Force-close after `max_bars_in_trade` (default 96 × 15 m ≈ 24 h crypto; 15 sessions IDX) if the trade never reached +0.5R. |
 | **Session / rollover exit** | Crypto: optional flat before the weekend funding window. IDX: flat before the close (`close_before_minutes`) since IDX has no overnight stop protection. |
 | **Invalidation** | If an opposite signal reaches `min_score` while the trade is open, exit at market on the next tick (early exit before hard TP/SL). |
@@ -197,15 +254,57 @@ Managed by the engine on each closed bar plus, for trailing, on ticks:
   reasons, gate results and the sizing math, so "why did it buy?" is answerable.
 - Idempotency: client order IDs are `to-{symbol}-{bar_time}-{side}`; a retried order
   with the same ID is refused by the executor and by the exchange where supported.
+- **Partials are reduce-only** market orders sized through `amount_to_precision()`
+  (`broker.amount_step()`), and the remaining stop is moved with `edit_order`, falling
+  back to cancel-and-recreate when the venue does not support edits.
+- **Startup reconciliation** (`TradingEngine.startup_sync()`, also
+  `POST /api/engine/reconcile`, `python -m trading_office.cli reconcile`, MCP
+  `reconcile_state`) runs before the first cycle and compares `state/positions.json`
+  with `exchange.fetch_positions()`:
+
+  | Situation | Action |
+  | --- | --- |
+  | State and venue agree | `restore` — venue entry/size win, `initial_stop`, `partial_done` and the trail high-water mark are kept |
+  | Venue flat, state open | `close` — the trade left without us; it is recorded and cleared (no phantom position) |
+  | Venue open, state missing | `untracked` — reported, and the symbol is blocked from new entries; `--adopt` re-attaches tracking, `--close-orphans` flattens instead |
+  | Venue unreachable | `blocked` — no new entries until it answers |
+  | Resting stop missing | `stops_missing` — flagged for a human/automated re-bracket |
+
+  The report is persisted in the ledger and exposed in `GET /api/engine/status`
+  (`status.reconciled`) and on the Live Engine tab.
 
 ---
 
 ## 6. Backtest, screening and "unseen data"
 
 - `backtest/engine.py` walks closed bars bar-by-bar, feeds fills from the **next bar's
-  open** (no look-ahead), charges spread/commission/slippage, and emits trades with
-  R-multiples. It reports win rate, expectancy, profit factor, max drawdown, Sharpe,
-  exposure and the per-filter rejection counts (why trades were skipped).
+  open** (no look-ahead), and emits trades with R-multiples. It reports win rate,
+  expectancy, profit factor, max drawdown, Sharpe, exposure, partials, gap-stops and the
+  per-filter rejection counts (why trades were skipped).
+- **Fill model** (identical to the live engine, `trading_office/costs.py`):
+
+  ```
+  latency_drift   = (open − signal_close) / close × (latency_ms / bar_ms)
+  fill            = open × (1 + latency_drift)
+  slippage_bps    = base + atr_mult × (ATR/price × 10⁴) + impact_coeff × √(participation %)
+                    capped at max_slippage_bps
+  participation % = notional / median(quote volume, 20 bars)
+  ```
+
+  Crypto: 400 ms latency, 1.5 bps base, 0.06 × ATR%, 1.5 × √impact, 45 bps cap.
+  IDX: 900 ms, 2 bps, 0.05, 2.5, 80 bps. Every fill emits a `cost_event`, which the
+  result aggregates into `metrics()["costs"]`:
+
+  | Key | Meaning |
+  | --- | --- |
+  | `slippage_bps.p50 / p90 / p100` | realised slippage distribution |
+  | `slippage_capped` | fills that hit `max_slippage_bps` (a size warning) |
+  | `latency_adverse_bps` | how much the 400/900 ms delay moved fills against us |
+  | `gap_guards`, `gap_examples` | entries refused by the gap/spread guard |
+  | `partial_fills`, `partial_pnl` | banked 2R partials |
+
+  `POST /api/backtest` returns the same block, so the numbers are inspectable, not
+  folklore.
 - Walk-forward: parameters are chosen on the first 70 % of the locked dataset and
   reported on the last 30 % (`--oos`), which is the only number that counts.
 - The IDX screener (`market/idx_client.py` + `strategy/screener.py`) runs the same

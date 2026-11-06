@@ -20,6 +20,14 @@ Guarantees
   the paper broker unless the config and the environment both say live.
 * **Everything audited**: each decision (taken or skipped) is appended to
   ``state/ledger.jsonl`` with the gate results, so the UI can replay the reasoning.
+* **Reconciled on restart**: ``startup_sync()`` compares the persisted positions, the
+  entry bar locks, the venue's real positions and its resting stop orders, then adopts /
+  closes / blocks accordingly. It runs before the first cycle, so a VPS reboot can never
+  produce a duplicate position or an untracked stop.
+* **Costs at execution time**: the same :mod:`trading_office.costs` model the backtest
+  uses decides whether the current spread makes a fill too expensive (the entry is
+  deferred, not faked), inflates risk while the tape is stressed, and blocks entries for
+  a few bars after a gap/spread shock.
 
 The engine can run **in-process** (the web server starts it as a background thread) or as
 its own process (``python -m trading_office.engine --market crypto``).
@@ -37,11 +45,12 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 from zoneinfo import ZoneInfo
 
+from . import costs, indicators as ind
 from .market import CryptoClient, IdxClient
 from .market import demo
 from .config import Settings
 from .execution import ClosedTrade, PaperBroker, make_broker, order_from_plan
-from .management import Position, manage_position, should_exit_on_signal
+from .management import Position, manage_position, partial_size, should_exit_on_signal
 from .state import StateStore
 from .strategy.runner import scan_symbol
 
@@ -61,6 +70,10 @@ class EngineStatus:
     last_errors: list[str] = field(default_factory=list)
     equity: float = 0.0
     open_positions: int = 0
+    reconciled: dict[str, Any] = field(default_factory=dict)
+    partials: int = 0
+    # live-only broker feeds; None means "the venue did not tell us", never "empty"
+    equity_source: str = "local"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -77,6 +90,9 @@ class EngineStatus:
             "last_errors": self.last_errors[-5:],
             "equity": self.equity,
             "open_positions": self.open_positions,
+            "reconciled": self.reconciled,
+            "partials": self.partials,
+            "equity_source": self.equity_source,
         }
 
 
@@ -134,6 +150,9 @@ class TradingEngine:
             open_positions=len(self.positions),
         )
         self.last_scans: dict[str, dict[str, Any]] = {}
+        self.cost_cfg = costs.CostConfig.for_market(market, self.profile)
+        self.gap_cooldowns: dict[str, int] = {}  # symbol -> cycles of entry block left
+        self.reconciled: dict[str, Any] = {}  # last startup_sync() report
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
@@ -178,6 +197,15 @@ class TradingEngine:
     # ------------------------------------------------------------------ one cycle
     def cycle(self) -> dict[str, Any]:
         started = dt.datetime.now(dt.timezone.utc)
+        if not self.reconciled:
+            try:
+                self.startup_sync()
+            except Exception as exc:  # never let reconciliation block the loop
+                self.status.last_errors.append(f"startup_sync: {exc}")
+        for symbol in list(self.gap_cooldowns):
+            self.gap_cooldowns[symbol] = max(0, self.gap_cooldowns[symbol] - 1)
+            if not self.gap_cooldowns[symbol]:
+                self.gap_cooldowns.pop(symbol, None)
         scans = []
         for symbol in self.symbols:
             try:
@@ -277,6 +305,13 @@ class TradingEngine:
             ask=data.get("ask"),
         )
         payload = result.to_dict()
+        # a gap/spread shock blocks new entries for a few bars (black-swan guard)
+        if self.gap_cooldowns.get(symbol):
+            payload["action"] = "WAIT"
+            payload["reasons"] = [
+                f"gap cooldown: {self.gap_cooldowns[symbol]} cycle(s) left after a shock"
+            ] + payload["reasons"][:2]
+            payload["executable"] = False
         self.last_scans[symbol] = payload
         self.state.append_ledger(
             {
@@ -335,6 +370,16 @@ class TradingEngine:
             payload["execution"] = {"skipped": "execution disabled"}
             return
 
+        # ---- execution-time cost check: the frozen plan was priced on the closed bar,
+        # the fill happens now. If the book widened (or a shock hit), defer instead of
+        # paying for it: the bar lock above already stops a second attempt on this bar.
+        check = self.cost_check(symbol, plan)
+        if not check["ok"]:
+            self._skip(symbol, f"entry deferred: {check['reason']}")
+            payload["execution"] = {"skipped": check["reason"], "cost": check}
+            return
+        payload["cost"] = check
+
         order = order_from_plan(plan, bar_time, payload.get("reasons", []))
         fill = self.broker.submit(order)
         self.state.append_ledger(
@@ -375,6 +420,213 @@ class TradingEngine:
         self.state.append_ledger({"event": "skip", "market": self.market, "symbol": symbol, "reason": reason})
         self._emit({"event": "skip", "market": self.market, "symbol": symbol, "reason": reason})
 
+    # ------------------------------------------------------------------ costs
+    def cost_check(self, symbol: str, plan) -> dict[str, Any]:
+        """Would filling ``plan`` right now cost more than the plan budgeted for?"""
+        snapshot = self.last_scans.get(symbol) or {}
+        checks = (snapshot.get("filter") or {}).get("checks") or []
+        spread_now = next((c.get("value") for c in checks if c.get("name") == "spread"), None)
+        max_spread = float(self.profile.get("max_spread_bps", 8.0))
+        try:
+            tick = self.fetch(symbol)
+        except Exception:
+            tick = {}
+        atr = snapshot.get("signal", {}).get("atr") or snapshot.get("indicators", {}).get("atr")
+        if atr is None:
+            try:
+                bars = tick.get("bars") or []
+                atr = ind.last_defined(
+                    ind.atr([b["high"] for b in bars], [b["low"] for b in bars],
+                            [b["close"] for b in bars], 14)
+                )
+            except Exception:
+                atr = 0.0
+        quote_volume = None
+        bars = tick.get("bars") or []
+        if bars:
+            recent = sorted(float(b.get("volume") or 0) * float(b["close"]) for b in bars[-20:])
+            quote_volume = recent[len(recent) // 2] if recent else None
+        price = float(plan.entry)
+        notional = price * float(plan.size)
+        estimate = costs.estimate_slippage(
+            price=price, atr=float(atr or 0.0), notional=notional,
+            quote_volume=quote_volume, cfg=self.cost_cfg,
+        )
+        planned_cost_pct = float(plan.costs.get("round_trip_cost_pct", 0.0)) / 100.0
+        now_cost_pct = (estimate.slippage_bps + float(spread_now or max_spread)) / 10_000.0
+        tolerance = float(self.settings.get("execution.max_cost_drift_pct", 40.0)) / 100.0
+        reason = ""
+        if spread_now is not None and spread_now > max_spread * float(self.profile.get("extreme_spread_mult", 1.6)):
+            reason = f"spread {spread_now:.1f} bps above the stress cap"
+        elif planned_cost_pct and now_cost_pct > planned_cost_pct * (1 + tolerance):
+            reason = (
+                f"live cost {now_cost_pct*100:.3f}% vs planned {planned_cost_pct*100:.3f}% "
+                f"(slippage {estimate.slippage_bps:.1f} bps)"
+            )
+        result = {
+            "ok": not reason,
+            "reason": reason,
+            "spread_bps": spread_now,
+            "slippage_bps": round(estimate.slippage_bps, 3),
+            "slippage_capped": estimate.capped,
+            "planned_cost_pct": round(planned_cost_pct * 100, 4),
+            "live_cost_pct": round(now_cost_pct * 100, 4),
+            "risk_multiplier": costs.risk_multiplier(
+                spread_bps=float(spread_now or 0.0), max_spread_bps=max_spread,
+                atr_pct=(float(atr or 0.0) / price * 100.0) if price else None,
+                profile=self.profile, cfg=self.cost_cfg,
+            ),
+        }
+        if reason:
+            self.state.append_ledger(
+                {"event": "cost_deferred", "market": self.market, "symbol": symbol, "reason": reason,
+                 "cost": result}
+            )
+        return result
+
+    def _venue_positions(self) -> list[dict[str, Any]] | None:
+        """Real positions from the venue, or ``None`` when the broker cannot tell us."""
+        if isinstance(self.broker, PaperBroker):
+            return [
+                {
+                    "symbol": symbol,
+                    "side": pos.get("side"),
+                    "contracts": float(pos.get("size") or 0.0),
+                    "entryPrice": float(pos.get("entry") or 0.0),
+                    "stopLoss": pos.get("stop"),
+                }
+                for symbol, pos in self.broker.positions.items()
+            ]
+        fetch = getattr(self.broker, "positions", None)
+        if fetch is None:
+            return None
+        try:
+            return fetch()
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------ startup reconciliation
+    def startup_sync(self, *, adopt_untracked: bool = False, close_orphans: bool = False) -> dict[str, Any]:
+        """Reconcile persisted state with the venue before trading starts.
+
+        Compares, per symbol:
+
+        * our ``state/positions.json`` (what we think is open),
+        * the venue's live positions (what is really open),
+        * whether the entry bar lock exists (proof the order was authorised once),
+        * whether the venue still has a resting stop for that position.
+
+        Actions: ``adopt`` (venue has it, state lost it -> re-attach tracking),
+        ``restore`` (state has it, venue agrees -> keep), ``close`` (venue flat but state
+        open -> the trade left without us: record and clear), ``block`` (state open, venue
+        unknown -> no new entries until a human looks), ``untracked`` (venue has a position
+        we never authorised: reported, adopted only when asked).
+        """
+        timeframe = str(self.profile.get("timeframe", ""))
+        venue = self._venue_positions()
+        venue_by_symbol: dict[str, dict[str, Any]] = {}
+        for row in venue or []:
+            key = row.get("symbol")
+            if key:
+                venue_by_symbol[key] = row
+        report: dict[str, Any] = {
+            "at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "market": self.market,
+            "mode": self.mode,
+            "venue_available": venue is not None,
+            "symbols": [],
+            "adopted": [],
+            "restored": [],
+            "closed": [],
+            "blocked": [],
+            "untracked": [],
+            "stops_missing": [],
+        }
+
+        stops_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        list_orders = getattr(self.broker, "exchange", None)
+        if list_orders is not None:
+            try:
+                for order in list_orders.fetch_open_orders():
+                    stops_by_symbol.setdefault(order.get("symbol"), []).append(order)
+            except Exception:
+                pass
+
+        with self.lock:
+            for symbol, position in list(self.positions.items()):
+                live = venue_by_symbol.get(symbol)
+                entry = {"symbol": symbol, "side": position.side, "size": position.size, "entry": position.entry}
+                if venue is None:
+                    report["blocked"].append({**entry, "reason": "venue positions unavailable"})
+                    self.gap_cooldowns[symbol] = max(self.gap_cooldowns.get(symbol, 0), 1)
+                    report["symbols"].append({**entry, "state": "unverified"})
+                    continue
+                if not live:
+                    closed = self.broker.close(symbol, position.entry, "reconciled: venue is flat")
+                    if closed is not None:
+                        self._record_close(symbol, closed)
+                    self.positions.pop(symbol, None)
+                    report["closed"].append({**entry, "reason": "venue flat while state was open"})
+                    continue
+                venue_size = float(live.get("contracts") or live.get("size") or 0.0)
+                position.size = venue_size or position.size
+                venue_entry = float(live.get("entryPrice") or 0.0)
+                if venue_entry > 0:
+                    position.entry = venue_entry
+                if list_orders is not None and not stops_by_symbol.get(symbol):
+                    report["stops_missing"].append(symbol)
+                self.state.save_position(symbol, position.to_dict())
+                report["restored"].append({**entry, "venue_size": venue_size})
+                report["symbols"].append({**entry, "state": "matched"})
+
+            for symbol, live in venue_by_symbol.items():
+                if symbol in self.positions:
+                    continue
+                key_known = self.state.is_locked(symbol, timeframe, str(live.get("timestamp", "")))
+                entry = {
+                    "symbol": symbol,
+                    "side": live.get("side"),
+                    "size": float(live.get("contracts") or live.get("size") or 0.0),
+                    "entry": float(live.get("entryPrice") or 0.0),
+                    "bar_lock": key_known,
+                }
+                if adopt_untracked:
+                    side = "long" if str(live.get("side")) == "long" else "short"
+                    position = Position(
+                        symbol=symbol,
+                        market=self.market,
+                        side=side,
+                        entry=float(live.get("entryPrice") or 0.0),
+                        stop=float(live.get("stopLoss") or 0.0) or float(live.get("entryPrice") or 0.0),
+                        target=0.0,
+                        size=entry["size"],
+                        initial_stop=float(live.get("stopLoss") or 0.0) or float(live.get("entryPrice") or 0.0),
+                        opened_at=str(live.get("timestamp", "")),
+                        bar_time="adopted",
+                        meta={"adopted_at": report["at"], "reconciled": True},
+                    )
+                    self.positions[symbol] = position
+                    self.state.save_position(symbol, position.to_dict())
+                    report["adopted"].append(entry)
+                else:
+                    report["untracked"].append(entry)
+                # never trade a symbol whose exposure we cannot explain
+                self.gap_cooldowns[symbol] = max(self.gap_cooldowns.get(symbol, 0), 1)
+
+        if close_orphans and report["untracked"]:
+            for row in list(report["untracked"]):
+                self.broker.close(row["symbol"], row["entry"], "reconciled: untracked position closed")
+                report["closed"].append({**row, "reason": "untracked position closed on request"})
+            report["untracked"] = []
+
+        self.reconciled = report
+        self.status.reconciled = {
+            k: len(v) for k, v in report.items() if isinstance(v, list)
+        } | {"venue_available": report["venue_available"], "at": report["at"]}
+        self.state.append_ledger({"event": "reconciliation", "market": self.market, **report})
+        self._emit({"event": "reconciliation", "market": self.market, **report})
+        return report
+
     # ------------------------------------------------------------------ management
     def manage_open_positions(self) -> list[dict[str, Any]]:
         actions: list[dict[str, Any]] = []
@@ -392,18 +644,19 @@ class TradingEngine:
                 continue
             closed_bar = bars[-1]
             price = float((data.get("quote") or {}).get("price") or closed_bar["close"])
-            from . import indicators as ind
-
             atr = ind.last_defined(
                 ind.atr([b["high"] for b in bars], [b["low"] for b in bars], [b["close"] for b in bars], 14)
             ) or 0.0
             scan = self.last_scans.get(symbol) or {}
             opposite = should_exit_on_signal(position, scan.get("action", ""))
+            checks = (scan.get("filter") or {}).get("checks") or []
+            spread_now = next((c.get("value") for c in checks if c.get("name") == "spread"), None)
             tick = None
             if self.market == "idx":
                 from .config import idx_tick_size
 
                 tick = idx_tick_size(price)
+            stop_before = position.stop
             decided = manage_position(
                 position,
                 closed_bar=closed_bar,
@@ -412,9 +665,10 @@ class TradingEngine:
                 now=dt.datetime.now(ZoneInfo(str(self.profile.get("sessions_timezone", "Asia/Jakarta")))),
                 mgmt_cfg=self.settings.section("management"),
                 profile=self.profile,
-                spread_bps=float(scan.get("filter", {}).get("checks", [{}])[-1].get("value") or 5.0),
+                spread_bps=float(spread_now if spread_now is not None else 5.0),
                 opposite_signal=opposite,
                 tick_size=tick,
+                size_step=self.profile.get("size_step"),
             )
             for action in decided:
                 actions.append({"symbol": symbol, **action.to_dict()})
@@ -422,10 +676,48 @@ class TradingEngine:
                     {"event": "manage", "market": self.market, "symbol": symbol, "action": action.to_dict()}
                 )
                 if action.kind == "modify_stop" and action.new_stop:
+                    moved = self.broker.modify_stop(symbol, action.new_stop)
+                    if isinstance(moved, dict) and moved.get("ok") is False:
+                        # never pretend the venue moved a stop it did not move: management
+                        # already advanced the local stop, so roll it back and retry next bar
+                        position.stop = stop_before
+                        position.be_moved = False
+                        self.status.last_errors.append(
+                            f"{symbol}: stop not moved ({moved.get('reason')}); "
+                            "the local stop was rolled back"
+                        )
+                        self.state.append_ledger(
+                            {"event": "stop_move_failed", "market": self.market, "symbol": symbol,
+                             "wanted": action.new_stop, "detail": moved}
+                        )
+                        continue
                     position.stop = action.new_stop
-                    if isinstance(self.broker, PaperBroker):
-                        self.broker.modify_stop(symbol, action.new_stop)
                     self.state.save_position(symbol, position.to_dict())
+                elif action.kind == "partial":
+                    fraction = float(action.fraction or 0.5)
+                    slice_size = partial_size(position, fraction, self.market, self.profile.get("size_step"))
+                    if slice_size <= 0:
+                        continue
+                    result = self.broker.partial_close(
+                        symbol, slice_size, action.price or price, reason=action.reason
+                    )
+                    if not result:
+                        continue
+                    position.size = max(0.0, position.size - float(result["size"]))
+                    position.realised_pnl += float(result["pnl"])
+                    position.partial_done = True
+                    position.partial_price = float(result["price"])
+                    self.status.partials += 1
+                    self.state.save_position(symbol, position.to_dict())
+                    self.state.append_ledger(
+                        {"event": "partial", "market": self.market, "symbol": symbol, **result}
+                    )
+                    self._emit({"event": "partial", "market": self.market, "symbol": symbol, **result})
+                    if position.size <= 0:
+                        closed = self.broker.close(symbol, float(result["price"]), "partial closed the position")
+                        if closed:
+                            self._record_close(symbol, closed)
+                        break
                 elif action.kind == "close":
                     trade = self.broker.close(symbol, action.price or price, action.reason)
                     if trade:
@@ -435,7 +727,10 @@ class TradingEngine:
 
     def _record_close(self, symbol: str, trade: ClosedTrade) -> None:
         with self.lock:
-            self.positions.pop(symbol, None)
+            position = self.positions.pop(symbol, None)
+        if position is not None and position.realised_pnl:
+            trade.pnl = round(float(trade.pnl) + float(position.realised_pnl), 4)
+            trade.meta = {**trade.meta, "banked_partial_pnl": round(position.realised_pnl, 4)}
         self.state.drop_position(symbol, exit_bar=dt.datetime.now(dt.timezone.utc).isoformat())
         self.state.append_ledger(
             {"event": "trade_closed", "market": self.market, **trade.to_dict()}
@@ -476,6 +771,8 @@ class TradingEngine:
         return {
             "status": self.status.to_dict(),
             "broker": broker_state or {"equity": self.broker.equity()},
+            "costs": self.cost_cfg.to_dict(),
+            "gap_cooldowns": dict(self.gap_cooldowns),
             "positions": [p.to_dict() | {"unrealised": self.broker_marks(marks).get(p.symbol, 0.0)}
                           for p in self.positions.values()],
             "last_scans": self.last_scans,
