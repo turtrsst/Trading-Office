@@ -111,6 +111,24 @@ def _short_stamp(value: Any) -> str:
     return stamp.strftime("%m-%d %H:%M UTC")
 
 
+def _num(value: Any) -> str:
+    """Adaptive price/size: ``61,230`` for BTC, ``0.004`` for a size, ``3,012.5`` for ETH.
+
+    Six fixed decimals turned a phone line into ``61,230.000000``, which is unreadable and
+    hides the one number that matters. Trailing zeros are dropped, never a significant digit.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    magnitude = abs(number)
+    digits = 2 if magnitude >= 1000 else 3 if magnitude >= 10 else 4 if magnitude >= 1 else 6
+    text = f"{number:,.{digits}f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
 def _money(value: Any, digits: int = 2) -> str:
     try:
         return f"{float(value):,.{digits}f}"
@@ -325,9 +343,9 @@ def format_digest(snap: dict[str, Any]) -> str:
         partial = " · ½ banked" if row.get("partial_done") else ""
         lines.append(
             f"{escape(str(row.get('symbol')))} {escape(str(row.get('side')))} "
-            f"{_money(row.get('size'), 6)} @ {_money(row.get('entry'), 6)} "
-            f"stop {_money(row.get('stop'), 6)} · {_money(row.get('pnl'))} "
-            f"({_money(row.get('r'))}R){partial}"
+            f"{_num(row.get('size'))} @ {_num(row.get('entry'))} "
+            f"stop {_num(row.get('stop'))} · {_money(row.get('pnl'))} "
+            f"({_num(row.get('r'))}R){partial}"
         )
     if len(positions) > 8:
         lines.append(f"… +{len(positions) - 8} more")
@@ -340,7 +358,7 @@ def format_digest(snap: dict[str, Any]) -> str:
     for row in pending[:5]:
         plan = row.get("plan") or {}
         lines.append(f"{escape(str(row.get('symbol')))} {escape(str(row.get('side')))} "
-                     f"entry {_money(plan.get('entry'), 6)} · id {escape(str(row.get('id')))}")
+                     f"entry {_num(plan.get('entry'))} · id {escape(str(row.get('id')))}")
     if entries:
         lines.append(f"entries: {'allowed' if entries.get('allowed') else 'BLOCKED'} "
                      f"({escape(str(entries.get('reason') or '?'))})")

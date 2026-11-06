@@ -258,3 +258,14 @@ def test_alert_text_is_escaped_when_html_is_on():
                     transport=lambda text, chat: sent.append(text) or {"ok": True})
     plain.notify({"event": "engine_error", "market": "crypto", "error": "a < b"}, blocking=True)
     assert "a < b" in sent[1]                    # no parse_mode -> no escaping, no change
+
+
+def test_numbers_are_readable_on_a_phone():
+    assert digest._num(61230.0) == "61,230"
+    assert digest._num(3012.5) == "3,012.5"
+    assert digest._num(148.2) == "148.2"
+    assert digest._num(1.23456789) == "1.2346"
+    assert digest._num(0.004) == "0.004"
+    assert digest._num(None) == "—"
+    assert digest._money(984.1) == "984.10"      # money keeps its two decimals
+    assert digest._money(None) == "—"
