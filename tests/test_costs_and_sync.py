@@ -618,3 +618,53 @@ def test_snapshot_is_written_on_every_position_change(tmp_path, settings):
     engine.positions["TEST/USDT:USDT"].stop = 99.0
     engine._persist_snapshot()
     assert json.loads(path.read_text())["positions"]["TEST/USDT:USDT"]["stop"] == 99.0
+
+
+# --------------------------------------------------------------------------- manual controls
+def test_active_trades_rows_carry_the_live_numbers(tmp_path, settings):
+    from tests.test_api import _ready_payload
+
+    engine = TradingEngine(market="crypto", settings=settings, symbols=["TEST/USDT:USDT"],
+                           state_dir=tmp_path / "rows")
+    engine._handle_entry("TEST/USDT:USDT", _ready_payload(settings))
+    rows = engine.active_trades({"TEST/USDT:USDT": 102.0})
+    assert len(rows) == 1
+    row = rows[0]
+    assert {"symbol", "side", "size", "entry", "stop", "target", "mark", "pnl", "r_multiple"} <= set(row)
+    assert row["side"] == "LONG"
+    assert row["pnl"] > 0
+    assert row["r_multiple"] == pytest.approx(row["pnl"] / (engine.positions["TEST/USDT:USDT"].risk_per_unit
+                                                           * row["size"]), rel=0.02)
+    # no marks -> the entry is the mark and the row is flat, never an error
+    assert engine.active_trades()[0]["pnl"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_close_position_only_touches_its_own_symbol(tmp_path, settings):
+    from tests.test_api import _ready_payload
+
+    engine = TradingEngine(market="crypto", settings=settings, symbols=["A/USDT:USDT", "B/USDT:USDT"],
+                          state_dir=tmp_path / "multi")
+    engine._handle_entry("A/USDT:USDT", _ready_payload(settings, symbol="A/USDT:USDT"))
+    other = _ready_payload(settings, symbol="B/USDT:USDT")
+    other["bar_time"] = "2026-11-06T11:00:00+07:00"
+    engine._handle_entry("B/USDT:USDT", other)
+    assert len(engine.positions) == 2
+
+    result = engine.close_position("A/USDT:USDT", reason="test")
+    assert result["ok"] is True
+    assert "A/USDT:USDT" not in engine.positions
+    assert "B/USDT:USDT" in engine.positions
+    assert engine.close_position("A/USDT:USDT")["ok"] is False  # idempotent, not an exception
+
+
+def test_execution_gate_is_explicit_about_simulation(tmp_path, settings):
+    paper = TradingEngine(market="crypto", settings=settings, symbols=["T/USDT:USDT"],
+                          state_dir=tmp_path / "g1")
+    gate = paper.execution_gate()
+    assert gate["simulated"] is True and gate["live"] is False
+    assert gate["broker"] == "paper" and "simulated" in gate["note"]
+
+    dry = TradingEngine(market="crypto", settings=settings, symbols=["T/USDT:USDT"],
+                        state_dir=tmp_path / "g2", execute=False)
+    assert dry.execution_gate()["simulated"] is True
+    assert "dry-run" in dry.execution_gate()["note"]

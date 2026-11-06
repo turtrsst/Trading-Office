@@ -650,3 +650,67 @@ canvas { width: 100%; display: block; }
 .ws-status .dot.off { background: var(--red); box-shadow: 0 0 0 3px rgba(255, 93, 115, .16); }
 .charts-container { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .charts-container canvas { width: 100%; display: block; }
+
+/* ---- active trades / open orders table ---- */
+.table-scroll { overflow-x: auto; }
+.book-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.book-table th {
+  text-align: left; font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--dim); font-weight: 600; padding: 8px 10px; border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+.book-table td {
+  padding: 10px; border-bottom: 1px solid var(--line-soft); color: var(--text);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.book-table tbody tr:hover { background: rgba(79, 157, 253, 0.05); }
+.book-table .ta-right { text-align: right; }
+.book-table .sym { font-weight: 600; color: var(--text); }
+.book-table .muted-cell { color: var(--dim); }
+.book-table .empty-row td { text-align: center; color: var(--dim); padding: 18px; }
+.book-table .pnl.up { color: var(--accent); }
+.book-table .pnl.down { color: var(--red); }
+.book-table .tag {
+  display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--muted); margin-left: 6px;
+}
+.book-table .tag.partial { border-color: rgba(46, 230, 168, .4); color: var(--accent); }
+.book-table .tag.ghost { border-color: rgba(245, 181, 68, .4); color: var(--amber); }
+.book-table .tag.sim { border-color: rgba(245, 181, 68, .4); color: var(--amber); }
+.book-table .btn-mini {
+  font: inherit; font-size: 10.5px; font-weight: 600; letter-spacing: .04em;
+  padding: 4px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid rgba(255, 93, 115, .45); background: rgba(255, 93, 115, .12); color: var(--red);
+}
+.book-table .btn-mini:hover { background: rgba(255, 93, 115, .22); }
+.book-table .btn-mini.ghost { border-color: var(--line); background: transparent; color: var(--muted); }
+.book-table .btn-mini.ghost:hover { color: var(--text); background: rgba(255, 255, 255, .04); }
+
+/* ---- toast stack (one container, stacked, dismissible) ---- */
+.toast-stack {
+  position: fixed; right: 18px; bottom: 18px; z-index: 9999;
+  display: flex; flex-direction: column; gap: 8px; align-items: flex-end;
+  pointer-events: none;
+}
+.toast-stack .toast {
+  position: static; pointer-events: auto; animation: none;
+  opacity: 0; transform: translateY(8px);
+  transition: opacity .18s ease, transform .18s ease;
+  max-width: 360px;
+}
+.toast-stack .toast.visible { opacity: 1; transform: translateY(0); }
+.toast-stack .toast.warn { border-left-color: var(--amber); }
+.toast-stack .toast .toast-close {
+  background: none; border: 0; color: var(--dim); cursor: pointer; font-size: 14px;
+  line-height: 1; padding: 0 0 0 10px;
+}
+
+/* ---- inline confirm dialog (replaces window.confirm) ---- */
+.confirm-dialog {
+  border: 1px solid var(--line); border-radius: 12px; background: var(--panel);
+  color: var(--text); padding: 18px 20px; max-width: 420px; box-shadow: 0 24px 60px rgba(0, 0, 0, .55);
+}
+.confirm-dialog::backdrop { background: rgba(4, 7, 12, .6); }
+.confirm-dialog h3 { margin: 0 0 6px; font-size: 15px; }
+.confirm-dialog p { margin: 0 0 14px; font-size: 12.5px; }
+.row-actions.end { justify-content: flex-end; }

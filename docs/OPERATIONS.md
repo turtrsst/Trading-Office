@@ -215,6 +215,26 @@ Adjust the model per market in `profiles.<market>.execution_costs` (`latency_ms`
 `shock_atr_mult`, `shock_slippage_mult`, `gap_reject_atr`, `gap_reject_spread_mult`,
 `gap_fill_fraction`, `gap_cooldown_bars`, `max_risk_multiplier`, `auction_windows`).
 
+## Manual controls (CLOSE / CANCEL)
+
+The Live Engine tab lists open positions and resting orders in one table and lets an
+operator act on a single row. Two things are deliberately explicit:
+
+| Action | Endpoint | What it does | What it refuses |
+| --- | --- | --- | --- |
+| **CLOSE** | `POST /api/trade/close` | reduce-only market order for that symbol only, then its resting brackets are cancelled and the trade is booked | a symbol the engine does not hold (a UI typo cannot send an order), and any broker that does not report a fill |
+| **CANCEL** | `POST /api/order/cancel` | cancels one resting order at the venue | anything on the paper broker (it fills instantly and has no resting orders) |
+
+`execution_gate` (in `/api/metrics`, `/api/engine/status` and every websocket frame) says
+whether an action is real: `simulated: true` covers the paper broker **and** dry-run, and the
+table prints a small `paper` / `dry-run` tag next to the side so a screenshot is never
+mistaken for a live fill. IDX stays paper-only — there is no retail order API, so the button
+simulates the sale and says so.
+
+The browser never sends an order id it invented: the ids come from the venue listing in the
+same frame that rendered the button, and a refusal (position vanished, order already filled)
+is surfaced as a toast instead of a silent no-op.
+
 ## Live equity & drawdown dashboard
 
 `GET /api/metrics?market=crypto` returns parallel `timestamps` / `equity` / `drawdown`

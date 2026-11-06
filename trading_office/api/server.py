@@ -130,6 +130,17 @@ class EngineRequest(BaseModel):
     symbols: list[str] | None = None
 
 
+class ClosePositionRequest(BaseModel):
+    market: Literal["crypto", "idx"] = "crypto"
+    symbol: str
+
+
+class CancelOrderRequest(BaseModel):
+    market: Literal["crypto", "idx"] = "crypto"
+    order_id: str
+    symbol: str | None = None
+
+
 class EngineReconcileRequest(BaseModel):
     market: Literal["crypto", "idx"] = "crypto"
     adopt: bool = False
@@ -369,6 +380,10 @@ def create_app() -> FastAPI:
                 "equity": perf["ending_equity"],
             },
             "starting_equity": perf["starting_equity"],
+            # the same rows the websocket pushes, so one render path serves both transports
+            "active_trades": engine.active_trades(marks),
+            "open_orders": engine.open_orders(),
+            "execution_gate": engine.execution_gate(),
             "updated_at": _iso_now(),
         }
 
@@ -465,6 +480,25 @@ def create_app() -> FastAPI:
     def engine_close_all(req: EngineRequest) -> dict[str, Any]:
         engine = _engine(req.market)
         return {"closed": engine.force_close_all("manual flatten from web terminal")}
+
+    @app.post("/api/trade/close")
+    def trade_close(req: ClosePositionRequest) -> dict[str, Any]:
+        """Close ONE position (the CLOSE button). Refuses symbols the engine does not hold."""
+        engine = _engine(req.market)
+        if req.market == "idx":
+            # IDX has no retail order API: the book is simulated, and saying so beats a
+            # button that silently pretends to have sold shares on the exchange
+            result = engine.close_position(req.symbol, reason="manual close (IDX paper)")
+            result["gate"] = engine.execution_gate()
+            return result
+        result = engine.close_position(req.symbol)
+        result["gate"] = engine.execution_gate()
+        return result
+
+    @app.post("/api/order/cancel")
+    def order_cancel(req: CancelOrderRequest) -> dict[str, Any]:
+        engine = _engine(req.market)
+        return engine.cancel_order(req.order_id, req.symbol)
 
     @app.get("/api/ledger")
     def ledger(market: Literal["crypto", "idx"] = "crypto", limit: int = Query(120, ge=1, le=1000)):

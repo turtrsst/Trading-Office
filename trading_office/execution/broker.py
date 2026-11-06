@@ -90,6 +90,9 @@ class Broker(Protocol):
     def submit(self, order: Order) -> Fill: ...
     def close(self, symbol: str, price: float, reason: str) -> ClosedTrade | None: ...
     def equity(self, marks: dict[str, float] | None = None) -> float: ...
+    def close_symbol(self, symbol: str) -> dict[str, Any]: ...
+    def open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]: ...
+    def cancel_order(self, order_id: str, symbol: str | None = None) -> dict[str, Any]: ...
 
 
 # --------------------------------------------------------------------------- paper
@@ -210,6 +213,13 @@ class PaperBroker:
             return False
         pos["stop"] = float(new_stop)
         return True
+
+    def open_orders(self) -> list[dict[str, Any]]:
+        """Resting brackets. The paper broker fills instantly, so it has none to show."""
+        return []
+
+    def cancel_order(self, order_id: str) -> dict[str, Any]:
+        return {"ok": False, "reason": "the paper broker has no resting orders"}
 
     def partial_close(
         self, symbol: str, size: float, price: float, *, reason: str = "partial take profit"
@@ -409,6 +419,87 @@ class CcxtBroker:
         except Exception as exc:  # pragma: no cover - network/venue
             return Fill(False, "", order.client_id, order.symbol, order.side, 0.0, order.price_hint, 0.0,
                         f"exchange rejected: {exc}")
+
+    def open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        """Normalised resting orders (client cards render these, not raw ccxt dicts)."""
+        try:  # pragma: no cover - live path
+            raw = (
+                self.exchange.fetch_open_orders(symbol) if symbol
+                else self.exchange.fetch_open_orders()
+            )
+        except Exception:
+            return []
+        out = []
+        for order in raw or []:
+            trigger = (order.get("triggerPrice") or order.get("stopPrice")
+                       or (order.get("info") or {}).get("triggerPrice"))
+            out.append({
+                "id": str(order.get("id") or ""),
+                "symbol": order.get("symbol"),
+                "type": str(order.get("type") or "order"),
+                "side": str(order.get("side") or ""),
+                "amount": float(order.get("amount") or 0.0),
+                "price": float(order.get("price") or trigger or 0.0),
+                "reduce_only": bool(order.get("reduceOnly") or (order.get("info") or {}).get("reduceOnly")),
+                "status": order.get("status") or "open",
+                "created_at": order.get("datetime"),
+            })
+        return out
+
+    def cancel_order(self, order_id: str, symbol: str | None = None) -> dict[str, Any]:
+        """Cancel one resting order. Used by the UI's CANCEL button (and stop replacements)."""
+        try:  # pragma: no cover - live path
+            if symbol:
+                self.exchange.cancel_order(order_id, symbol)
+            else:
+                self.exchange.cancel_order(order_id)
+            return {"ok": True, "order_id": order_id}
+        except Exception as exc:  # pragma: no cover
+            return {"ok": False, "order_id": order_id, "reason": str(exc)}
+
+    def close_symbol(self, symbol: str) -> dict[str, Any]:
+        """Market-close one position, reduce-only, with its resting brackets cleaned up.
+
+        There is no "close this symbol" in the engine's own loop, so this lives next to the
+        venue: the amount is the venue's own position size (never a guess), the side is the
+        opposite one, and the order is reduce-only so it cannot open exposure if the
+        position vanished between the read and the send.
+        """
+        live = [p for p in self.positions() if p.get("symbol") == symbol]
+        if not live:
+            return {"ok": False, "reason": f"no open position for {symbol}"}
+        pos = live[0]
+        contracts = float(pos.get("contracts") or 0.0)
+        if contracts <= 0:
+            return {"ok": False, "reason": "venue reports a zero-size position"}
+        side = "sell" if pos.get("side") == "long" else "buy"
+        try:  # pragma: no cover - live path
+            raw = self.exchange.create_order(
+                symbol, "market", side, self._amount(symbol, contracts), None,
+                {"reduceOnly": True},
+            )
+            fill = float(raw.get("average") or raw.get("price") or 0.0)
+            entry = float(pos.get("entryPrice") or 0.0)
+            direction = 1.0 if pos.get("side") == "long" else -1.0
+            fee = float((raw.get("fee") or {}).get("cost") or 0.0)
+            cancelled = []
+            for order in self.exchange.fetch_open_orders(symbol) or []:
+                try:
+                    self.exchange.cancel_order(order.get("id"), symbol)
+                    cancelled.append(str(order.get("id")))
+                except Exception:
+                    continue
+            return {
+                "ok": True,
+                "symbol": symbol,
+                "side": side,
+                "size": contracts,
+                "price": fill,
+                "pnl": round((fill - entry) * contracts * direction - fee, 6) if fill else 0.0,
+                "orders_cancelled": cancelled,
+            }
+        except Exception as exc:  # pragma: no cover
+            return {"ok": False, "reason": str(exc)}
 
     def amount_step(self, symbol: str) -> float | None:
         """Contract step (precision) for partial sizes."""

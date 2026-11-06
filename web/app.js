@@ -27,12 +27,50 @@
     return res.json();
   }
 
-  function toast(message, isError) {
+  function toast(message, isError, tone) {
+    const stack = $("#toast-container") || document.body;
     const el = document.createElement("div");
-    el.className = "toast" + (isError ? " err" : "");
-    el.textContent = message;
-    document.body.appendChild(el);
-    setTimeout(() => el.remove(), 5200);
+    el.className = "toast" + (isError ? " err" : tone ? " " + tone : "");
+    const text = document.createElement("span");
+    text.textContent = message;
+    const close = document.createElement("button");
+    close.className = "toast-close";
+    close.type = "button";
+    close.setAttribute("aria-label", "dismiss");
+    close.textContent = "×";
+    close.addEventListener("click", () => dismissToast(el));
+    el.append(text, close);
+    stack.appendChild(el);
+    requestAnimationFrame(() => el.classList.add("visible"));
+    setTimeout(() => dismissToast(el), isError ? 8000 : 4500);
+    return el;
+  }
+
+  function dismissToast(el) {
+    if (!el || !el.isConnected) return;
+    el.classList.remove("visible");
+    setTimeout(() => el.remove(), 200);
+  }
+
+  // window.confirm blocks the whole page (and the websocket repaints behind it): use a
+  // real dialog so the operator sees the book while deciding.
+  function confirmAction(title, body, okLabel) {
+    const dialog = $("#confirm-dialog");
+    if (!dialog || typeof dialog.showModal !== "function") {
+      return Promise.resolve(window.confirm(`${title}\n\n${body}`));
+    }
+    $("#confirm-title").textContent = title;
+    $("#confirm-body").textContent = body;
+    $("#confirm-ok").textContent = okLabel || "Confirm";
+    return new Promise((resolve) => {
+      const done = () => {
+        dialog.removeEventListener("close", done);
+        resolve(dialog.returnValue === "ok");
+      };
+      dialog.addEventListener("close", done);
+      dialog.returnValue = "cancel";
+      dialog.showModal();
+    });
   }
 
   const fmtNum = (v, digits) => {
@@ -655,6 +693,52 @@
     return Number.isFinite(value) ? value.toFixed(2) : "∞";
   }
 
+  function bookRows(frame) {
+    const trades = frame.active_trades || [];
+    const orders = frame.open_orders || [];
+    if (!trades.length && !orders.length) return "";
+    const gate = frame.execution_gate || state.engine?.execution_gate || {};
+    const simTag = gate.simulated ? `<span class="tag sim">${esc(gate.broker === "paper" ? "paper" : "dry-run")}</span>` : "";
+    const rows = [];
+    for (const t of trades) {
+      const pnl = Number(t.pnl || 0);
+      const tags = [
+        t.partial_done ? '<span class="tag partial">½ banked</span>' : "",
+        simTag,
+      ].join("");
+      rows.push(`<tr>
+        <td class="sym">${esc(t.symbol)}</td>
+        <td>${chip(t.side)}${tags}</td>
+        <td>${fmtNum(t.size, 6)}</td>
+        <td>${fmtNum(t.entry)}</td>
+        <td>${fmtNum(t.stop)}</td>
+        <td>${fmtNum(t.target)}</td>
+        <td>${fmtNum(t.mark)}</td>
+        <td class="pnl ${pnl >= 0 ? "up" : "down"}">${pnl >= 0 ? "+" : ""}${fmtNum(pnl)}</td>
+        <td class="${(t.r_multiple || 0) >= 0 ? "pnl up" : "pnl down"}">${Number(t.r_multiple || 0).toFixed(2)}R</td>
+        <td class="ta-right"><button class="btn-mini" data-action="close" data-symbol="${esc(t.symbol)}">CLOSE</button></td>
+      </tr>`);
+    }
+    for (const o of orders) {
+      const side = String(o.side || "").toUpperCase();
+      rows.push(`<tr>
+        <td class="sym">${esc(o.symbol || "")}</td>
+        <td>${esc(String(o.type || "order").toUpperCase())} ${side ? chip(side) : ""}${
+          o.ours === false ? '<span class="tag ghost">untracked</span>' : ""}</td>
+        <td>${fmtNum(o.amount, 6)}</td>
+        <td>${o.price ? fmtNum(o.price) : "—"}</td>
+        <td class="muted-cell">—</td>
+        <td class="muted-cell">${o.reduce_only ? "reduce-only" : "—"}</td>
+        <td class="muted-cell">${esc(o.status || "open")}</td>
+        <td class="muted-cell">pending</td>
+        <td class="muted-cell">—</td>
+        <td class="ta-right"><button class="btn-mini ghost" data-action="cancel"
+          data-order="${esc(o.id || "")}" data-symbol="${esc(o.symbol || "")}">CANCEL</button></td>
+      </tr>`);
+    }
+    return rows.join("");
+  }
+
   function renderMetrics(frame) {
     const kpi = frame.kpi || (frame.performance
       ? {
@@ -693,6 +777,65 @@
     set("eng-dd-meta", `max ${worst.toFixed(2)}% · now ${(dd[dd.length - 1] || 0).toFixed(2)}%`);
     set("eng-equity-meta",
       `${equity.length} points${frame.transport === "http" ? " · http fallback" : " · live"}`);
+
+    // active trades & open orders (rendered on every frame: the P&L mark moves)
+    const body = $("#book-rows");
+    if (body) {
+      const rows = bookRows(frame);
+      body.innerHTML = rows || `<tr class="empty-row"><td colspan="10">No open positions or resting orders.</td></tr>`;
+    }
+    const gate = frame.execution_gate || {};
+    set("book-meta", `${(frame.active_trades || []).length} position(s) · ${(frame.open_orders || []).length} resting order(s)`
+      + (gate.note ? ` · ${gate.note}` : ""));
+  }
+
+  async function closePosition(symbol) {
+    const ok = await confirmAction(
+      `Close ${symbol}?`,
+      "A reduce-only market order will flatten this position at the current price. The resting stop/target are cancelled and the trade is booked in the ledger.",
+      "Close position",
+    );
+    if (!ok) return;
+    try {
+      const result = await api("/api/trade/close", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ market: state.market, symbol }),
+      });
+      if (result.ok) {
+        const pnl = result.closed?.pnl ?? 0;
+        toast(`${symbol} closed · P&L ${pnl >= 0 ? "+" : ""}${fmtNum(pnl)}`, false);
+        await loadEngine();
+      } else {
+        toast(`Close refused: ${result.reason || "unknown error"}`, true);
+      }
+    } catch (err) {
+      toast("Close failed: " + err.message, true);
+    }
+  }
+
+  async function cancelOrder(orderId, symbol) {
+    const ok = await confirmAction(
+      "Cancel order?",
+      `Order ${orderId} on ${symbol || "the venue"} will be cancelled. If it is the stop of an open position, that position is left unprotected.`,
+      "Cancel order",
+    );
+    if (!ok) return;
+    try {
+      const result = await api("/api/order/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ market: state.market, order_id: orderId, symbol: symbol || null }),
+      });
+      if (result.ok) {
+        toast(`Order ${orderId} cancelled`, false);
+        await loadEngine();
+      } else {
+        toast(`Cancel refused: ${result.reason || "unknown error"}`, true);
+      }
+    } catch (err) {
+      toast("Cancel failed: " + err.message, true);
+    }
   }
 
   /* ------------------------------------------------------------------ engine */
@@ -742,20 +885,15 @@
 
     renderReconcile(data.status?.reconciled || {}, data.gap_cooldowns || {});
 
-    const positions = data.positions || [];
-    $("#eng-positions").innerHTML = positions.length
-      ? positions.map((p) => `<div class="pos-card">
-          <div class="top"><strong class="sym">${esc(p.symbol)}</strong>${chip(p.side === "long" ? "LONG" : "SHORT")}</div>
-          <div class="pos-grid">
-            <span>Entry<b>${fmtNum(p.entry)}</b></span>
-            <span>Stop<b>${fmtNum(p.stop)}</b></span>
-            <span>Target<b>${fmtNum(p.target)}</b></span>
-            <span>Unrealised<b class="chg ${(p.unrealised || 0) >= 0 ? "up" : "down"}">${fmtNum(p.unrealised || 0)}</b></span>
-          </div></div>`).join("")
-      : `<div class="empty">No open positions.</div>`;
+    // the open-position cards now live in the Active trades table (with actions), so the
+    // engine tab has one book view instead of two that can disagree
+    if (!metrics) {
+      renderMetrics({ series: data.equity_curve || [], performance: data.performance,
+                      active_trades: data.active_trades, open_orders: data.open_orders,
+                      execution_gate: data.execution_gate });
+    }
 
     // charts + KPI cards are driven by the websocket frame (or its HTTP fallback)
-    if (!metrics) renderMetrics({ series: data.equity_curve || [], performance: data.performance });
     const perf = (metrics && metrics.performance) || data.performance || {};
     $("#eng-perf").innerHTML = [
       stat("Profit factor", fmtFactor(perf.profit_factor), "gross win ÷ loss",
@@ -929,6 +1067,15 @@
     $("#eng-flat").addEventListener("click", () => engineCall("/api/engine/close-all", { market: state.market }));
     $("#eng-sync").addEventListener("click", () => engineCall("/api/engine/reconcile", { market: state.market }));
     $("#eng-resume").addEventListener("click", () => engineCall("/api/engine/resume", { market: state.market }));
+    $("#book-rows")?.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-action]");
+      if (!button) return;
+      const action = button.dataset.action;
+      button.disabled = true;
+      const done = () => { button.disabled = false; };
+      if (action === "close") closePosition(button.dataset.symbol).finally(done);
+      else if (action === "cancel") cancelOrder(button.dataset.order, button.dataset.symbol).finally(done);
+    });
     window.addEventListener("resize", () => {
       if (state.analysis && state.tab === "analysis") renderAnalysis(state.analysis);
       if (state.backtest && state.tab === "backtest") renderBacktest(state.backtest);

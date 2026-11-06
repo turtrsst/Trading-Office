@@ -429,6 +429,32 @@ class TradingEngine:
         self.state.append_ledger({"event": "skip", "market": self.market, "symbol": symbol, "reason": reason})
         self._emit({"event": "skip", "market": self.market, "symbol": symbol, "reason": reason})
 
+    # ------------------------------------------------------------------ manual controls
+    def execution_gate(self) -> dict[str, Any]:
+        """Is this engine allowed to send real orders from the UI right now?
+
+        Manual CLOSE/CANCEL are the only actions a browser can trigger, so they get an
+        explicit gate instead of relying on the mode wording alone. DRY-RUN is reported as
+        *simulated*: the paper book is real state, the venue is not.
+        """
+        return {
+            "market": self.market,
+            "mode": self.mode,
+            "broker": getattr(self.broker, "name", "paper"),
+            "execute": bool(self.execute),
+            "live": self.mode == "live",
+            "simulated": isinstance(self.broker, PaperBroker) or not self.execute,
+            "note": (
+                "paper + dry-run: nothing leaves this machine"
+                if isinstance(self.broker, PaperBroker) and not self.execute
+                else "paper: fills are simulated locally"
+                if isinstance(self.broker, PaperBroker)
+                else "dry-run: the engine will not send orders"
+                if not self.execute
+                else "live: orders go to the venue"
+            ),
+        }
+
     # ------------------------------------------------------------------ kill switch
     def guard_state(self) -> dict[str, Any]:
         """Daily-loss / consecutive-loss circuit breaker, evaluated from the ledger."""
@@ -872,6 +898,70 @@ class TradingEngine:
                 out.append(trade.to_dict())
         return out
 
+    def close_position(self, symbol: str, reason: str = "manual close from web terminal") -> dict[str, Any]:
+        """Close exactly one position (what the CLOSE button calls).
+
+        Refuses symbols the engine does not hold, so a typo in the UI cannot send a market
+        order into something that is not ours. Returns a plain dict: ``ok``, ``closed``
+        (trade), ``orders_cancelled`` and ``reason`` when it refused.
+        """
+        position = self.positions.get(symbol)
+        if position is None:
+            return {"ok": False, "symbol": symbol, "reason": "no open position for this symbol"}
+        price = 0.0
+        try:
+            price = float(self.fetch(symbol).get("quote", {}).get("price") or 0.0)
+        except Exception:
+            price = 0.0
+        mark = price or position.entry
+        trade = None
+        orders_cancelled = []
+        if isinstance(self.broker, PaperBroker):
+            trade = self.broker.close(symbol, mark, reason)
+        else:
+            result = self.broker.close_symbol(symbol)  # type: ignore[attr-defined]
+            if not result.get("ok"):
+                return {"ok": False, "symbol": symbol, "reason": result.get("reason") or "venue refused"}
+            orders_cancelled = result.get("orders_cancelled") or []
+            trade = ClosedTrade(
+                symbol=symbol, market=self.market, side=position.side, entry=position.entry,
+                exit=float(result.get("price") or mark), size=float(result.get("size") or position.size),
+                pnl=float(result.get("pnl") or 0.0), fees=0.0, reason=reason,
+                r_multiple=0.0, opened_at=position.opened_at,
+                closed_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+            )
+        if trade is None:
+            return {"ok": False, "symbol": symbol, "reason": "the broker did not report a fill"}
+        self._record_close(symbol, trade)
+        self.state.append_ledger(
+            {"event": "manual_close", "market": self.market, "symbol": symbol,
+             "reason": reason, "orders_cancelled": orders_cancelled}
+        )
+        return {"ok": True, "symbol": symbol, "closed": trade.to_dict(),
+                "orders_cancelled": orders_cancelled}
+
+    def cancel_order(self, order_id: str, symbol: str | None = None) -> dict[str, Any]:
+        if isinstance(self.broker, PaperBroker):
+            return {"ok": False, "reason": "the paper broker has no resting orders"}
+        result = self.broker.cancel_order(order_id, symbol)  # type: ignore[attr-defined]
+        self.state.append_ledger(
+            {"event": "cancel_order", "market": self.market, "order_id": order_id,
+             "symbol": symbol, "result": result}
+        )
+        return result
+
+    def open_orders(self) -> list[dict[str, Any]]:
+        """Resting orders at the venue, annotated with whether the engine knows the position."""
+        if isinstance(self.broker, PaperBroker):
+            return []
+        try:
+            orders = self.broker.open_orders()  # type: ignore[attr-defined]
+        except Exception:
+            return []
+        for order in orders:
+            order["ours"] = order.get("symbol") in self.positions
+        return orders
+
     # ------------------------------------------------------------------ state
     def _load_positions(self) -> None:
         for symbol, raw in self.state.positions().items():
@@ -892,11 +982,14 @@ class TradingEngine:
         closed = self.state.closed_trades()
         return {
             "status": self.status.to_dict(),
+            "execution_gate": self.execution_gate(),
             "broker": broker_state or {"equity": self.broker.equity()},
             "costs": self.cost_cfg.to_dict(),
             "gap_cooldowns": dict(self.gap_cooldowns),
             "positions": [p.to_dict() | {"unrealised": self.broker_marks(marks).get(p.symbol, 0.0)}
                           for p in self.positions.values()],
+            "active_trades": self.active_trades(marks),
+            "open_orders": self.open_orders(),
             "last_scans": self.last_scans,
             "closed_trades": closed[-25:],
             "ledger": self.state.ledger(60),
@@ -940,6 +1033,39 @@ class TradingEngine:
             point["peak"] = round(peak, 2)
             point["drawdown_pct"] = round(((peak - float(point["equity"])) / peak * 100.0) if peak > 0 else 0.0, 3)
         return points[-200:]
+
+    def active_trades(self, marks: dict[str, float] | None = None) -> list[dict[str, Any]]:
+        """Open positions as table rows: side, size, entry/stop/target, live P&L, R.
+
+        Every number the table shows is computed here, so the browser never has to know
+        about R-multiples, partials or which side is which.
+        """
+        marks = marks or {}
+        rows: list[dict[str, Any]] = []
+        for symbol, position in self.positions.items():
+            mark = float(marks.get(symbol) or position.entry)
+            direction = 1.0 if position.side == "long" else -1.0
+            pnl = (mark - position.entry) * position.size * direction
+            rpu = position.risk_per_unit or 0.0
+            rows.append({
+                "symbol": symbol,
+                "side": position.side.upper(),
+                "size": round(position.size, 8),
+                "entry": round(position.entry, 6),
+                "stop": round(position.stop, 6),
+                "target": round(position.target, 6),
+                "mark": round(mark, 6),
+                "pnl": round(pnl, 2),
+                "pnl_pct": round((pnl / (position.entry * position.size) * 100.0)
+                                 if position.entry and position.size else 0.0, 3),
+                "r_multiple": round((mark - position.entry) * direction / rpu, 3) if rpu else 0.0,
+                "partial_done": bool(position.partial_done),
+                "banked_pnl": round(position.realised_pnl, 2),
+                "bars_held": position.bars_held,
+                "opened_at": position.opened_at,
+                "kind": "position",
+            })
+        return rows
 
     def performance(self, marks: dict[str, float] | None = None) -> dict[str, Any]:
         """Closed-trade performance + the drawdown of the equity curve, for the UI/API."""

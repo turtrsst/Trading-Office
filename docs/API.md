@@ -95,6 +95,21 @@ Closed candles and indicator series aligned 1:1 with `bars` (`ema50`, `ema200`, 
 
 ## Backtest
 
+Both `/api/metrics` and the websocket frame also carry the book:
+
+```json
+"active_trades": [{"symbol":"SOL/USDT:USDT","side":"LONG","size":1.05,"entry":198.43,"stop":195.49,
+                   "target":203.70,"mark":201.10,"pnl":2.80,"r_multiple":0.83,
+                   "partial_done":true,"banked_pnl":3.05,"kind":"position"}],
+"open_orders":   [{"id":"ord-9","symbol":"ETH/USDT:USDT","type":"stop_market","side":"sell",
+                   "amount":0.5,"price":2380.0,"reduce_only":true,"status":"open","ours":true}],
+"execution_gate": {"mode":"paper","broker":"paper","execute":true,"live":false,
+                   "simulated":true,"note":"paper: fills are simulated locally"}
+```
+
+`ours: false` means a resting order exists at the venue without a matching engine position —
+the table flags it as *untracked* rather than pretending it is ours.
+
 `POST /api/backtest` also returns `drawdown_curve` (the OOS `equity_curve` with `peak` and
 `drawdown_pct` per point) and, in `out_of_sample.metrics`, `max_drawdown_pct` (closed
 trades) next to `max_drawdown_pct_mtm` (worst open excursion), `avg_mae_r`, `profit_factor`
@@ -137,6 +152,8 @@ With `oos = 0` it returns a single `BacktestResult` (`metrics`, `trades`,
 | `GET /api/cost-model?market=crypto` | — | the fill model: latency, slippage coefficients/caps, gap thresholds, auction windows, partial-TP defaults |
 | `GET /api/metrics?market=crypto&limit=200` | — | `status`, parallel `timestamps`/`equity`/`drawdown`, `series[{ts,equity,peak,drawdown_pct}]`, `performance`, `kpi{win_rate, profit_factor, total_trades, max_drawdown_pct, net_profit_pct, equity}` |
 | `WS /api/ws/metrics?market=crypto` | — | the same JSON as `/api/metrics` pushed once per second with `{type:"metrics", seq}`; the client answers `{"type":"pong"}` and is dropped after 3 unanswered cycles |
+| `POST /api/trade/close` | `{"market":"crypto","symbol":"BTC/USDT:USDT"}` | close **one** position; refuses symbols the engine does not hold (`{ok, closed, orders_cancelled, gate}`) |
+| `POST /api/order/cancel` | `{"market":"crypto","order_id":"…","symbol":"…"}` | cancel one resting order (`{ok, reason}`); the paper broker has none, so it answers honestly |
 | `GET /api/performance?market=crypto` | — | profit factor, max drawdown, win rate, net profit % of the live/paper book |
 | `GET /api/engine/kill-switch?market=crypto` | — | daily-loss and consecutive-loss breaker state (`blocked`, `reasons`, `day_pnl`) |
 | `POST /api/engine/resume` | `{"market":"crypto"}` | human override of the breaker for the current day (ledgered) |

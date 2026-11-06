@@ -248,3 +248,53 @@ def test_websocket_can_switch_market(client):
         frame = ws.receive_json()
         assert frame["market"] == "idx"
         assert "total_trades" in frame["kpi"]
+
+
+def test_metrics_payload_carries_the_book(client):
+    body = client.get("/api/metrics?market=crypto").json()
+    assert "active_trades" in body and "open_orders" in body
+    assert body["execution_gate"]["simulated"] is True
+    assert body["execution_gate"]["mode"] in ("paper", "dry-run", "live")
+
+
+def test_close_position_endpoint_refuses_unknown_symbols(client):
+    body = client.post("/api/trade/close", json={"market": "crypto", "symbol": "NOPE/USDT:USDT"}).json()
+    assert body["ok"] is False
+    assert "no open position" in body["reason"]
+
+
+def test_close_position_endpoint_closes_one_position(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from trading_office.api import server as server_module
+    from trading_office.config import Settings
+    from trading_office.engine import TradingEngine
+
+    engine = TradingEngine(market="crypto", settings=Settings.load(), symbols=["TEST/USDT:USDT"],
+                           state_dir=tmp_path / "close", execute=True)
+    engine._handle_entry("TEST/USDT:USDT", _ready_payload(Settings.load()))
+    engine.fetch = lambda symbol: {"bars": [], "htf_bars": [], "quote": {"price": 101.0},
+                                   "source": "synthetic", "warnings": [], "stale": False,
+                                   "data_age_s": 1}
+    original = server_module._ENGINES.get("crypto")
+    server_module._ENGINES["crypto"] = engine
+    try:
+        client = TestClient(server_module.app)
+        body = client.post("/api/trade/close", json={"market": "crypto", "symbol": "TEST/USDT:USDT"}).json()
+        assert body["ok"] is True
+        assert body["closed"]["symbol"] == "TEST/USDT:USDT"
+        assert body["closed"]["pnl"] > 0  # closed at 101 vs entry ~100.03
+        assert "TEST/USDT:USDT" not in engine.positions
+        events = [e["event"] for e in engine.state.ledger(40)]
+        assert "manual_close" in events and "trade_closed" in events
+    finally:
+        if original is not None:
+            server_module._ENGINES["crypto"] = original
+        else:
+            server_module._ENGINES.pop("crypto", None)
+
+
+def test_cancel_order_endpoint_is_honest_on_paper(client):
+    body = client.post("/api/order/cancel", json={"market": "crypto", "order_id": "abc"}).json()
+    assert body["ok"] is False
+    assert "paper" in body["reason"]

@@ -281,10 +281,25 @@
             <div class="card-head"><h3>Drawdown</h3><span class="muted small" id="eng-dd-meta"></span></div>
             <canvas id="live-drawdown" height="120"></canvas>
           </div>
-          <div class="card">
-            <div class="card-head"><h3>Open positions</h3><span class="muted small">one per symbol, mandatory stop</span></div>
-            <div id="eng-positions" class="positions"></div>
-          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h3>Active trades &amp; open orders</h3>
+          <span class="muted small" id="book-meta">one position per symbol · mandatory stop · reduce-only closes</span>
+        </div>
+        <div class="table-scroll">
+          <table class="book-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Type / Side</th><th>Size</th>
+                <th>Entry</th><th>Stop</th><th>Target</th><th>Mark</th>
+                <th>P&amp;L</th><th>R</th><th class="ta-right">Action</th>
+              </tr>
+            </thead>
+            <tbody id="book-rows"></tbody>
+          </table>
         </div>
       </div>
 
@@ -330,5 +345,17 @@
 
   <script src="/static/charts.js"></script>
   <script src="/static/app.js"></script>
+  <div id="toast-container" class="toast-stack" aria-live="polite"></div>
+
+  <dialog id="confirm-dialog" class="confirm-dialog">
+    <form method="dialog">
+      <h3 id="confirm-title">Confirm</h3>
+      <p id="confirm-body" class="muted"></p>
+      <div class="row-actions end">
+        <button value="cancel" class="btn ghost">Cancel</button>
+        <button value="ok" class="btn danger" id="confirm-ok">Confirm</button>
+      </div>
+    </form>
+  </dialog>
 </body>
 </html>
