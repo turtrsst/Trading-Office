@@ -52,6 +52,8 @@ ALIASES: dict[str, tuple[str, ...]] = {
     "TO_EXNESS_PRIVATE_KEY_PATH": ("EXNESS_PRIVATE_KEY_PATH", "TO_EXNESS_PRIVATE_KEY_FILE"),
     "TO_EXNESS_ACCOUNT_ID": ("EXNESS_ACCOUNT_ID", "TO_EXNESS_ACCT"),
     "TO_EXNESS_GATEWAY_HOST": ("EXNESS_GATEWAY_HOST", "EXN_GATEWAY_HOST"),
+    # Gotrade (US shares). A single bearer token from Profile > API Key, valid one year.
+    "TO_GOTRADE_TOKEN": ("GOTRADE_TOKEN", "GOTRADE_API_KEY", "HEYGOTRADE_TOKEN"),
 }
 
 #: variables from other ecosystems that this project cannot honour (see the docstring)

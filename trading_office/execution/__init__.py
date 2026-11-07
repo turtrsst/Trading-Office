@@ -10,6 +10,14 @@ from .broker import (  # noqa: F401
     make_broker,
     order_from_plan,
 )
+from .gotrade import (  # noqa: F401
+    GotradeBroker,
+    GotradeClient,
+    GotradeError,
+    fee_for,
+    readiness as gotrade_readiness,
+    shares_for_risk,
+)
 from .exness import (  # noqa: F401
     ExnessBroker,
     ExnessClient,
@@ -29,11 +37,17 @@ __all__ = [
     "ExnessError",
     "ExnessSigner",
     "Fill",
+    "GotradeBroker",
+    "GotradeClient",
+    "GotradeError",
     "FxInstrument",
     "Order",
     "PaperBroker",
     "lots_for_risk",
     "make_broker",
     "min_viable_equity",
+    "fee_for",
+    "gotrade_readiness",
     "order_from_plan",
+    "shares_for_risk",
 ]

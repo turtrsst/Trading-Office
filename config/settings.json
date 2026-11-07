@@ -285,6 +285,23 @@
         "margin_rate": 0.0333,
         "_note": "1 lot XAUUSD = 100 oz; margin_rate 0.0333 = retail leverage 1:30. Verify both in the account configuration before arming live."
       }
+    },
+    "gotrade": {
+      "entity": "global",
+      "base_url": "https://api.charlie.gotrade.admin.tr8.tech/api/b2c/v1",
+      "token_env": "TO_GOTRADE_TOKEN",
+      "fractional": true,
+      "extended_hours": false,
+      "fill_timeout_s": 20,
+      "fee_pct_per_side": 0.3,
+      "fee_min_usd": 0.1,
+      "max_position_pct": 25.0,
+      "_notes": {
+        "long_only": "the venue marks stocks shortable:false; side SELL only reduces a holding",
+        "bracket": "take_profit/stop_loss ride on the entry order and are rejected in extended hours",
+        "cash": "size from cash_available_for_trade; cash_balance still includes unsettled proceeds",
+        "market_data": "the published docs list market-data endpoints but not their paths; until they are confirmed, candles for `us` come from the synthetic provider and every row says so"
+      }
     }
   },
   "idx": {

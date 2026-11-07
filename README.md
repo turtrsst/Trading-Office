@@ -242,13 +242,14 @@ trading_office/
   market/demo.py              deterministic synthetic series (labelled everywhere)
   execution/exness.py         Exness Trader API: signed REST, async orders, lot sizing
   market/fx_client.py         gold/FX candles + quotes via Exness, synthetic when offline
+  execution/gotrade.py        US shares via the Gotrade REST API (long-only, bracket orders)
   digest.py                   the daily one-message report (reads the running server)
   api/server.py               FastAPI: REST + static UI
   api/mcp_server.py           MCP tools (stdio / streamable HTTP)
   backtest/engine.py          bar-by-bar backtester + walk-forward
   cli.py                      terminal
 web/                          the web terminal (no build step, no frameworks)
-tests/                        247 unit + API tests, all offline
+tests/                        267 unit + API tests, all offline
 docs/                         strategy logic, API, MCP, operations
 scripts/make_demo_data.py     writes data/*.json for the backtester
 ```
@@ -298,6 +299,24 @@ Gold is a **full market**, not a side car: `--market fx` runs the same four gate
 risk plan (in lots), the same paper broker, the same approvals and the same API surface, and
 `/api/market/fx` + the **Gold / FX** tab show it with a measured bid/ask spread. Setup, signing
 details and the sizing table: [docs/EXNESS.md](docs/EXNESS.md).
+
+## Gotrade (US shares) — adapter first, two account blockers
+
+Gotrade publishes a real REST API, so US shares are reachable without touching the app:
+`POST /stock-orders/create` with `stop_loss`/`take_profit` on the entry order, positions and
+`cash_available_for_trade` from `/portfolio/*`. The adapter is built and tested offline.
+
+```bash
+python -m trading_office.cli gotrade --equity 112.28 --entry 20 --stop 19.4
+```
+
+Three facts decide what a US bot can be, and all three are in [docs/GOTRADE.md](docs/GOTRADE.md):
+
+* **long-only** — `SELL` closes, it never shorts; a sell with no position is refused
+* **0.3 % per side, minimum $0.10** — on a $112 account that is 24 % of a 1 % risk budget, so
+  scalping is arithmetically impossible there; the cost gate already refuses such setups
+* **two account blockers** — an expired ID document and API access that must be enabled by a
+  Gotrade representative; without them every call is `401`
 
 ## Autonomous mode (approve from Telegram)
 
@@ -355,7 +374,7 @@ trading-office doctor     # shows credential presence + whether state/ is sealed
 
 ```sh
 pip install pytest httpx
-python -m pytest -q           # 247 passed, entirely offline
+python -m pytest -q           # 267 passed, entirely offline
 ```
 
 The suite covers indicator maths, each filter's pass/block path, the no-trigger veto, the

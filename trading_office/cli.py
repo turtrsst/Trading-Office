@@ -663,6 +663,68 @@ def cmd_trade(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def cmd_gotrade(args: argparse.Namespace, settings: Settings) -> int:
+    """Answer the two questions that decide whether a US bot can exist here.
+
+    1. Are the *account* qualifications in place? (a current ID document and API access —
+       both are enforced by Gotrade, and neither is a code problem)
+    2. Can this balance express the strategy at all, given a 0.3 % fee with a $0.10 floor?
+
+    Read-only with no token: the second question is arithmetic, and it is the one that
+    decides whether the first is worth chasing.
+    """
+    from .execution.gotrade import fee_for, readiness, round_trip_fee, shares_for_risk
+
+    report = readiness(settings)
+    cfg = settings.get("execution.gotrade", {}) or {}
+    out: dict[str, Any] = {"readiness": report}
+
+    if args.equity or args.entry:
+        equity = float(args.equity or report.get("equity") or 0.0)
+        entry, stop = float(args.entry or 0.0), float(args.stop or 0.0)
+        if entry and stop:
+            out["sizing"] = shares_for_risk(
+                equity=equity, risk_pct=float(args.risk_pct), entry=entry, stop=stop,
+                cash_available=float(args.cash or equity), fractional=bool(cfg.get("fractional", True)),
+                max_position_pct=float(cfg.get("max_position_pct", 25.0)))
+        if entry:
+            out["fees"] = {
+                "one_share_notional": entry,
+                "fee_one_side": fee_for(entry),
+                "fee_round_trip": round_trip_fee(entry),
+                "fee_pct_of_notional": round(max(0.10, entry * 0.003) / entry * 100, 3),
+                "breakeven_move_pct": round(max(0.10, entry * 0.003) * 2 / entry * 100, 3),
+            }
+
+    if args.json:
+        print(json.dumps({**report, **out}, indent=2, default=str))
+        return 0
+    print()
+    print(f"  Gotrade · entity {report['entity']} · token "
+          f"{green('present') if report['token_present'] else amber('missing')}")
+    for item in report["blocking"]:
+        print(f"  {amber('BLOCKER')} {dim(item)}")
+    if out.get("fees"):
+        fees = out["fees"]
+        print()
+        print(f"  fee on a ${fees['one_share_notional']:,.2f} order: "
+              f"${fees['fee_one_side']:.2f} each way · round trip ${fees['fee_round_trip']:.2f} "
+              f"= {fees['breakeven_move_pct']:.3f}% of price before any profit")
+    if out.get("sizing"):
+        plan = out["sizing"]
+        if plan["ok"]:
+            print(f"  {green('sized')} {plan['shares']:.4f} shares · notional "
+                  f"${plan['notional']:,.2f} · risk ${plan['risk_cash']:,.2f} · "
+                  f"fees ${plan['fee_round_trip']:,.2f} ({plan['fee_pct_of_risk']:.0f}% of risk) · "
+                  f"binding {plan['binding']}")
+        else:
+            print(f"  {amber('cannot size this trade')} {plan['reason']}")
+    print()
+    print(dim("  nothing here places an order; the token is never printed"))
+    print()
+    return 0
+
+
 def _redact(value: str, *, keep: int = 0) -> str:
     """Show that a secret exists without showing it. Used by every line of the report."""
     text = str(value or "")
@@ -1291,6 +1353,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="read-only diagnostic report (discovery, account, limits, conditions, "
                         "one gold candle) with every credential redacted — safe to paste")
     p.set_defaults(func=cmd_exness)
+
+    p = sub.add_parser("gotrade", help="US shares (Gotrade): readiness and fee-aware sizing")
+    p.add_argument("--equity", type=float, default=0.0, help="account equity in USD")
+    p.add_argument("--cash", type=float, default=0.0,
+                   help="cash available for trade (settled); defaults to --equity")
+    p.add_argument("--risk-pct", type=float, default=1.0, help="risk per trade, percent of equity")
+    p.add_argument("--entry", type=float, default=0.0, help="planned entry price")
+    p.add_argument("--stop", type=float, default=0.0, help="planned stop price")
+    p.set_defaults(func=cmd_gotrade)
 
     p = sub.add_parser("approvals", help="list or decide queued trade requests")
     p.add_argument("action", nargs="?", choices=["list", "approve", "reject"], default="list")
