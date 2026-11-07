@@ -696,6 +696,21 @@ def cmd_gotrade(args: argparse.Namespace, settings: Settings) -> int:
                 "breakeven_move_pct": round(max(0.10, entry * 0.003) * 2 / entry * 100, 3),
             }
 
+    if getattr(args, "connect", False):
+        # read-only: balance + positions today, nothing that can move money
+        from .execution.gotrade import GotradeBroker, from_settings
+
+        try:
+            broker = from_settings(settings)
+        except RuntimeError as exc:
+            out["connect"] = {"ok": False, "reason": str(exc)}
+        else:
+            try:
+                out["connect"] = {"ok": True, "review": broker.review(),
+                                  "balance": broker.cash()}
+            except Exception as exc:  # noqa: BLE001 - a 401 is the answer we need to show
+                out["connect"] = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+
     if args.json:
         print(json.dumps({**report, **out}, indent=2, default=str))
         return 0
@@ -713,6 +728,27 @@ def cmd_gotrade(args: argparse.Namespace, settings: Settings) -> int:
         print(f"  fee on a ${fees['one_share_notional']:,.2f} order: "
               f"${fees['fee_one_side']:.2f} each way · round trip ${fees['fee_round_trip']:.2f} "
               f"= {fees['breakeven_move_pct']:.3f}% of price before any profit")
+    connect = out.get("connect")
+    if connect is not None:
+        if not connect.get("ok"):
+            print()
+            print(f"  {red('connect failed')} {dim(connect['reason'])}")
+        else:
+            book = connect["review"]
+            print()
+            print(f"  {green('connected')} equity ${book['equity']:,.2f} · "
+                  f"invested {book['invested_pct']:.1f}% · cash ${book['cash_available']:,.2f}")
+            for pos in book["positions"]:
+                print(f"    {pos['ticker']:<7} ${pos['value']:>8,.2f}  {pos['weight_pct']:>5.1f}%"
+                      f"  P&L {pos['pnl_pct']:+.2f}%  exit fee ${pos['exit_fee']:.2f}"
+                      f" ({pos['exit_fee_pct']:.2f}%)")
+                for note in pos["notes"]:
+                    print(f"      {amber('·')} {dim(note)}")
+            print(f"  flattening the book costs ${book['flatten_cost']:.2f} "
+                  f"({book['flatten_cost_pct']:.2f}% of equity)")
+            if not book["can_open_new"]:
+                print(f"  {amber('no new entry')} {dim(book['new_entry_blocked_by'])}")
+            print(f"  {amber('stops')} {dim(book['stop_note'])}")
     if out.get("sizing"):
         plan = out["sizing"]
         if plan["ok"]:
@@ -1364,6 +1400,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--risk-pct", type=float, default=1.0, help="risk per trade, percent of equity")
     p.add_argument("--entry", type=float, default=0.0, help="planned entry price")
     p.add_argument("--stop", type=float, default=0.0, help="planned stop price")
+    p.add_argument("--connect", action="store_true",
+                   help="read-only call: balance + open positions + what the book can do")
     p.add_argument("--id-status", choices=["verified", "expired", "unknown"], default=None,
                    help="what the app shows about your ID document (recorded in the report)")
     p.set_defaults(func=cmd_gotrade)

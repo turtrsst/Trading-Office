@@ -48,6 +48,8 @@ FEE_MIN = 0.10           # USD per side
 #: HTTP code → what the operator should do. The body only carries a message, so the status is
 #: the contract.
 STATUS_HINTS = {
+    0: "the request never reached Gotrade (DNS/TLS/egress). This is the network, not the "
+       "credentials — a sandbox with a host allowlist fails exactly here",
     401: "token missing/expired, or the account is not enabled for API access "
          "(request enablement from your Gotrade representative, then regenerate at Profile > API Key)",
     403: "buying is currently unavailable for this account (KYC/ID validity, restriction)",
@@ -104,6 +106,74 @@ def shares_for_risk(*, equity: float, risk_pct: float, entry: float, stop: float
     }
 
 
+def review_positions(positions: list[dict[str, Any]], *, cash_available: float = 0.0,
+                     cash_balance: float = 0.0,
+                     min_trade_usd: float = 1.0) -> dict[str, Any]:
+    """Read an existing book the way the fee model sees it.
+
+    This exists because an account can be *fully invested*, and then the interesting question
+    is not "what should I buy" but "what can this book actually do": what an exit costs, which
+    holdings are too small to be worth closing, whether a stop can be attached at all, and how
+    much cash is free for a new entry. All of it is arithmetic on the venue's own numbers.
+    """
+    rows = []
+    total_value = 0.0
+    for row in positions:
+        value = float(row.get("market_value") or 0.0)
+        if value <= 0:
+            qty = float(row.get("quantity") or 0.0)
+            value = qty * float(row.get("avg_entry_price") or 0.0)
+        total_value += value
+        rows.append({"ticker": str(row.get("ticker") or ""), "value": round(value, 2),
+                     "shares": float(row.get("quantity") or 0.0),
+                     "entry": float(row.get("avg_entry_price") or 0.0),
+                     "pnl": float(row.get("unrealized_pl") or 0.0),
+                     "pnl_pct": round(float(row.get("unrealized_plpc") or 0.0) * 100, 2)})
+
+    equity = max(cash_balance, 0.0) + total_value
+    for item in rows:
+        item["exit_fee"] = fee_for(item["value"])
+        item["exit_fee_pct"] = round(item["exit_fee"] / item["value"] * 100, 2) if item["value"] else 0.0
+        item["weight_pct"] = round(item["value"] / equity * 100, 2) if equity else 0.0
+        # the docs offer take_profit/stop_loss only on the *create* request: there is no
+        # endpoint to attach a stop to a position that already exists. Saying so is the point.
+        item["stop_attachable"] = False
+        item["notes"] = []
+        if item["exit_fee_pct"] >= 0.5:
+            item["notes"].append(
+                f"closing costs {item['exit_fee_pct']:.2f}% (the ${FEE_MIN:.2f} floor on a "
+                f"${item['value']:.2f} position)")
+        if item["value"] < min_trade_usd / FEE_PCT:
+            item["notes"].append(
+                f"under ${min_trade_usd / FEE_PCT:.0f}: the venue fee is a bigger share of this "
+                f"position than of any new one")
+
+    fees_to_flatten = round(sum(i["exit_fee"] for i in rows), 2)
+    biggest = max(rows, key=lambda r: r["weight_pct"], default={"ticker": "", "weight_pct": 0.0})
+    return {
+        "equity": round(equity, 2),
+        "positions_value": round(total_value, 2),
+        "cash_available": round(cash_available, 2),
+        "cash_balance": round(cash_balance, 2),
+        "invested_pct": round(total_value / equity * 100, 2) if equity else 0.0,
+        "cash_pct": round(cash_available / equity * 100, 2) if equity else 0.0,
+        "positions": rows,
+        "flatten_cost": fees_to_flatten,
+        "flatten_cost_pct": round(fees_to_flatten / equity * 100, 3) if equity else 0.0,
+        "largest": {"ticker": biggest["ticker"], "weight_pct": biggest["weight_pct"]},
+        "can_open_new": cash_available >= min_trade_usd,
+        "new_entry_blocked_by": ("" if cash_available >= min_trade_usd else
+                                 f"cash available is ${cash_available:.2f}, below the "
+                                 f"${min_trade_usd:.0f} minimum a fractional order needs"),
+        "stop_on_existing_positions": False,
+        "stop_note": ("the API has no modify endpoint: take_profit/stop_loss exist only on the "
+                      "create request, so an existing position cannot be given a stop. Protecting "
+                      "this book means selling and re-entering with a bracket, which costs a "
+                      "second round of fees"),
+        "reprotect_cost": round(sum(fee_for(i["value"]) for i in rows) * 2, 2),
+    }
+
+
 @dataclass
 class GotradeClient:
     """Bearer-token REST client. One URL per call, no hidden retries on mutations."""
@@ -119,7 +189,16 @@ class GotradeClient:
         body = json.dumps(payload).encode() if payload is not None else None
         headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
         send = self.transport or _default_transport
-        status, data = send(method, self.base_url.rstrip("/") + path, headers, body, self.timeout)
+        try:
+            status, data = send(method, self.base_url.rstrip("/") + path, headers, body,
+                                self.timeout)
+        except GotradeError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - includes injected transports
+            # A DNS/TLS failure never reached the venue. Surfacing it as "bad token" would send
+            # an operator chasing credentials for a network problem.
+            raise GotradeError(0, f"transport failure before any HTTP status "
+                                  f"({type(exc).__name__}: {exc})") from exc
         self.audit.append({"method": method, "path": path, "status": status, "at": time.time()})
         del self.audit[:-100]
         if status not in allow:
@@ -177,6 +256,10 @@ def _default_transport(method: str, url: str, headers: dict[str, str], body: byt
             return exc.code, json.loads(exc.read() or b"{}")
         except Exception:  # noqa: BLE001
             return exc.code, {"message": f"HTTP {exc.code}"}
+    except Exception as exc:  # noqa: BLE001 - a transport failure is not an HTTP status
+        # URLError / TLS / DNS never reach the venue, so it must not look like a token problem
+        raise GotradeError(0, f"transport failure before any HTTP status "
+                              f"({type(exc).__name__}: {exc})") from exc
 
 
 class GotradeError(RuntimeError):
@@ -251,6 +334,12 @@ class GotradeBroker:
                 "raw": row,
             })
         return out
+
+    def review(self) -> dict[str, Any]:
+        """What this book can and cannot do, from the venue's own numbers."""
+        cash = self.cash()
+        return review_positions(self.client.open_positions(extended_hours=self.allow_extended_hours),
+                                cash_available=cash["available"], cash_balance=cash["balance"])
 
     def open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         out = []

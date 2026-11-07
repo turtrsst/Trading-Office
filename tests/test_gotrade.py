@@ -377,3 +377,62 @@ def test_the_constraints_are_declared_for_the_ui_and_the_docs():
     assert c["stop_loss_required"] is True
     assert c["tp_sl_rejected_in_extended_hours"] is True
     assert c["market_data_endpoints_published"] is False
+
+
+# --------------------------------------------------------------------------- an invested book
+def _book():
+    return [
+        {"ticker": "BRK.B", "market_value": "29.87", "quantity": "0.052319373",
+         "avg_entry_price": "475.0", "unrealized_pl": "4.98", "unrealized_plpc": "0.20"},
+        {"ticker": "MSFT", "market_value": "39.39", "quantity": "0.074235097",
+         "avg_entry_price": "430.0", "unrealized_pl": "7.45", "unrealized_plpc": "0.2336"},
+        {"ticker": "V", "market_value": "32.68", "quantity": "0.077325993",
+         "avg_entry_price": "325.0", "unrealized_pl": "7.79", "unrealized_plpc": "0.3130"},
+        {"ticker": "XOM", "market_value": "10.11", "quantity": "0.060944544",
+         "avg_entry_price": "157.0", "unrealized_pl": "0.54", "unrealized_plpc": "0.0562"},
+    ]
+
+
+def test_a_fully_invested_book_is_described_in_terms_of_what_it_can_do():
+    review = gotrade.review_positions(_book(), cash_available=0.24, cash_balance=0.24)
+
+    assert review["invested_pct"] > 99
+    assert review["can_open_new"] is False
+    assert "below the $1 minimum" in review["new_entry_blocked_by"]
+    assert review["largest"]["ticker"] == "MSFT"
+    assert len(review["positions"]) == 4
+
+
+def test_per_position_exit_fees_expose_the_floor_on_small_holdings():
+    review = gotrade.review_positions(_book(), cash_available=0.24, cash_balance=0.24)
+    by_ticker = {p["ticker"]: p for p in review["positions"]}
+
+    # a $10.11 holding: the $0.10 floor is 0.99 % of it, ten times the headline rate
+    assert by_ticker["XOM"]["exit_fee"] == pytest.approx(0.10)
+    assert by_ticker["XOM"]["exit_fee_pct"] == pytest.approx(0.99, abs=0.01)
+    assert any("floor" in n for n in by_ticker["XOM"]["notes"])
+    assert by_ticker["MSFT"]["exit_fee"] == pytest.approx(0.12)      # flat 0.3 %
+
+
+def test_no_stop_can_be_attached_to_an_existing_position_and_the_report_says_why():
+    review = gotrade.review_positions(_book(), cash_available=0.24, cash_balance=0.24)
+
+    assert review["stop_on_existing_positions"] is False
+    assert "no modify endpoint" in review["stop_note"]
+    assert all(p["stop_attachable"] is False for p in review["positions"])
+    # re-protecting = sell + rebuy, i.e. two more fee sides
+    assert review["reprotect_cost"] == pytest.approx(0.84, abs=0.02)
+
+
+def test_a_transport_failure_is_not_reported_as_a_token_problem():
+    def blocked(method, url, headers, body, timeout):
+        raise OSError("TLS handshake closed")
+
+    client = GotradeClient(token=TOKEN, base_url="https://example.invalid", transport=blocked)
+
+    with pytest.raises(GotradeError) as excinfo:
+        client.account_balance()
+
+    assert excinfo.value.status == 0
+    assert "never reached Gotrade" in str(excinfo.value)
+    assert "not the credentials" in str(excinfo.value)

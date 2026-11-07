@@ -249,7 +249,7 @@ trading_office/
   backtest/engine.py          bar-by-bar backtester + walk-forward
   cli.py                      terminal
 web/                          the web terminal (no build step, no frameworks)
-tests/                        268 unit + API tests, all offline
+tests/                        272 unit + API tests, all offline
 docs/                         strategy logic, API, MCP, operations
 scripts/make_demo_data.py     writes data/*.json for the backtester
 ```
@@ -315,8 +315,11 @@ Three facts decide what a US bot can be, and all three are in [docs/GOTRADE.md](
 * **long-only** — `SELL` closes, it never shorts; a sell with no position is refused
 * **0.3 % per side, minimum $0.10** — on a $112 account that is 24 % of a 1 % risk budget, so
   scalping is arithmetically impossible there; the cost gate already refuses such setups
-* **two account blockers** — an expired ID document and API access that must be enabled by a
-  Gotrade representative; without them every call is `401`
+* **the account is 99.8 % invested** — `--connect` reviews the book: no cash for a new entry,
+  $0.42 to flatten it, and **no way to attach a stop to a position that already exists**
+  (TP/SL are create-only fields, there is no modify endpoint)
+* **API access must be enabled by a Gotrade representative** — without it every call is `401`,
+  even with a valid token
 
 ## Autonomous mode (approve from Telegram)
 
@@ -374,7 +377,7 @@ trading-office doctor     # shows credential presence + whether state/ is sealed
 
 ```sh
 pip install pytest httpx
-python -m pytest -q           # 268 passed, entirely offline
+python -m pytest -q           # 272 passed, entirely offline
 ```
 
 The suite covers indicator maths, each filter's pass/block path, the no-trigger veto, the

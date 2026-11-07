@@ -110,6 +110,50 @@ Honest options, in order:
 4. **Or trade the same idea on a venue where the fee is not the strategy.** Crypto perps on
    Bybit cost ~18 bps round trip; that is where a $112 account can actually rotate.
 
+## An already-invested book: what the numbers say
+
+The account holds four fractional positions and $0.24 of cash. Reviewed through the fee model:
+
+| Position | Value | Weight | P&L | Exit fee | Fee as % of the position |
+| --- | --- | --- | --- | --- | --- |
+| MSFT | $39.39 | 35.1 % | +23.4 % | $0.12 | 0.30 % |
+| Visa | $32.68 | 29.1 % | +31.3 % | $0.10 | 0.31 % |
+| Berkshire | $29.87 | 26.6 % | +20.0 % | $0.10 | 0.33 % |
+| ExxonMobil | $10.11 | 9.0 % | +5.6 % | $0.10 | **0.99 %** |
+
+```
+$ trading-office gotrade --connect
+connected  equity $112.29 · invested 99.8% · cash $0.24
+  flattening the book costs $0.42 (0.37% of equity)
+  no new entry  cash available is $0.24, below the $1 minimum a fractional order needs
+  stops  the API has no modify endpoint: take_profit/stop_loss exist only on the create
+         request, so an existing position cannot be given a stop
+```
+
+Four facts a US bot on this account has to start from:
+
+1. **The book is 99.8 % invested.** There is no cash to enter with, so "buy when the trend
+   turns" cannot happen until something is sold. Any bot that ignores this will simply report
+   `400 insufficient buying power` forever.
+2. **The stops are not there, and cannot be added.** `take_profit` / `stop_loss` exist only on
+   the *create* request; there is no modify endpoint. Protecting these four positions means
+   selling and re-buying with a bracket, which spends a second round of fees ($0.84).
+3. **The XOM position is fee-dominated**: $10.11 with a $0.10 exit is 0.99 %, three times the
+   headline rate. Positions under ~$333 always pay the floor rather than 0.3 %.
+4. **The upside is real but comes from beta, not from timing.** +20 % to +31 % on mega-caps is
+   what a rising market did to a buy-and-hold book; it says nothing about whether a bot can
+   reproduce it. Reproducing it with 0.6 % round-trip friction needs a *slower* strategy than
+   the one this repo runs for crypto — weekly decisions, not 15-minute ones.
+
+### What a US strategy on this account can honestly be
+
+| Option | Fits? | Why |
+| --- | --- | --- |
+| Scalping / intraday | no | 0.6 % round trip needs >40 % win rate on tiny moves, and cash is zero |
+| Swing with brackets (hold days–weeks) | yes | the fee is amortised over a 5–10 % move; brackets are allowed in the regular session |
+| Buy-and-hold rebalancing bot | yes | quarterly trades, fee irrelevant, but it is portfolio management, not "bot trading" |
+| Protective stops on the current book | no | the API cannot attach a stop to an existing position |
+
 ## Market data
 
 The docs say market data exists (1 price endpoint + 3 market-data endpoints) but do not publish
