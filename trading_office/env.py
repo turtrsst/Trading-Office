@@ -45,6 +45,13 @@ ALIASES: dict[str, tuple[str, ...]] = {
     "TO_STATE_PASSPHRASE": ("STATE_PASSPHRASE",),
     # a bot token pasted from a generic tutorial is usually named after the service
     "TO_TELEGRAM_TOKEN": ("TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "TG_TOKEN"),
+    # Exness Trader API (docs: exness-api.com). The public key and the account id are not
+    # secrets; the Ed25519 private key is, so it can also live in a file outside the repo.
+    "TO_EXNESS_API_KEY": ("EXNESS_API_KEY",),
+    "TO_EXNESS_PRIVATE_KEY": ("EXNESS_PRIVATE_KEY",),
+    "TO_EXNESS_PRIVATE_KEY_PATH": ("EXNESS_PRIVATE_KEY_PATH", "TO_EXNESS_PRIVATE_KEY_FILE"),
+    "TO_EXNESS_ACCOUNT_ID": ("EXNESS_ACCOUNT_ID", "TO_EXNESS_ACCT"),
+    "TO_EXNESS_GATEWAY_HOST": ("EXNESS_GATEWAY_HOST", "EXN_GATEWAY_HOST"),
 }
 
 #: variables from other ecosystems that this project cannot honour (see the docstring)

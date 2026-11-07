@@ -453,6 +453,31 @@ def _security_checks(settings: Settings) -> list[tuple[str, bool, str]]:
     ]
 
 
+def _exness_check(settings: Settings) -> tuple[str, bool, str]:
+    """Presence only — never a secret, never a network call.
+
+    A configured-but-unverified key is reported as WARN on purpose: the only way to know a
+    key works is `trading-office exness --connect`, and `doctor` must stay offline.
+    """
+    from .env import get
+
+    cfg = settings.get("execution.exness", {}) or {}
+    api_key = get(str(cfg.get("api_key_env") or "TO_EXNESS_API_KEY"))
+    private = get(str(cfg.get("private_key_env") or "TO_EXNESS_PRIVATE_KEY")) or get(
+        str(cfg.get("private_key_path_env") or "TO_EXNESS_PRIVATE_KEY_PATH"))
+    account = get(str(cfg.get("account_id_env") or "TO_EXNESS_ACCOUNT_ID"))
+    gateway = get(str(cfg.get("gateway_env") or "TO_EXNESS_GATEWAY_HOST"))
+    have = sum(1 for v in (api_key, private, account, gateway) if v)
+    if have == 4:
+        return ("exness", True,
+                f"key {api_key[:8]}… · account {account} · verify with `exness --connect`")
+    if have == 0:
+        return ("exness", True, "not configured (optional) — see docs/EXNESS.md")
+    missing = [name for name, value in (("API_KEY", api_key), ("PRIVATE_KEY", private),
+                                        ("ACCOUNT_ID", account), ("GATEWAY_HOST", gateway)) if not value]
+    return ("exness", False, f"incomplete — missing TO_EXNESS_{', TO_EXNESS_'.join(missing)}")
+
+
 def cmd_doctor(args: argparse.Namespace, settings: Settings) -> int:
     from .market import CryptoClient, IdxClient
 
@@ -465,6 +490,7 @@ def cmd_doctor(args: argparse.Namespace, settings: Settings) -> int:
         ("ccxt", crypto.available(), f"{crypto.exchange_id} reachable" if crypto.available() else crypto.last_error or "install ccxt"),
         ("config", settings.path.exists(), str(settings.path)),
         ("paper broker", bool(settings.get("execution.paper", True)), "no capital at risk"),
+        _exness_check(settings),
     ] + _security_checks(settings)
     if args.json:
         print(json.dumps([{"check": c, "ok": ok, "detail": d} for c, ok, d in checks], indent=2))
@@ -634,6 +660,87 @@ def cmd_trade(args: argparse.Namespace, settings: Settings) -> int:
     else:
         print()
         print(dim("  nothing executable on this bar — no plan, no signal, or a guard is closed"))
+    return 0
+
+
+def cmd_exness(args: argparse.Namespace, settings: Settings) -> int:
+    """Check the Exness connection and answer the only question that matters first:
+    can this account even *express* the risk the strategy wants?
+
+    Read-only by design: no order is sent, and nothing here needs the trading scope. Run
+    with ``--size-only`` (the default) before any key exists — it answers the lot-step
+    question from arithmetic alone, which is exactly the question that kills small accounts
+    on gold.
+    """
+    from .execution.exness import ExnessError, from_settings, lots_for_risk
+
+    cfg = (settings.get("execution.exness", {}) or {}).get("instrument", {}) or {}
+    equity = float(args.equity or 0.0)
+    risk_pct = float(args.risk_pct)
+    entry, stop = float(args.entry), float(args.stop)
+
+    if entry and stop:
+        from .execution.exness import FxInstrument
+
+        instrument = FxInstrument(
+            symbol=str(cfg.get("symbol", "XAUUSD")),
+            volume_min=float(cfg.get("volume_min", 0.01)),
+            volume_max=float(cfg.get("volume_max", 100)),
+            volume_step=float(cfg.get("volume_step", 0.01)),
+            contract_size=float(cfg.get("contract_size", 100)),
+            price_step=float(cfg.get("price_step", 0.01)),
+            margin_rate=float(cfg.get("margin_rate", 0.0333)),
+        )
+        plan = lots_for_risk(equity=equity, risk_pct=risk_pct, entry=entry, stop=stop,
+                             instrument=instrument,
+                             max_margin_pct=float(settings.get("risk.max_margin_per_trade_pct", 8)))
+        if args.json:
+            print(json.dumps(plan, indent=2, default=str))
+        elif plan["ok"]:
+            print(f"  {green('sized')} {instrument.symbol}  {plan['lots']:g} lots · "
+                  f"risk {plan['risk_cash']:.2f} ({plan['risk_pct_actual']:.2f}%) · "
+                  f"margin {plan['margin']:.2f}")
+        else:
+            print(f"  {amber('cannot size this trade')} {plan['reason']}")
+            print(dim("  a raw size of "
+                      f"{plan.get('raw_lots', 0):.4f} lots would risk {plan.get('risk_cash', 0):.2f} "
+                      f"but the venue's smallest step is {instrument.volume_step:g} lots"))
+        if not args.connect:
+            return 0 if plan["ok"] else 1
+
+    try:
+        broker = from_settings(settings)
+    except RuntimeError as exc:
+        print(f"  {amber('not configured')} {exc}")
+        print(dim("  set TO_EXNESS_API_KEY, TO_EXNESS_PRIVATE_KEY(_PATH), TO_EXNESS_ACCOUNT_ID, "
+                  "TO_EXNESS_GATEWAY_HOST (see docs/EXNESS.md)"))
+        return 1
+
+    try:
+        account = broker.refresh()
+        positions = broker.positions()
+    except ExnessError as exc:
+        print(f"  {red('connection failed')} {exc}")
+        return 1
+    out = {
+        "account": {k: account.get(k) for k in ("account_id", "balance", "equity", "currency",
+                                                "leverage", "trade_mode")},
+        "instrument": broker.instrument.__dict__,
+        "open_positions": positions,
+        "access_point": broker.client.access_point,
+        "calls": broker.client.audit[-5:],
+    }
+    if args.json:
+        print(json.dumps(out, indent=2, default=str))
+        return 0
+    print(f"  {green('connected')} account {out['account']['account_id']} · "
+          f"equity {out['account']['equity']} {out['account']['currency']} · "
+          f"leverage 1:{out['account']['leverage']} · mode {out['account']['trade_mode']}")
+    print(dim(f"  access point {out['access_point']}"))
+    print(f"  open positions: {len(positions)}")
+    for row in positions:
+        print(f"    {row['symbol']} {row['side']} {row['lots']:g} lots @ {row['entry']} "
+              f"stop {row['stop']} · P&L {row['pnl']:.2f}")
     return 0
 
 
@@ -917,6 +1024,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="closed bar the analysis was made on; a newer bar is refused")
     p.add_argument("--side", choices=["LONG", "SHORT"], default=None)
     p.set_defaults(func=cmd_trade)
+
+    p = sub.add_parser("exness", help="Exness Trader API: connection check and gold lot sizing")
+    p.add_argument("--equity", type=float, default=1000.0, help="account equity for the sizing check")
+    p.add_argument("--risk-pct", type=float, default=0.5, help="risk per trade, percent of equity")
+    p.add_argument("--entry", type=float, default=0.0, help="planned entry price")
+    p.add_argument("--stop", type=float, default=0.0, help="planned stop price")
+    p.add_argument("--connect", action="store_true",
+                   help="also call the API (read-only: account + positions)")
+    p.set_defaults(func=cmd_exness)
 
     p = sub.add_parser("approvals", help="list or decide queued trade requests")
     p.add_argument("action", nargs="?", choices=["list", "approve", "reject"], default="list")

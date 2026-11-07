@@ -438,8 +438,11 @@ shutdown path: the child gets `SIGTERM`/`terminate`, then a hard kill after
 ### What this appendix does **not** cover
 
 MetaTrader 5. There is no MT5 execution path in this codebase (it is Windows-only, and the
-repo's venue abstraction is `paper` / `ccxt`); a `MT5_*` variable is reported as *ignored*
-by `doctor` and `/api/security` rather than silently accepted. If an MT5 venue is ever
-added, it needs the zombie-terminal watchdog described in the design notes — an MT5 Python
-call talks to `terminal64.exe` over IPC, so a frozen GUI looks like a healthy process that
-rejects every order.
+repo's venue abstraction is `paper` / `ccxt` / `exness`); a `MT5_*` variable is reported as
+*ignored* by `doctor` and `/api/security` rather than silently accepted. If an MT5 venue is
+ever added, it needs the zombie-terminal watchdog described in the design notes — an MT5
+Python call talks to `terminal64.exe` over IPC, so a frozen GUI looks like a healthy process
+that rejects every order.
+
+The Exness path added later does **not** go through MT5: it is their documented REST Trader
+API, so the "frozen terminal" failure does not exist there. See [EXNESS.md](EXNESS.md).
