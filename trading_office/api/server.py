@@ -87,6 +87,31 @@ def _engine(market: str) -> TradingEngine:
         return _ENGINES[market]
 
 
+def _fx_status() -> dict[str, Any]:
+    """Whether gold data comes from Exness or from the synthetic fallback.
+
+    A read-only probe: it reports the *last* fetch result and whether credentials exist, and
+    never performs a network call from ``/api/health`` (a health check that calls the venue is
+    a health check that hangs when the venue does).
+    """
+    if "_FX_STATUS" not in globals():
+        try:
+            from ..env import get
+
+            cfg = SETTINGS.get("execution.exness", {}) or {}
+            configured = bool(
+                get(str(cfg.get("api_key_env") or "TO_EXNESS_API_KEY"))
+                and (get(str(cfg.get("private_key_env") or "TO_EXNESS_PRIVATE_KEY"))
+                     or get(str(cfg.get("private_key_path_env") or "TO_EXNESS_PRIVATE_KEY_PATH")))
+                and get(str(cfg.get("account_id_env") or "TO_EXNESS_ACCOUNT_ID"))
+            )
+        except Exception:  # noqa: BLE001
+            configured = False
+        globals()["_FX_STATUS"] = {"provider": "exness", "configured": configured,
+                                   "available": configured}
+    return globals()["_FX_STATUS"]
+
+
 def _iso_now() -> str:
     return dt.datetime.now(ZoneInfo("Asia/Jakarta")).isoformat()
 
@@ -95,6 +120,8 @@ def _candles_payload(market: str, symbol: str, limit: int = 260) -> dict[str, An
     profile = SETTINGS.profile(market)
     if market == "idx":
         data = SCREENER._idx_symbol_data(symbol.upper())
+    elif market == "fx":
+        data = SCREENER._fx_symbol_data(symbol.upper())
     else:
         data = SCREENER._crypto_symbol_data(symbol)
     bars = data["bars"][-limit:]
@@ -134,7 +161,7 @@ def _candles_payload(market: str, symbol: str, limit: int = 260) -> dict[str, An
 
 # --------------------------------------------------------------------------- schemas
 class BacktestRequest(BaseModel):
-    market: Literal["crypto", "idx"] = "crypto"
+    market: Literal["crypto", "idx", "fx"] = "crypto"
     symbol: str = "BTC/USDT:USDT"
     oos: float = Field(0.3, ge=0.0, le=0.6)
     bars: int = Field(900, ge=150, le=2000)
@@ -144,12 +171,12 @@ class BacktestRequest(BaseModel):
 
 
 class EngineRequest(BaseModel):
-    market: Literal["crypto", "idx"] = "crypto"
+    market: Literal["crypto", "idx", "fx"] = "crypto"
     symbols: list[str] | None = None
 
 
 class ApprovalDecisionRequest(BaseModel):
-    market: Literal["crypto", "idx"] = "crypto"
+    market: Literal["crypto", "idx", "fx"] = "crypto"
     request_id: str
     by: str = "browser"
 
@@ -162,7 +189,7 @@ class ConfirmTradeRequest(BaseModel):
     bar. The plan itself is recomputed server-side, so a modified request cannot change the
     size, the stop or the target.
     """
-    market: Literal["crypto", "idx"] = "crypto"
+    market: Literal["crypto", "idx", "fx"] = "crypto"
     symbol: str
     side: str | None = None
     analysis_id: str = ""
@@ -171,24 +198,24 @@ class ConfirmTradeRequest(BaseModel):
 
 
 class ArmLiveRequest(BaseModel):
-    market: Literal["crypto", "idx"] = "crypto"
+    market: Literal["crypto", "idx", "fx"] = "crypto"
     confirm: bool = False           # must be true; an accidental POST must not arm trading
     by: str = "operator"
 
 
 class ClosePositionRequest(BaseModel):
-    market: Literal["crypto", "idx"] = "crypto"
+    market: Literal["crypto", "idx", "fx"] = "crypto"
     symbol: str
 
 
 class CancelOrderRequest(BaseModel):
-    market: Literal["crypto", "idx"] = "crypto"
+    market: Literal["crypto", "idx", "fx"] = "crypto"
     order_id: str
     symbol: str | None = None
 
 
 class EngineReconcileRequest(BaseModel):
-    market: Literal["crypto", "idx"] = "crypto"
+    market: Literal["crypto", "idx", "fx"] = "crypto"
     adopt: bool = False
     close_orphans: bool = False
 
@@ -210,7 +237,7 @@ def _telegram_control() -> Any:
                 engine_for=lambda market: _engine(market),
             )
             # every engine event flows through here: the bot only sends the interesting ones
-            for market in ("crypto", "idx"):
+            for market in ("crypto", "idx", "fx"):
                 try:
                     _attach_telegram(_engine(market))
                 except Exception:
@@ -260,7 +287,7 @@ async def _lifespan(_app: FastAPI):
     started: list[str] = []
     if autostart:
         for market in markets:
-            if market not in ("crypto", "idx"):
+            if market not in ("crypto", "idx", "fx"):
                 continue
             try:
                 engine = _engine(str(market))
@@ -317,6 +344,7 @@ def create_app() -> FastAPI:
             "providers": {
                 "idx": IDX.status(),
                 "crypto": {**CRYPTO.status(), "available": _crypto_ok()},
+                "fx": {**_fx_status(), "available": _fx_status().get("available", False)},
             },
             "execution": {
                 "paper": bool(SETTINGS.get("execution.paper", True)),
@@ -343,7 +371,7 @@ def create_app() -> FastAPI:
         return status
 
     @app.get("/api/approvals")
-    def approvals(market: Literal["crypto", "idx"] = "crypto", status: str = "pending") -> dict[str, Any]:
+    def approvals(market: Literal["crypto", "idx", "fx"] = "crypto", status: str = "pending") -> dict[str, Any]:
         engine = _engine(market)
         return {
             "market": market,
@@ -354,7 +382,7 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/api/analyse")
-    def analyse(market: Literal["crypto", "idx"] = "crypto") -> dict[str, Any]:
+    def analyse(market: Literal["crypto", "idx", "fx"] = "crypto") -> dict[str, Any]:
         """Analyse every watched symbol on the newest **closed** bar and rank it.
 
         Read-only: this endpoint scans, it never trades. Each row carries an ``analysis_id``
@@ -430,7 +458,7 @@ def create_app() -> FastAPI:
         return status
 
     @app.get("/api/engine/heartbeat")
-    def engine_heartbeat(market: Literal["crypto", "idx"] = "crypto") -> dict[str, Any]:
+    def engine_heartbeat(market: Literal["crypto", "idx", "fx"] = "crypto") -> dict[str, Any]:
         return _engine(market).heartbeat()
 
     @app.get("/api/security")
@@ -536,9 +564,40 @@ def create_app() -> FastAPI:
         }
 
     # ------------------------------------------------------------------ screening
+    @app.get("/api/market/fx")
+    def market_fx(refresh: bool = False) -> dict[str, Any]:
+        symbols = list(SETTINGS.get("profiles.fx.symbols") or ["XAUUSD"])
+        out = []
+        for symbol in symbols:
+            data = SCREENER._fx_symbol_data(symbol.upper())
+            quote = data.get("quote") or {}
+            closes = [b["close"] for b in data["bars"]]
+            change = (closes[-1] / closes[0] - 1) * 100.0 if len(closes) > 1 else 0.0
+            out.append({
+                "symbol": symbol.upper(),
+                "price": quote.get("last"),
+                "bid": quote.get("bid"),
+                "ask": quote.get("ask"),
+                "spread_bps": quote.get("spread_bps"),
+                "change_pct": round(change, 2),
+                "source": data.get("source"),
+                "warnings": data.get("warnings") or [],
+            })
+        screen = SCREENER.screen("fx", limit=len(symbols))
+        return {
+            "market": "fx",
+            "generated_at": _iso_now(),
+            "tickers": out,
+            "screening": screen,
+            "providers": {"fx": {"provider": "exness", "configured": bool(out and out[0]["source"] == "exness")}},
+            "hours": {"week": "Sun 22:00 → Fri 21:00 UTC",
+                      "note": "gold does not trade on Saturday; a position held over the "
+                              "weekend gaps through its stop"},
+        }
+
     @app.get("/api/screen")
     def screen(
-        market: Literal["idx", "crypto"] = "idx",
+        market: Literal["idx", "crypto", "fx"] = "idx",
         limit: int = Query(20, ge=1, le=80),
         symbols: str = "",
         deep: bool = True,
@@ -550,7 +609,7 @@ def create_app() -> FastAPI:
         return SCREENER.screen(market, symbols=wanted, limit=limit, deep_context=deep)
 
     @app.get("/api/symbol/{market}/{symbol:path}")
-    def symbol_detail(market: Literal["idx", "crypto"], symbol: str, refresh: bool = False) -> dict[str, Any]:
+    def symbol_detail(market: Literal["idx", "crypto", "fx"], symbol: str, refresh: bool = False) -> dict[str, Any]:
         try:
             if refresh:
                 IDX.cache.clear()
@@ -559,7 +618,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
     @app.get("/api/candles/{market}/{symbol:path}")
-    def candles(market: Literal["idx", "crypto"], symbol: str, limit: int = Query(260, ge=60, le=1200)):
+    def candles(market: Literal["idx", "crypto", "fx"], symbol: str, limit: int = Query(260, ge=60, le=1200)):
         try:
             return _candles_payload(market, symbol, limit)
         except Exception as exc:  # noqa: BLE001
@@ -608,7 +667,7 @@ def create_app() -> FastAPI:
         return engine.startup_sync(adopt_untracked=req.adopt, close_orphans=req.close_orphans)
 
     @app.get("/api/metrics")
-    def live_metrics(market: Literal["crypto", "idx"] = "crypto", limit: int = Query(200, ge=2, le=2000)) -> dict[str, Any]:
+    def live_metrics(market: Literal["crypto", "idx", "fx"] = "crypto", limit: int = Query(200, ge=2, le=2000)) -> dict[str, Any]:
         """Equity + drawdown time series for the dashboard charts.
 
         ``timestamps`` / ``equity`` / ``drawdown`` are parallel arrays (chart-friendly);
@@ -692,12 +751,12 @@ def create_app() -> FastAPI:
             pass
 
     @app.get("/api/performance")
-    def performance(market: Literal["crypto", "idx"] = "crypto") -> dict[str, Any]:
+    def performance(market: Literal["crypto", "idx", "fx"] = "crypto") -> dict[str, Any]:
         """Profit factor, max drawdown, win rate and net profit of the live/paper book."""
         return _engine(market).performance()
 
     @app.get("/api/engine/kill-switch")
-    def engine_kill_switch(market: Literal["crypto", "idx"] = "crypto") -> dict[str, Any]:
+    def engine_kill_switch(market: Literal["crypto", "idx", "fx"] = "crypto") -> dict[str, Any]:
         engine = _engine(market)
         return engine.guard_state()
 
@@ -707,7 +766,7 @@ def create_app() -> FastAPI:
         return engine.resume()
 
     @app.get("/api/cost-model")
-    def cost_model_endpoint(market: Literal["crypto", "idx"] = "crypto") -> dict[str, Any]:
+    def cost_model_endpoint(market: Literal["crypto", "idx", "fx"] = "crypto") -> dict[str, Any]:
         profile = SETTINGS.profile(market)
         return {
             "market": market,
@@ -718,7 +777,7 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/api/engine/status")
-    def engine_status(market: Literal["crypto", "idx"] = "crypto") -> dict[str, Any]:
+    def engine_status(market: Literal["crypto", "idx", "fx"] = "crypto") -> dict[str, Any]:
         engine = _engine(market)
         return engine.snapshot()
 
@@ -765,7 +824,7 @@ def create_app() -> FastAPI:
         return engine.cancel_order(req.order_id, req.symbol)
 
     @app.get("/api/ledger")
-    def ledger(market: Literal["crypto", "idx"] = "crypto", limit: int = Query(120, ge=1, le=1000)):
+    def ledger(market: Literal["crypto", "idx", "fx"] = "crypto", limit: int = Query(120, ge=1, le=1000)):
         engine = _engine(market)
         return {"market": market, "events": engine.state.ledger(limit), "account": engine.state.account()}
 

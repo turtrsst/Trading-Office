@@ -122,9 +122,18 @@ class PaperBroker:
         self.locked_margin = 0.0
 
     # ------------------------------------------------------------------ helpers
+    @property
+    def contract_size(self) -> float:
+        """Units per lot: 1 for spot/perp, 100 oz for XAUUSD, 100 shares for IDX."""
+        if self.market == "fx":
+            return float(self.profile.get("contract_size", 100.0) or 100.0)
+        return 1.0
+
     def _tick(self, price: float) -> float | None:
         if self.market == "idx" and self.profile.get("tick_table", True):
             return idx_tick_size(price)
+        if self.market == "fx":
+            return float(self.profile.get("price_step", 0.01) or 0.01)
         return None
 
     def _slipped_price(self, side: str, price: float) -> float:
@@ -168,8 +177,22 @@ class PaperBroker:
             return Fill(False, "", order.client_id, order.symbol, order.side, 0.0, order.price_hint, 0.0,
                         "zero quantity", at=dt.datetime.now(dt.timezone.utc).isoformat())
 
+        if self.market == "fx":
+            # a lot is not a unit: 0.05 lot of gold is $13,250 of notional, not $132.50
+            step = float(self.profile.get("volume_step", 0.01) or 0.01)
+            volume_min = float(self.profile.get("volume_min", step) or step)
+            if qty + 1e-9 < volume_min:
+                return Fill(False, "", order.client_id, order.symbol, order.side, 0.0, 0.0, 0.0,
+                            f"{qty:g} lots is below the venue minimum {volume_min:g}",
+                            at=dt.datetime.now(dt.timezone.utc).isoformat())
+            qty = round(math.floor(qty / step + 1e-9) * step, 8)
+            if qty <= 0:
+                return Fill(False, "", order.client_id, order.symbol, order.side, 0.0, 0.0, 0.0,
+                            "volume rounds to zero at the venue step",
+                            at=dt.datetime.now(dt.timezone.utc).isoformat())
+
         fill_price = self._slipped_price(order.side, order.price_hint)
-        notional = fill_price * qty
+        notional = fill_price * qty * self.contract_size
         fee = self._commission(order.side, notional)
         margin = notional / self.leverage if self.market != "idx" else notional
         if margin + fee > self.cash:
@@ -646,6 +669,12 @@ def make_broker(config: dict[str, Any], market: str, equity: float, profile: dic
             market=market,
             profile=profile,
         )
+    if market == "fx" and live:
+        # Imported here so the paper/synthetic paths never require the cryptography stack.
+        # No fallback: a missing key raises, exactly like the ccxt branch above.
+        from .exness import from_settings as exness_from_settings
+
+        return exness_from_settings(config)
     return PaperBroker(
         market=market,
         equity=equity,

@@ -277,6 +277,8 @@ class Screener:
             exchange_id=str(self.settings.get("execution.exchange_id", "bybit")),
             symbols=self.settings.get("profiles.crypto.symbols") or [],
         )
+        # built lazily: the fx screener must work with no Exness key (synthetic, labelled)
+        self._fx_client: Any = None
 
     # ------------------------------------------------------------------ data
     def _idx_symbol_data(self, symbol: str) -> dict[str, Any]:
@@ -289,6 +291,24 @@ class Screener:
             "quote": quote_payload.get("quote") or {},
             "source": candles.get("source", "synthetic"),
             "warnings": list(candles.get("warnings") or []),
+        }
+
+    def _fx_symbol_data(self, symbol: str) -> dict[str, Any]:
+        """Gold/FX from the venue (or synthetic), same shape as the other markets."""
+        from ..market.fx_client import from_settings as fx_from_settings
+
+        client = self._fx_client or fx_from_settings(self.settings)
+        self._fx_client = client
+        profile = self.settings.profile("fx")
+        candles = client.candles(symbol, str(profile.get("timeframe", "15m")), 400)
+        htf = client.htf_candles(symbol, str(profile.get("trend_timeframe", "4h")), 260)
+        quote = client.quote(symbol)
+        return {
+            "bars": candles["bars"],
+            "htf_bars": htf["bars"],
+            "quote": quote,
+            "source": candles["source"],
+            "warnings": list(candles.get("warnings", [])) + list(htf.get("warnings", [])),
         }
 
     def _crypto_symbol_data(self, symbol: str) -> dict[str, Any]:
@@ -310,6 +330,8 @@ class Screener:
             return [s.upper() if market == "idx" else s for s in symbols][:limit]
         if market == "idx":
             return self.idx.universe(limit=limit)
+        if market == "fx":
+            return list(self.settings.get("profiles.fx.symbols") or ["XAUUSD"])[:limit]
         return list(self.settings.get("profiles.crypto.symbols") or [])[:limit]
 
     def screen(
@@ -323,7 +345,9 @@ class Screener:
     ) -> dict[str, Any]:
         market = market.lower()
         targets = self.universe(market, limit=limit, symbols=symbols)
-        fetch = self._idx_symbol_data if market == "idx" else self._crypto_symbol_data
+        fetch = (self._idx_symbol_data if market == "idx"
+                 else self._fx_symbol_data if market == "fx"
+                 else self._crypto_symbol_data)
         rows: list[ScreenRow] = []
         failures: list[str] = []
 
@@ -342,7 +366,13 @@ class Screener:
                 with_risk=with_risk,
             )
             quote = data["quote"]
-            name = quote.get("name") or (demo.IDX_REFERENCE.get(symbol, (symbol,))[0] if market == "idx" else symbol)
+            if market == "fx":
+                from ..market.demo import FX_REFERENCE
+
+                name = quote.get("name") or FX_REFERENCE.get(symbol.upper(), (symbol,))[0]
+            else:
+                name = quote.get("name") or (
+                    demo.IDX_REFERENCE.get(symbol, (symbol,))[0] if market == "idx" else symbol)
             context: dict[str, Any] = {
                 "filter_checks": {
                     c["name"]: c for c in (scan.filter.get("checks") or [])

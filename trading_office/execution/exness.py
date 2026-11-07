@@ -45,18 +45,37 @@ from typing import Any, Callable
 #: documented hash of the empty body (base64url, no padding)
 EMPTY_BODY_HASH = "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU"
 
-#: error codes the docs name explicitly, mapped to something an operator can act on
-ERROR_HINTS = {
+#: error codes named in the public reference, mapped to something an operator can act on.
+#: The documented contract is ``code`` + ``error_message``; the hint explains the cause.
+ERROR_HINTS: dict[int, str] = {
     1000: "AUTH_INVALID_API_KEY — check EXN-API-KEY, key expiry, and api_key inside EXN-DATA",
-    1001: "AUTH_INVALID_SIGNATURE — check EXN-DATA/EXN-SIGN, payload order, body hash, timestamp",
-    1002: "AUTH_PERMISSION_DENIED — check account access, source IP allowlist, key scopes",
-    4001: "MARKET_TRADE_DISABLED — the account or instrument is not accepting new trades",
-    4002: "MARKET_CLOSE_ONLY — only closing is allowed right now",
-    5000: "TRADING_RULE_INVALID_VOLUME — volume_min / volume_max / volume_step",
-    5005: "TRADING_RULE_INVALID_PRICE_LEVELS — margin or exposure limit for this size",
-    6000: "EXECUTION_REQUOTE — retry only while the market is open",
+    1001: "AUTH_INVALID_SIGNATURE — check EXN-DATA/EXN-SIGN, signed path, body hash, clock skew",
+    1002: "AUTH_PERMISSION_DENIED — check key scopes, the source IP allowlist, and the account",
+    2000: "ACCOUNT_NOT_FOUND — account_id does not belong to this API key",
+    2001: "ACCOUNT_DISABLED — the account cannot trade; nothing to retry",
+    2002: "ACCOUNT_CLOSE_ONLY — only closing is allowed; no new exposure",
+    3001: "REQUEST_INVALID_PARAMETERS — the request shape is wrong",
+    3002: "REQUEST_INVALID_PRICE — price has more digits than point_digits allows",
+    3014: "REQUEST_OPERATION_NOT_FOUND — unknown operation_id (24 h retention)",
+    4001: "MARKET_TRADE_DISABLED — new positions are disabled for this instrument",
+    4002: "MARKET_CLOSE_ONLY — this instrument is close-only right now",
+    4003: "MARKET_SESSION_CLOSED — outside the instrument's trading session (gold runs Sun 22:00–Fri 21:00 UTC)",
+    4004: "MARKET_NO_QUOTES — no price to execute against; wait for a tick",
+    4005: "MARKET_INSTRUMENT_NOT_FOUND — instrument name is wrong for this account",
+    5000: "TRADING_RULE_INVALID_VOLUME / VOLUME_TOO_SMALL / VOLUME_TOO_LARGE — check volume_min/max",
+    5001: "TRADING_RULE_INVALID_VOLUME_STEP — volume must be a multiple of volume_step",
+    5005: "TRADING_RULE_INVALID_PRICE_LEVELS — SL/TP on the wrong side of the market",
+    5006: "TRADING_RULE_INSUFFICIENT_MARGIN — free margin is too small for this size",
+    5007: "TRADING_RULE_MARGIN_LEVEL_TOO_LOW — the account is near a margin call; no new exposure",
+    5010: "TRADING_RULE_TOO_MANY_OPEN_POSITIONS — the venue limit is reached",
+    6000: "EXECUTION_REQUOTE — price moved; retry only while the market is open",
     6001: "EXECUTION_REJECTED — wait for a fresh tick; retry only if still intended",
+    9000: "SYSTEM_RATE_LIMIT — slow down; check the limits endpoint before retrying",
 }
+
+#: documented terminal states for an operation, and the one non-terminal state
+FINAL_STATES = {"confirmed": "filled", "rejected": "rejected", "failed": "failed"}
+PENDING_STATES = {"pending", "accepted", "processing"}
 
 
 def b64url(data: bytes) -> str:
@@ -66,6 +85,23 @@ def b64url(data: bytes) -> str:
 
 def unb64url(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def _decimal(value: float) -> str:
+    """Encode a number as the decimal string the API wants (no exponent, no trailing zeros)."""
+    text = f"{float(value):.10f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def quote(text: str) -> str:
+    """Percent-encode a query value **without** touching what must stay literal.
+
+    The signed path is the transmitted path, so this is the only encoding step: building the
+    URL first and letting a library re-encode it afterwards is how signatures break. ``:`` and
+    ``+`` are escaped because ``+`` in an ISO timestamp is the UTC offset.
+    """
+    safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+    return "".join(ch if ch in safe else "".join(f"%{b:02X}" for b in ch.encode()) for ch in text)
 
 
 def body_hash(body: bytes | None) -> str:
@@ -166,6 +202,49 @@ class FxInstrument:
     contract_size: float = 100_000.0     # 1 lot = 100k units for FX; 100 oz for XAUUSD
     price_step: float = 0.01
     margin_rate: float = 0.0333          # 1:30 retail on gold, overridden from the venue
+    quote_currency: str = "USD"          # gold and FX majors are USD-quoted
+
+    @classmethod
+    def from_conditions(cls, symbol: str, data: dict[str, Any]) -> "FxInstrument":
+        """Build from ``GET …/instruments/{instrument}/conditions``.
+
+        Every field is optional in that payload, so anything missing keeps the default rather
+        than becoming zero: a zero step would make every volume "invalid" in a confusing way.
+        """
+        known = {f for f in cls.__dataclass_fields__}
+        mapped: dict[str, Any] = {}
+        aliases = {
+            "volume_min": ("volume_min",),
+            "volume_max": ("volume_max",),
+            "volume_step": ("volume_step",),
+            "contract_size": ("contract_size", "lot_size"),
+            "price_step": ("price_step", "tick_size", "point"),
+            "margin_rate": ("margin_rate",),
+            "quote_currency": ("quote_currency", "profit_currency"),
+        }
+        for field_name, keys in aliases.items():
+            if field_name not in known:
+                continue
+            for key in keys:
+                if data.get(key) not in (None, ""):
+                    try:
+                        mapped[field_name] = float(data[key])
+                    except (TypeError, ValueError):
+                        pass
+                    break
+        digits = data.get("point_digits")
+        if digits not in (None, "") and "price_step" not in mapped:
+            try:
+                mapped["price_step"] = 10 ** -int(digits)
+            except (TypeError, ValueError):
+                pass
+        return cls(symbol=symbol, **mapped)
+
+    def price_str(self, value: float) -> str:
+        """Round to the instrument's price step and render as a decimal string."""
+        step = self.price_step or 0.01
+        rounded = round(round(float(value) / step) * step, 10)
+        return _decimal(rounded)
 
     def normalise_volume(self, volume: float) -> tuple[float, str]:
         """Round **down** to the venue step. Returns ``(volume, reason_if_refused)``.
@@ -188,7 +267,8 @@ class FxInstrument:
 
 
 def lots_for_risk(*, equity: float, risk_pct: float, entry: float, stop: float,
-                  instrument: FxInstrument, max_margin_pct: float = 8.0) -> dict[str, Any]:
+                  instrument: FxInstrument, max_margin_pct: float = 8.0,
+                  leverage: float = 1.0 / 0.0333) -> dict[str, Any]:
     """Convert a risk budget into lots, and say when it cannot be expressed.
 
     This is the FX equivalent of the crypto sizing: risk cash ÷ (price distance × contract
@@ -201,18 +281,58 @@ def lots_for_risk(*, equity: float, risk_pct: float, entry: float, stop: float,
     risk_cash = abs(float(equity)) * abs(float(risk_pct)) / 100.0
     per_lot_risk = distance * instrument.contract_size
     raw_lots = risk_cash / per_lot_risk
-    lots, refused = instrument.normalise_volume(raw_lots)
-    if not lots:
-        return {"ok": False, "reason": refused, "raw_lots": raw_lots, "risk_cash": risk_cash}
-    notional = lots * instrument.contract_size * float(entry)
-    margin = notional * instrument.margin_rate
     margin_cap = abs(float(equity)) * float(max_margin_pct) / 100.0
-    if margin > margin_cap:
-        return {"ok": False, "reason": (f"margin {margin:.2f} exceeds the per-trade cap "
-                                        f"{margin_cap:.2f} ({max_margin_pct:g}% of equity)"),
-                "lots": lots, "margin": margin, "margin_cap": margin_cap}
-    return {"ok": True, "lots": lots, "risk_cash": risk_cash, "margin": margin,
-            "risk_pct_actual": round(lots * per_lot_risk / abs(float(equity)) * 100, 4)}
+    per_lot_margin = instrument.contract_size * float(entry) / (leverage if leverage > 0 else 1.0)
+    # the margin cap is a *sizing* constraint, not a rejection: the position shrinks until the
+    # capital it ties up fits, and the risk falls with it. Refusing here would refuse every
+    # trade on a 1:3 account, because gold's notional is large by construction.
+    cap_lots = margin_cap / per_lot_margin if per_lot_margin > 0 else raw_lots
+    lots, refused = instrument.normalise_volume(min(raw_lots, cap_lots))
+    if not lots:
+        return {"ok": False, "reason": refused, "raw_lots": raw_lots, "risk_cash": risk_cash,
+                "margin_cap": margin_cap}
+    notional = lots * instrument.contract_size * float(entry)
+    margin = notional / leverage if leverage > 0 else notional
+    capped_by = "margin" if cap_lots < raw_lots else ""
+    return {"ok": True, "lots": lots, "risk_cash": risk_cash,
+            "risk_cash_actual": round(lots * per_lot_risk, 2),
+            "risk_pct_actual": round(lots * per_lot_risk / abs(float(equity)) * 100, 4),
+            "margin": margin, "margin_cap": margin_cap, "capped_by": capped_by}
+
+
+def min_viable_equity(*, entry: float, stop: float, instrument: FxInstrument,
+                      risk_pct: float = 0.5, max_margin_pct: float = 8.0,
+                      leverage: float = 3.0) -> dict[str, Any]:
+    """Smallest equity at which the venue minimum lot still fits **both** budgets.
+
+    Two independent constraints bind, and the larger one wins:
+
+    * **risk** — the smallest lot must not exceed the per-trade risk budget, so
+      ``equity ≥ volume_min × stop × contract ÷ (risk_pct/100)``
+    * **margin** — the smallest lot's margin must stay under the per-trade cap, so
+      ``equity ≥ volume_min × contract × entry ÷ (leverage × margin_pct/100)``
+
+    On gold the margin constraint dominates by an order of magnitude, which is the
+    counter-intuitive part: the stop distance is what feels risky, the lot size is what
+    actually decides whether the trade can exist.
+    """
+    distance = abs(float(entry) - float(stop))
+    contract = instrument.contract_size
+    volume_min = instrument.volume_min
+    risk_equity = (volume_min * distance * contract * 100.0 / abs(risk_pct)) if risk_pct else 0.0
+    margin_equity = (volume_min * contract * float(entry)
+                     / (max(leverage, 1e-9) * max(max_margin_pct, 1e-9) / 100.0))
+    required = max(risk_equity, margin_equity)
+    return {
+        "equity_required": round(required, 2),
+        "binding": "margin" if margin_equity >= risk_equity else "risk",
+        "risk_equity": round(risk_equity, 2),
+        "margin_equity": round(margin_equity, 2),
+        "volume_min": volume_min,
+        "risk_at_minimum_lot": round(volume_min * distance * contract, 2),
+        "risk_at_minimum_lot_pct": round(
+            volume_min * distance * contract / required * 100, 4) if required else 0.0,
+    }
 
 
 # --------------------------------------------------------------------------- transport
@@ -250,11 +370,13 @@ class ExnessClient:
         send = self.transport or _default_transport
         status, data = send(method, base.rstrip("/") + path, headers, body, self.timeout)
         record = {"method": method, "path": path, "status": status,
-                  "error_code": data.get("error_code"), "at": time.time()}
+                  "error_code": data.get("code", data.get("error_code")), "at": time.time()}
         self.audit.append(record)
         del self.audit[:-100]
         if status >= 400:
-            code = data.get("error_code")
+            # the documented contract is {code, error_message}; error_code was assumed
+            # before the OpenAPI reference was read, so both are accepted here
+            code = data.get("code", data.get("error_code"))
             raise ExnessError(status, code, str(data.get("error_message") or ""), record)
         return data
 
@@ -279,9 +401,39 @@ class ExnessClient:
     def account(self) -> dict[str, Any]:
         return self._send("GET", self._ap(), f"/v1/configuration/accounts/{self.account_id}/account")
 
+    def limits(self) -> dict[str, Any]:
+        """Rate limits, candle limits and websocket limits: read before spending quota."""
+        return self._send("GET", self._ap(), f"/v1/configuration/accounts/{self.account_id}/limits")
+
+    def conditions(self, instrument: str) -> dict[str, Any]:
+        """The venue's own volume_min/max/step, point_digits, contract size and margin rate.
+
+        This is the authority for instrument rules: guessing them from a docs example is how
+        an order becomes TRADING_RULE_INVALID_VOLUME after a round trip.
+        """
+        return self._send("GET", self._ap(),
+                          f"/v1/configuration/accounts/{self.account_id}"
+                          f"/instruments/{instrument}/conditions")
+
+    def snapshot(self) -> dict[str, Any]:
+        """Current trading state: ``{orders, positions, account_state}``."""
+        return self._send("GET", self._ap(),
+                          f"/v1/trading/accounts/{self.account_id}/snapshot")
+
     def positions(self) -> list[dict[str, Any]]:
-        data = self._send("GET", self._ap(), f"/v1/trading/accounts/{self.account_id}/positions")
-        return list(data.get("positions") or data.get("data") or [])
+        return list(self.snapshot().get("positions") or [])
+
+    def candles(self, instrument: str, timeframe: str, *, start: str, count: int = 400,
+                price_type: str = "bid") -> list[dict[str, Any]]:
+        """Historical candles (``{time, open, high, low, close, volume}``), oldest first.
+
+        ``start`` is ISO-8601 UTC. ``count`` may be negative to walk backwards, which is what
+        a backtest wants: the most recent N bars without knowing the end time.
+        """
+        path = (f"/v1/market-data/accounts/{self.account_id}/candles"
+                f"?instrument={instrument}&timeframe={timeframe}"
+                f"&price_type={price_type}&from={quote(start)}&count={int(count)}")
+        return list(self._send("GET", self._ap(), path).get("candles") or [])
 
     def operation(self, operation_id: str) -> dict[str, Any]:
         """Final state of an accepted operation (the ACK is not the result)."""
@@ -292,12 +444,14 @@ class ExnessClient:
     def open_position(self, *, instrument: str, side: str, volume: float,
                       stop_loss: float | None = None, take_profit: float | None = None,
                       client_request_id: str = "", comment: str = "") -> dict[str, Any]:
+        # field names and the decimal-string encoding come from OpenPositionRequest in the
+        # published OpenAPI document: stop_loss (not stop_loss_price) was my earlier guess
         payload: dict[str, Any] = {"instrument": instrument, "side": side.lower(),
-                                   "volume": f"{volume:.8f}".rstrip("0").rstrip(".")}
+                                   "volume": _decimal(volume)}
         if stop_loss:
-            payload["stop_loss"] = float(stop_loss)
+            payload["stop_loss"] = _decimal(stop_loss)
         if take_profit:
-            payload["take_profit"] = float(take_profit)
+            payload["take_profit"] = _decimal(take_profit)
         if comment:
             payload["comment"] = comment[:31]        # MT-style comment limit, kept short
         return self._send("POST", self._ap(), f"/v1/trading/accounts/{self.account_id}/positions",
@@ -305,11 +459,34 @@ class ExnessClient:
 
     def close_position(self, position_id: str, *, volume: float | None = None,
                        client_request_id: str = "") -> dict[str, Any]:
-        payload: dict[str, Any] = {}
+        """Close (or partially close) a position. Documented as ``DELETE`` on the position,
+        with the partial volume as a query parameter — not a ``POST .../close`` body."""
+        path = f"/v1/trading/accounts/{self.account_id}/positions/{position_id}"
         if volume:
-            payload["volume"] = f"{volume:.8f}".rstrip("0").rstrip(".")
-        return self._send("POST", self._ap(),
-                          f"/v1/trading/accounts/{self.account_id}/positions/{position_id}/close",
+            path += f"?volume={_decimal(volume)}"
+        return self._send("DELETE", self._ap(), path,
+                          idempotency_key=client_request_id or None)
+
+    def cancel_order(self, order_id: str, *, client_request_id: str = "") -> dict[str, Any]:
+        return self._send("DELETE", self._ap(),
+                          f"/v1/trading/accounts/{self.account_id}/orders/{order_id}",
+                          idempotency_key=client_request_id or None)
+
+    def modify_order(self, order_id: str, *, stop_loss: float | None = None,
+                     take_profit: float | None = None, price: float | None = None,
+                     client_request_id: str = "") -> dict[str, Any]:
+        """Change SL/TP or price on a pending order. ``None`` omits (unchanged)."""
+        payload: dict[str, Any] = {}
+        if price is not None:
+            payload["price"] = _decimal(price)
+        if stop_loss is not None:
+            payload["stop_loss"] = _decimal(stop_loss)
+        if take_profit is not None:
+            payload["take_profit"] = _decimal(take_profit)
+        if not payload:
+            raise ValueError("modify_order needs at least one of price / stop_loss / take_profit")
+        return self._send("PATCH", self._ap(),
+                          f"/v1/trading/accounts/{self.account_id}/orders/{order_id}",
                           payload, idempotency_key=client_request_id or None)
 
     def wait_for_final(self, operation_id: str, *, timeout_s: float = 15.0,
@@ -323,11 +500,11 @@ class ExnessClient:
         last: dict[str, Any] = {}
         while time.time() < deadline:
             last = self.operation(operation_id)
-            state = str(last.get("status") or last.get("state") or "").lower()
-            if state in ("filled", "executed", "done", "success"):
-                return {"state": "filled", **last}
-            if state in ("rejected", "failed", "cancelled", "canceled", "error"):
-                return {"state": "rejected", **last}
+            state = str(last.get("status") or "").lower()
+            if state in FINAL_STATES:
+                return {"state": FINAL_STATES[state], **last}
+            if state and state not in PENDING_STATES:      # an unknown state is not a fill
+                return {"state": "unknown", **last}
             time.sleep(max(0.0, poll_s))
         return {"state": "timeout" if last else "pending", **last}
 
@@ -338,7 +515,10 @@ class ExnessError(RuntimeError):
     def __init__(self, status: int, code: Any, message: str, record: dict[str, Any]):
         self.status = status
         self.code = code
-        hint = ERROR_HINTS.get(int(code)) if isinstance(code, int) or (isinstance(code, str) and code.isdigit()) else None
+        try:
+            hint = ERROR_HINTS.get(int(code))       # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            hint = None
         self.hint = hint or ""
         detail = f"HTTP {status}" + (f" · {code}" if code is not None else "")
         super().__init__(f"{detail}: {message}" + (f" — {hint}" if hint else "") + f" ({record.get('path', '')})")
@@ -392,29 +572,52 @@ class ExnessBroker:
         return float(self.equity_value)
 
     def positions(self) -> list[dict[str, Any]]:
-        """Open positions, normalised to the keys the engine and UI already read."""
+        """Open positions, normalised to the keys the engine and UI already read.
+
+        The venue's position object carries ``direction`` (not ``side``) and no per-position
+        profit, so P&L is left at 0.0 rather than invented: the caller has a mark and can
+        compute it. SL/TP live on separate SLTP orders, not on the position payload.
+        """
         out = []
         for row in self.client.positions():
             out.append({
                 "id": str(row.get("position_id") or row.get("id") or ""),
                 "symbol": str(row.get("instrument") or row.get("symbol") or ""),
-                "side": str(row.get("side") or "").lower(),
+                "side": str(row.get("direction") or row.get("side") or "").lower(),
                 "lots": float(row.get("volume") or 0.0),
                 "entry": float(row.get("open_price") or row.get("price") or 0.0),
-                "stop": float(row.get("stop_loss") or 0.0) or None,
-                "target": float(row.get("take_profit") or 0.0) or None,
-                "pnl": float(row.get("profit") or 0.0),
+                "stop": float(row.get("stop_loss") or row.get("stop_loss_price") or 0.0) or None,
+                "target": float(row.get("take_profit") or row.get("take_profit_price") or 0.0) or None,
+                "pnl": float(row.get("profit") or 0.0),   # not in the schema → 0.0, not a guess
+                "swap": float(row.get("swap") or 0.0),
+                "commission": float(row.get("commission") or 0.0),
                 "raw": row,
             })
         return out
 
     def open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
-        """Pending orders are not documented for this client yet: report none, do not guess."""
-        return []
+        """Pending and SLTP orders from the snapshot."""
+        out = []
+        for row in self.client.snapshot().get("orders") or []:
+            if symbol and str(row.get("instrument", "")).upper() != symbol.upper():
+                continue
+            out.append({"id": str(row.get("order_id", "")),
+                        "symbol": str(row.get("instrument", "")),
+                        "side": str(row.get("direction", "")).lower(),
+                        "type": str(row.get("order_type", "")),
+                        "price": float(row.get("price") or 0.0),
+                        "lots": float(row.get("volume") or 0.0),
+                        "state": str(row.get("state", "")),
+                        "raw": row})
+        return out
 
     def cancel_order(self, order_id: str, symbol: str | None = None) -> dict[str, Any]:
-        return {"ok": False, "order_id": order_id,
-                "reason": "cancel is not implemented for the Exness adapter (no documented endpoint)"}
+        """Cancel a pending or SLTP order (documented: DELETE …/orders/{order_id})."""
+        try:
+            ack = self.client.cancel_order(order_id, client_request_id=f"cancel-{order_id}")
+        except ExnessError as exc:
+            return {"ok": False, "order_id": order_id, "reason": str(exc)}
+        return {"ok": True, "order_id": order_id, "operation_id": ack.get("operation_id")}
 
     # ------------------------------------------------------------------ writes
     def submit(self, order: Any) -> Any:
@@ -494,6 +697,36 @@ class ExnessBroker:
                            exit=float(price or row["entry"]), size=row["lots"], pnl=row["pnl"],
                            fees=0.0, r_multiple=0.0, reason=reason, opened_at="",
                            closed_at=time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()))
+
+    def modify_stop(self, symbol: str, new_stop: float) -> dict[str, Any]:
+        """Move the stop for ``symbol``, or say why it could not be moved.
+
+        Exness keeps SL/TP on SLTP orders attached to a position, not on the position, so this
+        finds the SLTP order for our position and patches it; if there is none it creates one.
+        A ``False``/``ok: False`` here is important: the caller rolls the local stop back
+        instead of believing a stop that the venue does not hold.
+        """
+        live = [p for p in self.positions() if p["symbol"] == symbol]
+        if not live:
+            return {"ok": False, "reason": f"no open position for {symbol}"}
+        position = live[0]
+        existing = next((o for o in self.open_orders(symbol) if o["type"] == "sltp"), None)
+        price = self.instrument.price_str(new_stop)
+        try:
+            if existing:
+                ack = self.client.modify_order(existing["id"], stop_loss=float(price),
+                                               client_request_id=f"sl-{existing['id']}-{int(time.time())}")
+            else:
+                ack = self.client._send(
+                    "POST", self.client._ap(),
+                    f"/v1/trading/accounts/{self.client.account_id}/orders",
+                    {"position_id": position["id"], "type": "sltp", "stop_loss": price},
+                    idempotency_key=f"sltp-{position['id']}-{int(time.time())}",
+                )
+        except ExnessError as exc:
+            return {"ok": False, "reason": str(exc), "stop": new_stop}
+        return {"ok": True, "stop": new_stop, "operation_id": ack.get("operation_id"),
+                "position_id": position["id"]}
 
     def close_symbol(self, symbol: str) -> dict[str, Any]:
         live = [p for p in self.positions() if p["symbol"] == symbol]

@@ -75,6 +75,11 @@ class RiskDecision:
 def _round_price(price: float, market: str, tick: float | None = None) -> float:
     if market == "idx":
         return round_to_tick(price, "nearest", tick or idx_tick_size(price))
+    if market == "fx":
+        # a CFD quote has a hard tick (0.01 on gold, 0.00001 on EURUSD). Rounding to
+        # "6 decimals because the price is > 1" produces a price the venue rejects.
+        step = tick or 0.01
+        return round(round(price / step) * step, 10)
     digits = 8 if price < 1 else 6 if price < 100 else 4 if price < 10_000 else 2
     return round(price, digits)
 
@@ -107,6 +112,14 @@ def round_trip_cost_pct(
         buy = float(profile.get("commission_buy_pct", 0.15)) / 100.0
         sell = float(profile.get("commission_sell_pct", 0.25)) / 100.0
         return buy + sell + (spread_bps + 2 * slippage_bps) / 10_000.0
+    if market == "fx":
+        # CFDs are paid for in spread, not commission. swap_bps_per_day is the overnight
+        # financing: a gold position held for a day pays it both ways, so a strategy whose
+        # target is inside the swap cost is a strategy that loses by waiting.
+        commission_bps = float(profile.get("commission_bps", 0.0))
+        swap_bps = float(profile.get("swap_bps_per_day", 0.0)) * float(
+            profile.get("expected_hold_days", 0.0))
+        return (2 * commission_bps + spread_bps + 2 * slippage_bps + swap_bps) / 10_000.0
     commission_bps = float(profile.get("commission_bps", 5.5))
     return (2 * commission_bps + spread_bps + 2 * slippage_bps) / 10_000.0
 
@@ -145,6 +158,8 @@ def build_plan(
     elif market == "idx":
         max_lev = 1.0
     else:
+        # crypto and CFDs share the cap: the venue offers 1:500 on gold, and using it is how
+        # a 3% stop becomes an account-ending event
         max_lev = float(risk_cfg.get("max_leverage", 3))
 
     tick = tick_size
@@ -226,8 +241,11 @@ def build_plan(
         risk_pct = risk_pct / mult
         caps.append(f"risk_scale_{mult:.2f}x")
     risk_cash = equity * risk_pct / 100.0
-    size = risk_cash / stop_distance
-    notional = size * entry
+    # a lot is not one unit: on XAUUSD one lot is 100 oz, so "risk per lot" is
+    # stop_distance × contract_size. Without this, gold risk is understated 100x.
+    value_per_unit = float(profile.get("contract_size", 100.0) or 100.0) if market == "fx" else 1.0
+    size = risk_cash / (stop_distance * value_per_unit)
+    notional = size * value_per_unit * entry
     size_cap_reasons: list[str] = []
 
     max_margin_pct = float(
@@ -240,7 +258,13 @@ def build_plan(
         size_cap_reasons.append(f"margin cap {max_margin_pct}% of equity at {max_lev:g}x")
 
     max_symbol_pct = float(risk_cfg.get("max_symbol_exposure_pct", 20.0))
-    max_notional_by_exposure = equity * max_symbol_pct / 100.0
+    if market == "fx":
+        # A CFD's notional is levered by construction: capping notional at 20% of equity
+        # would cap the *position* at 20% and make gold untradable at any sane size. The
+        # capital actually committed is the margin, so that is what is capped here.
+        max_notional_by_exposure = equity * max_symbol_pct / 100.0 * max_lev
+    else:
+        max_notional_by_exposure = equity * max_symbol_pct / 100.0
     if notional > max_notional_by_exposure:
         notional = max_notional_by_exposure
         caps.append("exposure_cap")
@@ -254,9 +278,9 @@ def build_plan(
             caps.append("liquidity_cap")
             size_cap_reasons.append(f"liquidity cap {participation*100:.2f}% of median bar volume")
 
-    if notional < size * entry:  # recompute size from the capped notional
-        size = notional / entry
-        risk_cash = size * stop_distance
+    if notional < size * value_per_unit * entry:  # recompute size from the capped notional
+        size = notional / (value_per_unit * entry)
+        risk_cash = size * value_per_unit * stop_distance
 
     # venue rounding
     lots = None
@@ -268,14 +292,35 @@ def build_plan(
                 f"minimum 1 lot (100 shares, {entry*100:,.0f} IDR) exceeds the risk budget"
             )
             size = 0.0
+    elif market == "fx":
+        # size is in lots; the venue's step is the unit of account. Rounding down keeps the
+        # risk at or below the budget; falling under volume_min is a refusal, never a bump up.
+        step = float(profile.get("volume_step", 0.01) or 0.01)
+        volume_min = float(profile.get("volume_min", step) or step)
+        volume_max = float(profile.get("volume_max", 100.0) or 100.0)
+        lots = math.floor(size / step + 1e-9) * step
+        lots = round(lots, 8)
+        if lots + 1e-9 < volume_min:
+            rejections.append(
+                f"size {size:.4f} lots is below the venue minimum {volume_min:g} lot "
+                f"(step {step:g}); the smallest tradable size would risk "
+                f"{volume_min * value_per_unit * stop_distance:,.2f} instead of the approved "
+                f"{size * value_per_unit * stop_distance:,.2f}"
+            )
+            size = 0.0
+        elif lots > volume_max:
+            rejections.append(f"size {lots:g} lots exceeds the venue maximum {volume_max:g}")
+            size = 0.0
+        else:
+            size = lots
     else:
         size = _round_down(size, 6)
         if size <= 0:
             rejections.append("size rounds to zero at the venue precision")
 
     if size > 0:
-        notional = size * entry
-        risk_cash = size * stop_distance
+        notional = size * value_per_unit * entry
+        risk_cash = size * value_per_unit * stop_distance
     margin = notional / max_lev if max_lev > 0 else notional
 
     if risk_cash > equity * risk_pct / 100.0 * 1.05:

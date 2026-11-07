@@ -22,6 +22,7 @@
     <div class="market-switch" role="tablist" aria-label="Market">
       <button class="switch-btn active" data-market="idx" role="tab">IDX / IHSG</button>
       <button class="switch-btn" data-market="crypto" role="tab">Crypto Perps</button>
+      <button class="switch-btn" data-market="fx" role="tab">Gold / FX</button>
     </div>
 
     <div class="topbar-right">
@@ -187,6 +188,7 @@
           <select id="bt-market" class="input">
             <option value="crypto">crypto</option>
             <option value="idx">idx</option>
+            <option value="fx">fx (gold)</option>
           </select>
           <button class="btn" id="bt-run">Run walk-forward</button>
         </div>
@@ -237,7 +239,7 @@
       <div class="terminal-header">
         <div class="th-title">
           <h2>Trading Office</h2>
-          <span class="muted small">Multi-gateway algorithmic terminal · IDX &amp; crypto perpetuals</span>
+          <span class="muted small">Multi-gateway algorithmic terminal · IDX, crypto perpetuals &amp; gold (Exness)</span>
         </div>
         <div class="th-badges">
           <div class="health-badge is-warn" id="server-health"

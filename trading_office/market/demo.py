@@ -62,12 +62,45 @@ CRYPTO_REFERENCE: dict[str, tuple[str, float, float]] = {
 }
 
 
+#: CFD reference prices so the gold chart is not a bitcoin chart with a different label.
+#: (symbol: (name, price, volatility %) at an M15-ish resolution)
+FX_REFERENCE: dict[str, tuple[str, float, float]] = {
+    "XAUUSD": ("Gold vs USD", 2_650.0, 0.10),
+    "XAGUSD": ("Silver vs USD", 31.20, 0.18),
+    "EURUSD": ("Euro vs USD", 1.0850, 0.035),
+    "GBPUSD": ("Pound vs USD", 1.2680, 0.040),
+    "USDJPY": ("USD vs Yen", 152.30, 0.040),
+    "AUDUSD": ("Aussie vs USD", 0.6580, 0.040),
+    "US30": ("Dow Jones 30", 43_200.0, 0.09),
+    "NAS100": ("Nasdaq 100", 20_400.0, 0.13),
+}
+
+
 def _seed(symbol: str) -> int:
     digest = hashlib.sha256(symbol.encode("utf-8")).hexdigest()
     return int(digest[:12], 16)
 
 
-def _grid(now: dt.datetime, timeframe: str, count: int, *, idx_shape: bool = False) -> list[dt.datetime]:
+def _fx_is_open(ts: dt.datetime) -> bool:
+    """FX/CFD week: closes Friday 21:00 UTC, reopens Sunday 22:00 UTC.
+
+    This is what makes gold different from crypto in the data itself: a bar grid that ignores
+    the weekend produces signals on a market that was not trading, and hides the Sunday gap
+    that the risk gate is supposed to see.
+    """
+    utc = ts.astimezone(dt.timezone.utc)
+    weekday, hour = utc.weekday(), utc.hour
+    if weekday == 5:                      # Saturday: closed all day
+        return False
+    if weekday == 4:                      # Friday: closes at 21:00 UTC
+        return hour < 21
+    if weekday == 6:                      # Sunday: reopens at 22:00 UTC
+        return hour >= 22
+    return True
+
+
+def _grid(now: dt.datetime, timeframe: str, count: int, *, idx_shape: bool = False,
+          fx_shape: bool = False) -> list[dt.datetime]:
     """Timestamps of the last ``count`` closed bars, oldest first."""
     step = {
         "1m": dt.timedelta(minutes=1),
@@ -90,6 +123,9 @@ def _grid(now: dt.datetime, timeframe: str, count: int, *, idx_shape: bool = Fal
     out: list[dt.datetime] = []
     while len(out) < count:
         if idx_shape and not _is_session_bar(cursor, timeframe):
+            cursor -= step
+            continue
+        if fx_shape and not _fx_is_open(cursor):
             cursor -= step
             continue
         out.append(cursor)
@@ -117,9 +153,10 @@ def _walk(
     now: dt.datetime,
     drift: float | None = None,
     idx_shape: bool = False,
+    fx_shape: bool = False,
 ) -> list[dict[str, Any]]:
     rng = random.Random(_seed(symbol) + count)
-    times = _grid(now, timeframe, count, idx_shape=idx_shape)
+    times = _grid(now, timeframe, count, idx_shape=idx_shape, fx_shape=fx_shape)
 
     # a few regimes so trend filters and MA crossovers actually have something to work on
     regime_len = max(20, count // 9)
@@ -138,6 +175,9 @@ def _walk(
         elif rng.random() < 0.04:
             shock *= 0.25
         open_ = current
+        if fx_shape and bars and (times[i] - times[i - 1]) > dt.timedelta(hours=6):
+            # the weekend gap is real: gold does not resume where it left off
+            open_ = current * (1 + rng.gauss(0, vol_pct / 100.0 * 1.5))
         close = open_ * (1 + regime + shock)
         span = abs(shock) + vol_pct / 100.0 * rng.uniform(0.4, 1.1)
         high = max(open_, close) * (1 + span * rng.uniform(0.15, 0.7))
@@ -178,6 +218,42 @@ def crypto_bars(
     now = now or dt.datetime.now(dt.timezone.utc)
     return _walk(symbol, count=count, price=price, vol_pct=vol, timeframe=timeframe, now=now,
                  drift=0.0004, idx_shape=False)
+
+
+def fx_bars(
+    symbol: str,
+    timeframe: str = "15m",
+    count: int = 400,
+    *,
+    now: dt.datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Synthetic CFD candles: 24/5, weekend gap, gold-scale prices."""
+    name, price, vol = FX_REFERENCE.get(symbol.upper(), (symbol.upper(), 100.0, 0.12))
+    now = now or dt.datetime.now(dt.timezone.utc)
+    bars = _walk(symbol.upper(), count=count, price=price, vol_pct=vol, timeframe=timeframe,
+                 now=now, drift=0.0001, fx_shape=True)
+    for bar in bars:                       # CFD prices carry 3 decimals on gold, 5 on FX
+        digits = 2 if price > 100 else (3 if price > 10 else 5)
+        for key in ("open", "high", "low", "close"):
+            bar[key] = round(bar[key], digits)
+    return bars
+
+
+def fx_quote(symbol: str, bars: list[dict[str, Any]] | None = None,
+             *, now: dt.datetime | None = None) -> dict[str, Any]:
+    bars = bars or fx_bars(symbol, "15m", 60, now=now)
+    last = bars[-1]
+    spread = spread_bps(symbol.upper(), last["close"], "fx")
+    half = last["close"] * spread / 2 / 10_000
+    return {
+        "symbol": symbol.upper(),
+        "last": last["close"],
+        "bid": round(last["close"] - half, 5),
+        "ask": round(last["close"] + half, 5),
+        "spread_bps": spread,
+        "source": "synthetic",
+        "timestamp": None,
+    }
 
 
 def idx_bars(
@@ -247,11 +323,38 @@ def spread_bps(symbol: str, price: float, market: str) -> float:
 
         tick = idx_tick_size(price)
         return round(2 * tick / price * 10_000.0 * rng.uniform(0.8, 2.2), 2)
+    if market == "fx":
+        # CFDs are priced off a spread, not a fee: gold is typically 15–35 cents wide
+        # (~0.6–1.4 bps at $2,650), FX majors ~0.5–1.5 bps, and it doubles at rollover
+        typical = {"XAUUSD": 1.0, "XAGUSD": 2.5, "US30": 1.2, "NAS100": 1.0}.get(symbol.upper(), 0.9)
+        return round(typical * rng.uniform(0.7, 2.3), 2)
     return round(rng.uniform(1.5, 7.0), 2)
+
+
+def _resample(bars: list[dict[str, Any]], factor: int) -> list[dict[str, Any]]:
+    """Aggregate ``factor`` lower-timeframe bars into one, so HTF and LTF agree."""
+    out = []
+    for i in range(0, len(bars), factor):
+        chunk = bars[i : i + factor]
+        if not chunk:
+            continue
+        out.append(
+            {
+                "time": chunk[0]["time"],
+                "open": chunk[0]["open"],
+                "high": max(b["high"] for b in chunk),
+                "low": min(b["low"] for b in chunk),
+                "close": chunk[-1]["close"],
+                "volume": sum(float(b.get("volume") or 0) for b in chunk),
+            }
+        )
+    return out
 
 
 def htf_bars(symbol: str, market: str, factor: int, count: int, *, now: dt.datetime | None = None) -> list[dict[str, Any]]:
     """Higher-timeframe series (resampled, so it is consistent with the LTF series)."""
+    if market == "fx":
+        return _resample(fx_bars(symbol, "15m", count * factor, now=now), factor)
     if market == "idx":
         ltf = idx_bars(symbol, "1d", count * factor, now=now)
     else:

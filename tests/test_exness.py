@@ -121,26 +121,59 @@ def test_risk_sizing_refuses_instead_of_bumping_to_the_minimum_lot():
     assert bigger["risk_pct_actual"] <= 0.5 + 1e-9
 
 
-def test_margin_cap_blocks_a_plan_that_fits_the_lot_step_but_not_the_budget():
+def test_the_margin_cap_sizes_the_trade_down_instead_of_refusing_it():
+    """Margin is a sizing constraint: the position shrinks, the risk falls with it.
+
+    Refusing here would refuse every gold trade on a 1:3 account, because a lot's notional is
+    large by construction — the cap that matters is the capital committed, not the notional.
+    """
     gold = FxInstrument("XAUUSD", volume_min=0.01, volume_step=0.01, contract_size=100,
                         margin_rate=0.0333)
-    plan = lots_for_risk(equity=500, risk_pct=2.0, entry=2650, stop=2640, instrument=gold,
-                         max_margin_pct=8)
-    assert plan["ok"] is False
-    assert "margin" in plan["reason"]
+    # 0.01 lot of gold = 100 oz × 2650 = $265,000 notional = $88,333 of margin at 1:3, so
+    # the cap allows 1,600/88,333 = 0.018 lots on $20k: floor to 0.01 and the risk follows
+    plan = lots_for_risk(equity=20_000, risk_pct=2.0, entry=2650, stop=2640, instrument=gold,
+                         max_margin_pct=8, leverage=3)
+    assert plan["ok"] is True
+    assert plan["capped_by"] == "margin"
+    assert plan["lots"] == 0.01
+    assert plan["margin"] == pytest.approx(883.33, abs=0.01)
+    assert plan["margin"] <= plan["margin_cap"] + 1e-6
+
+    # and when the cap leaves less than the venue minimum, that *is* a refusal with a reason
+    tiny = lots_for_risk(equity=500, risk_pct=2.0, entry=2650, stop=2640, instrument=gold,
+                         max_margin_pct=8, leverage=3)
+    assert tiny["ok"] is False
+    assert "below the venue minimum" in tiny["reason"]
 
 
 # --------------------------------------------------------------------------- stub venue
 class _Venue:
-    """A local Exness-shaped server that verifies what it receives."""
+    """A local server that speaks the *documented* Exness contract.
+
+    Status codes, error bodies (``{code, error_message}``), the 202 ACK, the snapshot shape
+    and the operation vocabulary (``pending`` / ``confirmed`` / ``rejected``) all follow the
+    published OpenAPI document. A stub that only matches what the client happens to send
+    would happily pass while the client is wrong.
+    """
 
     def __init__(self, public_key):
         self.public_key = public_key
         self.calls: list[dict] = []
-        self.final_status = "filled"
-        self.final_price = 2651.25
+        self.final_status = "confirmed"
+        self.final_price = "2651.25"
+        self.close_only = False
         self.fail_with: tuple[int, dict] | None = None
-        self.final_after_polls = 0
+        self.positions: list[dict] = [{
+            "position_id": "2001", "direction": "buy", "instrument": "XAUUSD",
+            "initial_volume": "0.01", "volume": "0.01", "open_price": "2650.00",
+            "state": "open", "margin_rate": "0.0333", "commission": "-0.07", "swap": "0",
+        }]
+        self.sltp: list[dict] = [{
+            "order_id": "3001", "order_type": "sltp", "instrument": "XAUUSD",
+            "direction": "sell", "volume": "0.01", "stop_loss_price": "2632.00",
+            "take_profit_price": "2686.00", "state": "placed",
+        }]
+        self.candles: list[dict] = []
 
     def handler(self):
         venue = self
@@ -162,42 +195,76 @@ class _Venue:
                     payload = verify_headers(venue.public_key, dict(self.headers), method, path, body)
                 except Exception as exc:  # noqa: BLE001 - the point is to report it
                     venue.calls.append({"path": path, "auth_error": str(exc)})
-                    return self._reply(401, {"error_code": 1001, "error_message": f"AUTH_INVALID_SIGNATURE: {exc}"})
+                    return self._reply(401, {"code": 1001, "error_message": "AUTH_INVALID_SIGNATURE"})
+                parsed = json.loads(body) if body else None
                 venue.calls.append({"path": path, "method": method, "payload": payload,
-                                    "body": json.loads(body) if body else None})
+                                    "body": parsed})
                 if venue.fail_with:
                     return self._reply(*venue.fail_with)
-                if path.startswith("/v1/trading/access-point"):
+                clean, _, query = path.partition("?")
+
+                if clean == "/v1/trading/access-point":
                     return self._reply(200, {"access_point": venue.base, "account_id": "777"})
-                if path.endswith("/account"):
+                if clean.endswith("/account"):
                     return self._reply(200, {"account_id": "777", "balance": "1000.00",
                                              "equity": "1012.50", "currency": "USD",
                                              "leverage": "30", "trade_mode": "full"})
-                if path.endswith("/positions") and method == "GET":
-                    return self._reply(200, {"positions": [
-                        {"position_id": "p1", "instrument": "XAUUSD", "side": "buy",
-                         "volume": "0.01", "open_price": "2650.00", "profit": "1.25",
-                         "stop_loss": "2632.00", "take_profit": "2686.00"}]})
-                if path.endswith("/positions") and method == "POST":
-                    return self._reply(200, {"operation_id": "789",
-                                             "client_request_id": (json.loads(body) or {}).get("x", "order"),
+                if clean.endswith("/limits"):
+                    return self._reply(200, {"limits": {"candles": {"count": 1000}}})
+                if clean.endswith("/conditions"):
+                    return self._reply(200, {"volume_min": "0.01", "volume_max": "200",
+                                             "volume_step": "0.01", "contract_size": "100",
+                                             "point_digits": 2, "margin_rate": "0.0333"})
+                if "/candles" in clean:
+                    return self._reply(200, {"candles": venue.candles})
+                if clean.endswith("/snapshot"):
+                    return self._reply(200, {
+                        "orders": venue.sltp,
+                        "positions": venue.positions,
+                        "account_state": {"balance": "1000.00", "equity": "1012.50",
+                                          "used_margin": "88.25"},
+                    })
+                if clean.endswith("/positions"):
+                    if method == "GET":
+                        return self._reply(200, {"positions": venue.positions})
+                    if venue.close_only:
+                        return self._reply(403, {"code": 2002, "error_message": "ACCOUNT_CLOSE_ONLY"})
+                    return self._reply(202, {"operation_id": "789",
+                                             "client_request_id": "x",
                                              "status": "accepted"})
-                if "/operations/" in path:
+                if "/operations/" in clean:
                     polls = getattr(venue, "_polls", 0)
                     venue._polls = polls + 1
                     if polls < venue.final_after_polls:
                         return self._reply(200, {"operation_id": "789", "status": "pending"})
-                    return self._reply(200, {"operation_id": "789", "status": venue.final_status,
-                                             "price": venue.final_price, "commission": "-0.07"})
-                if path.endswith("/close"):
-                    return self._reply(200, {"operation_id": "790", "status": "accepted"})
-                return self._reply(404, {"error_message": "no such route"})
+                    out = {"operation_id": "789", "status": venue.final_status}
+                    if venue.final_status == "confirmed":
+                        out.update({"price": venue.final_price, "commission": "-0.07"})
+                    else:
+                        out.update({"error_code": 6001, "error_message": "EXECUTION_REJECTED"})
+                    return self._reply(200, out)
+                if "/positions/" in clean:            # DELETE = close (or partial close)
+                    venue.closed = {"path": path, "volume": query}
+                    return self._reply(202, {"operation_id": "790", "status": "accepted"})
+                if "/orders/" in clean:                # DELETE = cancel, PATCH = modify
+                    venue.order_call = {"method": method, "path": path, "body": parsed}
+                    return self._reply(202, {"operation_id": "791", "status": "accepted"})
+                if clean.endswith("/orders"):           # POST = new pending / SLTP order
+                    venue.order_call = {"method": method, "path": path, "body": parsed}
+                    return self._reply(202, {"operation_id": "792", "status": "accepted"})
+                return self._reply(404, {"code": 3000, "error_message": "REQUEST_INVALID"})
 
             def do_GET(self):  # noqa: N802
                 self._handle("GET")
 
             def do_POST(self):  # noqa: N802
                 self._handle("POST")
+
+            def do_DELETE(self):  # noqa: N802
+                self._handle("DELETE")
+
+            def do_PATCH(self):  # noqa: N802
+                self._handle("PATCH")
 
             def log_message(self, *args):
                 pass
@@ -211,6 +278,7 @@ def venue():
     stub = _Venue(signer.private_key.public_key())
     server = HTTPServer(("127.0.0.1", 0), stub.handler())
     stub.base = f"http://127.0.0.1:{server.server_port}"
+    stub.final_after_polls = 0
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -221,8 +289,7 @@ def venue():
 
 
 def _client(signer, stub, **over):
-    client = ExnessClient(signer=signer, account_id="777", gateway_host=stub.base, timeout=5, **over)
-    return client
+    return ExnessClient(signer=signer, account_id="777", gateway_host=stub.base, timeout=5, **over)
 
 
 def _gold():
@@ -235,13 +302,11 @@ def test_discovery_is_cached_and_uses_the_gateway_host(venue):
     signer, stub = venue
     client = _client(signer, stub)
 
-    first = client.resolve_access_point()
-    second = client.resolve_access_point()
+    assert client.resolve_access_point() == stub.base == client.resolve_access_point()
 
-    assert first == stub.base == second
-    discovery_calls = [c for c in stub.calls if "access-point" in c["path"]]
-    assert len(discovery_calls) == 1, "discovery is rate limited: it must be cached"
-    assert discovery_calls[0]["payload"]["path"] == "/v1/trading/access-point?account_id=777"
+    discovery = [c for c in stub.calls if "access-point" in c["path"]]
+    assert len(discovery) == 1, "discovery is rate limited: it must be cached"
+    assert discovery[0]["payload"]["path"] == "/v1/trading/access-point?account_id=777"
 
 
 def test_every_call_reaches_the_stub_with_a_valid_signature(venue):
@@ -249,46 +314,86 @@ def test_every_call_reaches_the_stub_with_a_valid_signature(venue):
     client = _client(signer, stub)
 
     client.account()
-    client.positions()
+    client.snapshot()
 
     assert all("auth_error" not in c for c in stub.calls), stub.calls
     assert [c["path"].split("?")[0].rsplit("/", 1)[-1] for c in stub.calls] == [
-        "access-point", "account", "positions"]
+        "access-point", "account", "snapshot"]
 
 
 def test_a_tampered_body_is_refused_by_the_venue(venue):
     """Proves the stub really verifies: signing body A and sending body B must 401."""
     signer, stub = venue
-    client = _client(signer, stub)
-    client.resolve_access_point()
+    path = "/v1/trading/accounts/777/positions"
+    good = signer.headers("POST", path, b'{"volume":"0.01"}', idempotency_key="k1")
+    swapped = dict(good)
+    swapped["EXN-DATA"] = signer.headers("POST", path, b'{"volume":"9.00"}',
+                                         idempotency_key="k1")["EXN-DATA"]
 
-    original = signer.headers("POST", "/v1/trading/accounts/777/positions", b'{"volume":"0.01"}',
-                              idempotency_key="k1")
-    swapped = dict(original)
-    swapped["EXN-DATA"] = signer.headers("POST", "/v1/trading/accounts/777/positions",
-                                         b'{"volume":"9.00"}', idempotency_key="k1")["EXN-DATA"]
     status, data = exness._default_transport(
-        "POST", stub.base + "/v1/trading/accounts/777/positions", swapped, b'{"volume":"0.01"}', 5)
+        "POST", stub.base + path, swapped, b'{"volume":"0.01"}', 5)
 
     assert status == 401
-    assert data["error_code"] == 1001
+    assert data["code"] == 1001
 
 
-def test_venue_errors_carry_an_actionable_hint(venue):
+def test_venue_errors_use_the_documented_code_field_and_carry_a_hint(venue):
     signer, stub = venue
     client = _client(signer, stub)
     client.resolve_access_point()
-    stub.fail_with = (400, {"error_code": 5000, "error_message": "invalid volume"})
+    stub.fail_with = (422, {"code": 5006, "error_message": "TRADING_RULE_INSUFFICIENT_MARGIN"})
 
     with pytest.raises(ExnessError) as excinfo:
-        client.positions()
+        client.snapshot()
 
-    assert "volume_min" in str(excinfo.value)
-    assert excinfo.value.code == 5000
+    assert excinfo.value.code == 5006
+    assert "INSUFFICIENT_MARGIN" in str(excinfo.value)
+    assert excinfo.value.hint
+
+
+def test_close_only_account_is_reported_not_retried(venue):
+    signer, stub = venue
+    stub.close_only = True
+    broker = ExnessBroker(client=_client(signer, stub), instrument=_gold())
+
+    fill = broker.submit(Order(symbol="XAUUSD", side="buy", quantity=0.01, price_hint=2650.0,
+                               client_id="to-co", market="fx"))
+
+    assert fill.ok is False
+    assert "CLOSE_ONLY" in fill.message or "close" in fill.message.lower()
+
+
+def test_conditions_override_the_instrument_defaults(venue):
+    """volume_min/max/step come from the venue, not from a docs example."""
+    signer, stub = venue
+
+    raw = _client(signer, stub).conditions("XAUUSD")
+    gold = FxInstrument.from_conditions("XAUUSD", raw)
+
+    assert gold.volume_max == 200.0
+    assert gold.contract_size == 100.0
+    assert gold.price_step == 0.01          # from point_digits = 2
+    assert gold.price_str(2650.567) == "2650.57"
+
+
+def test_candles_are_asked_for_with_a_signed_query_string(venue):
+    signer, stub = venue
+    stub.candles = [{"time": "2026-03-16T12:45:00+00:00", "open": 2650.0, "high": 2651.0,
+                     "low": 2649.0, "close": 2650.5, "volume": 120}]
+
+    rows = _client(signer, stub).candles("XAUUSD", "M15", start="2026-03-16T12:00:00+00:00",
+                                         count=400)
+
+    assert rows[0]["close"] == 2650.5
+    call = next(c for c in stub.calls if "/candles" in c["path"])
+    assert call["payload"]["path"] == call["path"]      # signed exactly as transmitted
+    assert "timeframe=M15" in call["path"]
+    assert "instrument=XAUUSD" in call["path"]
+    assert "%3A" in call["path"]                        # the ISO timestamp is encoded once
 
 
 # --------------------------------------------------------------------------- broker
-def test_submit_waits_for_the_final_state_and_reports_a_real_fill(venue):
+def test_submit_waits_for_confirmed_and_reports_a_real_fill(venue):
     signer, stub = venue
     broker = ExnessBroker(client=_client(signer, stub), instrument=_gold(), equity_value=1000)
 
@@ -299,19 +404,31 @@ def test_submit_waits_for_the_final_state_and_reports_a_real_fill(venue):
     assert fill.price == 2651.25
     assert fill.quantity == 0.02
     assert fill.order_id == "789"
-    assert fill.fee == 0.07
+    assert fill.fee == 0.07                                 # commission arrives negative
     sent = next(c for c in stub.calls if c["method"] == "POST")
-    assert sent["body"]["instrument"] == "XAUUSD"
-    assert sent["body"]["volume"] == "0.02"
+    assert sent["body"] == {"instrument": "XAUUSD", "side": "buy", "volume": "0.02",
+                            "stop_loss": "2632", "take_profit": "2686",
+                            "comment": "trading-office"}
     assert sent["payload"]["idempotency_key"] == "to-1"
-    assert sent["body"]["stop_loss"] == 2632.0        # the hard stop travels with the order
 
 
-def test_an_accepted_order_that_never_finalises_is_not_reported_as_a_fill(venue):
-    """The ACK is not the result: 'pending' must never become a phantom position."""
+def test_pending_while_the_venue_decides_becomes_a_fill_once_confirmed(venue):
+    signer, stub = venue
+    stub.final_after_polls = 2
+    broker = ExnessBroker(client=_client(signer, stub), instrument=_gold(), fill_timeout_s=5)
+
+    fill = broker.submit(Order(symbol="XAUUSD", side="buy", quantity=0.01, price_hint=2650.0,
+                               client_id="to-poll", market="fx"))
+
+    assert fill.ok is True
+    polls = [c for c in stub.calls if "/operations/" in c["path"]]
+    assert len(polls) == 3
+
+
+def test_an_order_that_never_confirms_is_not_reported_as_a_fill(venue):
     signer, stub = venue
     stub.final_status = "pending"
-    broker = ExnessBroker(client=_client(signer, stub), instrument=_gold())
+    broker = ExnessBroker(client=_client(signer, stub), instrument=_gold(), fill_timeout_s=0.6)
 
     fill = broker.submit(Order(symbol="XAUUSD", side="buy", quantity=0.01, price_hint=2650.0,
                                client_id="to-2", market="fx"))
@@ -368,16 +485,28 @@ def test_an_unconfigured_venue_raises_instead_of_falling_back_to_paper():
         exness.from_settings(Settings())
 
 
-def test_positions_are_normalised_for_the_engine(venue):
+def test_positions_are_normalised_from_the_snapshot(venue):
     signer, stub = venue
     broker = ExnessBroker(client=_client(signer, stub), instrument=_gold())
 
     rows = broker.positions()
 
     assert rows[0]["symbol"] == "XAUUSD"
+    assert rows[0]["side"] == "buy"            # the venue says "direction"
     assert rows[0]["lots"] == 0.01
-    assert rows[0]["stop"] == 2632.0
-    assert rows[0]["target"] == 2686.0
+    assert rows[0]["entry"] == 2650.0
+    assert rows[0]["pnl"] == 0.0               # not in the schema → 0.0, never a guess
+    assert rows[0]["swap"] == 0.0
+
+
+def test_the_stop_lives_on_an_sltp_order_not_on_the_position(venue):
+    signer, stub = venue
+    broker = ExnessBroker(client=_client(signer, stub), instrument=_gold())
+
+    orders = broker.open_orders("XAUUSD")
+
+    assert orders[0]["type"] == "sltp"
+    assert orders[0]["id"] == "3001"
 
 
 def test_equity_comes_from_the_venue_not_from_a_default(venue):
@@ -386,22 +515,60 @@ def test_equity_comes_from_the_venue_not_from_a_default(venue):
     assert broker.equity() == 1012.50
 
 
-def test_close_symbol_reports_what_it_actually_closed(venue):
+def test_close_symbol_uses_delete_on_the_position(venue):
     signer, stub = venue
     broker = ExnessBroker(client=_client(signer, stub), instrument=_gold())
 
     result = broker.close_symbol("XAUUSD")
 
     assert result["ok"] is True
-    assert result["volume"] == 0.01
     assert result["operation_id"] == "790"
+    assert stub.closed["path"].startswith("/v1/trading/accounts/777/positions/2001")
 
 
-def test_base64url_helpers_are_padding_free():
-    text = exness.b64url(b"any bytes at all")
-    assert "=" not in text
-    assert exness.unb64url(text) == b"any bytes at all"
-    assert base64.urlsafe_b64decode(text + "==") == b"any bytes at all"
+def test_modify_stop_patches_the_sltp_order(venue):
+    signer, stub = venue
+    broker = ExnessBroker(client=_client(signer, stub), instrument=_gold())
+
+    moved = broker.modify_stop("XAUUSD", 2640.0)
+
+    assert moved["ok"] is True
+    assert stub.order_call["method"] == "PATCH"
+    assert stub.order_call["path"].startswith("/v1/trading/accounts/777/orders/3001")
+    assert stub.order_call["body"] == {"stop_loss": "2640"}
+
+
+def test_a_stop_that_cannot_move_says_so(venue):
+    signer, stub = venue
+    broker = ExnessBroker(client=_client(signer, stub), instrument=_gold())
+    stub.positions = []
+
+    moved = broker.modify_stop("XAUUSD", 2640.0)
+
+    assert moved["ok"] is False
+    assert "no open position" in moved["reason"]
+
+
+def test_cancel_order_is_documented_and_not_a_stub(venue):
+    signer, stub = venue
+    broker = ExnessBroker(client=_client(signer, stub), instrument=_gold())
+
+    out = broker.cancel_order("3001")
+
+    assert out["ok"] is True
+    assert stub.order_call["method"] == "DELETE"
+
+
+def test_min_viable_equity_names_the_binding_constraint():
+    """On gold the margin cap binds long before the risk budget does."""
+    gold = FxInstrument("XAUUSD", volume_min=0.01, contract_size=100)
+
+    need = exness.min_viable_equity(entry=2650, stop=2632, instrument=gold,
+                                    risk_pct=0.5, max_margin_pct=8.0, leverage=3)
+
+    assert need["binding"] == "margin"
+    assert need["equity_required"] == pytest.approx(11041.67, abs=0.01)
+    assert need["risk_at_minimum_lot"] == 18.0
 
 
 # --------------------------------------------------------------------------- doctor + cli
@@ -450,10 +617,17 @@ def test_cli_sizing_check_exits_non_zero_when_the_plan_cannot_be_expressed(capsy
     assert "cannot size this trade" in out
     assert "below the venue minimum" in out
 
+    # 10k is still too small: the margin cap leaves 0.009 lots, below the venue step
     args = argparse.Namespace(equity=10_000, risk_pct=0.5, entry=2650, stop=2632,
                               json=False, connect=False)
+    assert cli.cmd_exness(args, Settings.load()) == 1
+    assert "cannot size this trade" in capsys.readouterr().out
+
+    # 60k trades, and the risk comes out below the budget the operator set
+    args = argparse.Namespace(equity=60_000, risk_pct=0.5, entry=2650, stop=2632,
+                              json=False, connect=False)
     assert cli.cmd_exness(args, Settings.load()) == 0
-    assert "0.02 lots" in capsys.readouterr().out
+    assert "sized XAUUSD" in capsys.readouterr().out
 
 
 def test_cli_connect_without_credentials_says_what_is_missing(monkeypatch, capsys):
@@ -470,3 +644,19 @@ def test_cli_connect_without_credentials_says_what_is_missing(monkeypatch, capsy
     out = capsys.readouterr().out
     assert "not configured" in out
     assert "refusing to fall back to paper" in out
+
+
+def test_the_cli_names_the_equity_the_smallest_lot_needs(capsys):
+    """The one number a small account needs: what it takes to trade gold at all."""
+    import argparse
+
+    from trading_office import cli
+    from trading_office.config import Settings
+
+    args = argparse.Namespace(equity=1_000, risk_pct=0.5, entry=2650, stop=2632,
+                              json=False, connect=False)
+    assert cli.cmd_exness(args, Settings.load()) == 1
+    out = capsys.readouterr().out
+    assert "below the venue minimum" in out
+    assert "11,04" in out               # equity required, thousands separator
+    assert "margin" in out              # and which constraint binds

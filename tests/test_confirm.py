@@ -57,7 +57,7 @@ def _scan(settings, *, symbol=SYMBOL, action="LONG", bar_time=None, source="ccxt
 
 def _evaluate_is(monkeypatch, payload):
     """Every refresh of the analysis returns this payload, whatever the symbol."""
-    TradingEngine.evaluate = lambda self, symbol, record=False: payload
+    monkeypatch.setattr(TradingEngine, "evaluate", lambda self, symbol, record=False: payload)
 
 
 # --------------------------------------------------------------------------- fingerprint
@@ -164,7 +164,7 @@ def test_confirm_refuses_a_broken_feed(engine, monkeypatch):
     def boom(self, symbol, record=False):
         raise ConnectionError("provider down")
 
-    TradingEngine.evaluate = boom
+    monkeypatch.setattr(TradingEngine, "evaluate", boom)
     result = confirm.confirm(engine, {"symbol": SYMBOL})
     assert result["ok"] is False
     assert result["block"] == "error"
@@ -244,7 +244,7 @@ def test_confirm_on_an_armed_live_venue_queues_instead_of_sending(engine, monkey
 
 
 # --------------------------------------------------------------------------- the board
-def test_analyse_all_ranks_by_abs_score_and_blocks_what_it_must(engine):
+def test_analyse_all_ranks_by_abs_score_and_blocks_what_it_must(engine, monkeypatch):
     engine.symbols = ["A/USDT:USDT", "B/USDT:USDT", "C/USDT:USDT", "D/USDT:USDT"]
 
     def fake_evaluate(self, symbol, record=False):
@@ -261,7 +261,7 @@ def test_analyse_all_ranks_by_abs_score_and_blocks_what_it_must(engine):
             return {**base, "action": "WAIT", "score": 9}
         return {**base, "action": "LONG", "score": 6, "risk": {"plan": None}}
 
-    TradingEngine.evaluate = fake_evaluate
+    monkeypatch.setattr(TradingEngine, "evaluate", fake_evaluate)
     board = confirm.analyse_all(engine)
 
     assert [r["symbol"] for r in board["rows"]] == ["C/USDT:USDT", "B/USDT:USDT",
@@ -298,11 +298,11 @@ def test_analyse_all_marks_an_open_position(engine, monkeypatch):
     assert board["tradeable"] == 0
 
 
-def test_analyse_all_tolerates_a_broken_feed(engine):
+def test_analyse_all_tolerates_a_broken_feed(engine, monkeypatch):
     def boom(self, symbol, record=False):
         raise ConnectionError("provider down")
 
-    TradingEngine.evaluate = boom
+    monkeypatch.setattr(TradingEngine, "evaluate", boom)
     board = confirm.analyse_all(engine)
 
     assert board["analysed"] == 1

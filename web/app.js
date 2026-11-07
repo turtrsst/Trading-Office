@@ -125,11 +125,16 @@
       state.health = health;
       const idxLive = health.providers?.idx?.available;
       const cryptoLive = health.providers?.crypto?.available;
-      const live = state.market === "idx" ? idxLive : cryptoLive;
+      const fxLive = health.providers?.fx?.available;
+      const live = state.market === "idx" ? idxLive : state.market === "fx" ? fxLive : cryptoLive;
       const pill = $("#source-pill");
       pill.className = "pill " + (live ? "live" : "demo");
       $("#source-text").textContent = live
-        ? `${state.market === "idx" ? "idx CLI live" : health.providers.crypto.exchange + " live"}`
+        ? state.market === "idx"
+          ? "idx CLI live"
+          : state.market === "fx"
+            ? "Exness live"
+            : health.providers.crypto.exchange + " live"
         : "synthetic demo data";
       pill.title = live
         ? "Live provider reachable"
@@ -206,17 +211,22 @@
     tbody.innerHTML = `<tr><td colspan="8" class="muted"><span class="spinner"></span> scanning…</td></tr>`;
     const symbols = ($("#screen-symbols").value || "").trim();
     const isIdx = state.market === "idx";
-    $("#screen-title").textContent = isIdx ? "IDX screening" : "Crypto screening";
+    const isFx = state.market === "fx";
+    $("#screen-title").textContent = isIdx ? "IDX screening" : isFx ? "Gold & FX screening" : "Crypto screening";
     $("#screen-subtitle").textContent = isIdx
       ? "Market filter → signal → risk over the most liquid names. Bandarmology, foreign flow and valuation feed the conviction score."
-      : "Same pipeline on perpetual futures: trend + volatility + session + spread, then the confluence score.";
+      : isFx
+        ? "Exness CFDs (XAUUSD first): trend + volatility + session + spread → risk in lots, capped to the venue minimum."
+        : "Same pipeline on perpetual futures: trend + volatility + session + spread, then the confluence score.";
     try {
-      const q = new URLSearchParams({ market: state.market, limit: isIdx ? "18" : "8" });
+      const q = new URLSearchParams({ market: state.market, limit: isIdx ? "18" : isFx ? "6" : "8" });
       if (symbols) q.set("symbols", symbols);
       const data = await api("/api/screen?" + q.toString());
       state.screen = data;
       renderScreen(data);
-      if (isIdx) loadMarketIdx(data); else loadMarketCrypto(data);
+      if (isIdx) loadMarketIdx(data);
+      else if (isFx) loadMarketFx(data);
+      else loadMarketCrypto(data);
     } catch (err) {
       tbody.innerHTML = `<tr><td colspan="8" class="chg down">${esc(err.message)}</td></tr>`;
       toast("Screening failed: " + err.message, true);
@@ -314,9 +324,31 @@
     }
   }
 
+  async function loadMarketFx() {
+    const box = $("#market-card");
+    box.innerHTML = `<div class="muted">loading gold…</div>`;
+    try {
+      const data = await api("/api/market/fx");
+      box.innerHTML =
+        (data.tickers || [])
+          .map(
+            (t) => `<div class="idx-row"><span class="sym">${esc(t.symbol)}</span>
+              <span class="mono chg ${(t.change_pct || 0) >= 0 ? "up" : "down"}">${fmtNum(t.price)} · ${fmtPct(t.change_pct)}</span></div>
+              <div class="muted small" style="margin:-4px 0 6px">bid ${fmtNum(t.bid)} / ask ${fmtNum(t.ask)} · spread ${t.spread_bps} bps · ${esc(t.source || "")}</div>`
+          )
+          .join("") +
+        `<div class="muted small" style="margin-top:8px">${esc(data.hours?.week || "")} — one lot XAUUSD is 100 oz, so the smallest size is not small.</div>`;
+    } catch (err) {
+      box.innerHTML = `<div class="chg down">${esc(err.message)}</div>`;
+    }
+  }
+
   /* ------------------------------------------------------------------ analysis */
   async function loadAnalysis(symbol) {
-    const sym = symbol || $("#analysis-symbol").value.trim() || (state.market === "idx" ? "BBCA" : "BTC/USDT:USDT");
+    const sym =
+      symbol ||
+      $("#analysis-symbol").value.trim() ||
+      (state.market === "idx" ? "BBCA" : state.market === "fx" ? "XAUUSD" : "BTC/USDT:USDT");
     $("#verdict-body").innerHTML = `<div class="muted"><span class="spinner"></span> running the gates…</div>`;
     try {
       const data = await api(`/api/symbol/${state.market}/${encodeURIComponent(sym)}`);
@@ -447,14 +479,20 @@
       return;
     }
     const dir = plan.side === "long" ? "long" : "short";
-    const unit = plan.market === "idx" ? "IDR" : "USDT";
+    const unit = plan.market === "idx" ? "IDR" : plan.market === "fx" ? "USD" : "USDT";
     box.innerHTML = `
       <div class="plan-row ${dir}"><span>Direction</span><b>${esc(plan.side.toUpperCase())}</b></div>
       <div class="plan-row"><span>Entry (last closed price)</span><b>${fmtNum(plan.entry)}</b></div>
       <div class="plan-row"><span>Stop loss <span class="muted small">(${esc(plan.stop_source)})</span></span><b class="chg down">${fmtNum(plan.stop)}</b></div>
       <div class="plan-row"><span>Take profit <span class="muted small">(${esc(plan.target_source)})</span></span><b class="chg up">${fmtNum(plan.target)}</b></div>
       <div class="plan-row"><span>Reward : risk</span><b>1 : ${Number(plan.rr).toFixed(2)}</b></div>
-      <div class="plan-row"><span>Size</span><b>${plan.market === "idx" ? `${fmtNum(plan.lots)} lots` : fmtNum(plan.size, 4) + " units"}</b></div>
+      <div class="plan-row"><span>Size</span><b>${
+        plan.market === "idx"
+          ? `${fmtNum(plan.lots)} lots`
+          : plan.market === "fx"
+            ? `${fmtNum(plan.size, 2)} lots <span class="muted small">(1 lot = ${fmtNum(plan.contract_size || 100)} oz)</span>`
+            : fmtNum(plan.size, 4) + " units"
+      }</b></div>
       <div class="plan-row"><span>Notional</span><b>${fmtNum(plan.notional)} ${unit}</b></div>
       <div class="plan-row"><span>Risk at stop</span><b>${fmtNum(plan.risk_cash)} ${unit} (${Number(plan.risk_pct).toFixed(2)}%)</b></div>
       <div class="plan-row"><span>Round-trip costs</span><b>${Number(plan.costs?.round_trip_cost_pct || 0).toFixed(3)}%</b></div>

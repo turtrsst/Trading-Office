@@ -56,13 +56,22 @@ class Position:
     realised_pnl: float = 0.0  # banked by partial take profits
     r_multiple: float = 0.0
     meta: dict[str, Any] = field(default_factory=dict)
+    #: units per lot: 1 for spot/perp, 100 oz for XAUUSD, 100 shares for IDX. Without this a
+    #: gold position's risk reads 100x too small, and every R-multiple downstream with it.
+    contract_size: float = 1.0
+
+    @property
+    def risk_per_price_unit(self) -> float:
+        """Price distance to the stop — the unit R is measured in."""
+        return abs(self.entry - self.initial_stop)
 
     @property
     def risk_per_unit(self) -> float:
-        return abs(self.entry - self.initial_stop)
+        """Cash at risk per *lot* (or per unit for spot): distance × contract size."""
+        return self.risk_per_price_unit * (self.contract_size or 1.0)
 
     def unrealised_r(self, price: float) -> float:
-        rpu = self.risk_per_unit
+        rpu = self.risk_per_price_unit
         if rpu <= 0:
             return 0.0
         move = (price - self.entry) if self.side == "long" else (self.entry - price)

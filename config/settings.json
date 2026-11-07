@@ -198,6 +198,62 @@
       "size_step": 100,
       "auto_reject_pct": 25.0,
       "_auto_reject_note": "ARA/ARB symmetric band for the automated rule; IDX bands are asymmetric per price level and change by regulation, so set this from the broker's own feed when known."
+    },
+    "fx": {
+      "timeframe": "15m",
+      "trend_timeframe": "4h",
+      "atr_min_pct": 0.03,
+      "atr_max_pct": 1.2,
+      "max_spread_bps": 4.0,
+      "commission_bps": 0.0,
+      "slippage_bps": 1.0,
+      "swap_bps_per_day": 0.55,
+      "expected_hold_days": 0.5,
+      "sessions": [
+        [
+          "14:00",
+          "23:00"
+        ],
+        [
+          "01:00",
+          "04:00"
+        ]
+      ],
+      "sessions_timezone": "Asia/Jakarta",
+      "sessions_note": "XAUUSD is most liquid in the London/NY overlap (14:00-23:00 WIB) and the Tokyo open. Exness itself trades gold ~24/5; these windows are a liquidity choice, not the venue's hours.",
+      "symbols": [
+        "XAUUSD"
+      ],
+      "max_margin_per_trade_pct": 8.0,
+      "volume_min": 0.01,
+      "volume_max": 100.0,
+      "volume_step": 0.01,
+      "contract_size": 100.0,
+      "price_step": 0.01,
+      "execution_costs": {
+        "latency_ms": 250,
+        "slippage_base_bps": 1.0,
+        "atr_mult": 0.05,
+        "impact_coeff": 1.2,
+        "max_slippage_bps": 25.0,
+        "gap_reject_atr": 2.0,
+        "gap_reject_spread_mult": 2.5,
+        "gap_fill_fraction": 0.5,
+        "gap_cooldown_bars": 3,
+        "max_risk_multiplier": 1.6,
+        "auction_windows": [],
+        "shock_atr_mult": 3.0,
+        "shock_slippage_mult": 2.5
+      },
+      "leverage": 3,
+      "atr_soft_cap_pct": 0.8,
+      "extreme_spread_mult": 2.0,
+      "fill_timeout_s": 15,
+      "_notes": {
+        "margin": "leverage 3 = the repo cap (risk.max_leverage). The venue allows up to 1:500 on gold; that is a trap, not a feature.",
+        "gold": "1 lot XAUUSD = 100 oz. With equity under ~$3,600 a 0.5% risk budget cannot buy the 0.01 lot minimum at an $18 stop.",
+        "weekend": "FX closes Fri 21:00 UTC and reopens Sun 22:00 UTC. flat_before_weekend is off by default; a weekend gap jumps the hard stop on Sunday's open."
+      }
     }
   },
   "execution": {

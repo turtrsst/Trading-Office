@@ -672,7 +672,7 @@ def cmd_exness(args: argparse.Namespace, settings: Settings) -> int:
     question from arithmetic alone, which is exactly the question that kills small accounts
     on gold.
     """
-    from .execution.exness import ExnessError, from_settings, lots_for_risk
+    from .execution.exness import ExnessError, from_settings, lots_for_risk, min_viable_equity
 
     cfg = (settings.get("execution.exness", {}) or {}).get("instrument", {}) or {}
     equity = float(args.equity or 0.0)
@@ -693,7 +693,17 @@ def cmd_exness(args: argparse.Namespace, settings: Settings) -> int:
         )
         plan = lots_for_risk(equity=equity, risk_pct=risk_pct, entry=entry, stop=stop,
                              instrument=instrument,
-                             max_margin_pct=float(settings.get("risk.max_margin_per_trade_pct", 8)))
+                             max_margin_pct=float(settings.get("risk.max_margin_per_trade_pct", 8)),
+                             leverage=float(settings.get("profiles.fx.leverage",
+                                                         settings.get("risk.max_leverage", 3)) or 3))
+        if not plan["ok"]:
+            # the same number the human-readable branch prints: what equity makes it tradable
+            plan["min_equity"] = min_viable_equity(
+                entry=entry, stop=stop, instrument=instrument, risk_pct=risk_pct,
+                max_margin_pct=float(settings.get("risk.max_margin_per_trade_pct", 8)),
+                leverage=float(settings.get("profiles.fx.leverage",
+                                            settings.get("risk.max_leverage", 3)) or 3),
+            )
         if args.json:
             print(json.dumps(plan, indent=2, default=str))
         elif plan["ok"]:
@@ -705,6 +715,16 @@ def cmd_exness(args: argparse.Namespace, settings: Settings) -> int:
             print(dim("  a raw size of "
                       f"{plan.get('raw_lots', 0):.4f} lots would risk {plan.get('risk_cash', 0):.2f} "
                       f"but the venue's smallest step is {instrument.volume_step:g} lots"))
+            need = min_viable_equity(
+                entry=entry, stop=stop, instrument=instrument, risk_pct=risk_pct,
+                max_margin_pct=float(settings.get("risk.max_margin_per_trade_pct", 8)),
+                leverage=float(settings.get("profiles.fx.leverage",
+                                            settings.get("risk.max_leverage", 3)) or 3),
+            )
+            binding_value = need[f"{need['binding']}_equity"]
+            print(dim(f"  equity needed for the smallest lot: {need['equity_required']:,.0f} "
+                      f"({need['binding']} constraint = {binding_value:,.0f}); "
+                      f"0.01 lot at this stop risks {need['risk_at_minimum_lot']:,.2f}"))
         if not args.connect:
             return 0 if plan["ok"] else 1
 

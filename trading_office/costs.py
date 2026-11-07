@@ -55,6 +55,22 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "shock_slippage_mult": 3.0,
         "auction_windows": [],
     },
+    "fx": {
+        # gold: quoted off a spread, executed in milliseconds, and gappy over the weekend
+        "latency_ms": 250,
+        "slippage_base_bps": 1.0,
+        "atr_mult": 0.05,
+        "impact_coeff": 1.2,
+        "max_slippage_bps": 25.0,
+        "gap_reject_atr": 2.0,
+        "gap_reject_spread_mult": 2.5,
+        "gap_fill_fraction": 0.5,
+        "gap_cooldown_bars": 3,
+        "max_risk_multiplier": 1.6,
+        "shock_atr_mult": 3.0,
+        "shock_slippage_mult": 2.5,
+        "auction_windows": [],
+    },
     "idx": {
         "latency_ms": 900,
         "slippage_base_bps": 2.0,

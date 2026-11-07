@@ -241,13 +241,14 @@ trading_office/
   market/crypto_client.py     ccxt bridge (closed candles only, ticks, book)
   market/demo.py              deterministic synthetic series (labelled everywhere)
   execution/exness.py         Exness Trader API: signed REST, async orders, lot sizing
+  market/fx_client.py         gold/FX candles + quotes via Exness, synthetic when offline
   digest.py                   the daily one-message report (reads the running server)
   api/server.py               FastAPI: REST + static UI
   api/mcp_server.py           MCP tools (stdio / streamable HTTP)
   backtest/engine.py          bar-by-bar backtester + walk-forward
   cli.py                      terminal
 web/                          the web terminal (no build step, no frameworks)
-tests/                        213 unit + API tests, all offline
+tests/                        243 unit + API tests, all offline
 docs/                         strategy logic, API, MCP, operations
 scripts/make_demo_data.py     writes data/*.json for the backtester
 ```
@@ -274,7 +275,7 @@ python -m trading_office.cli trade --market crypto      # the same board in the 
 
 Endpoint contract: [docs/API.md](docs/API.md) → *Analyse → confirm*.
 
-## Exness (CFD / gold) — adapter, demo first
+## Exness (CFD / gold) — a third market, demo first
 
 `trading_office/execution/exness.py` speaks the official **Exness Trader API**: Ed25519
 signed requests, `EXN-*` headers, cached access-point discovery, and — because Exness is
@@ -287,9 +288,15 @@ python -m trading_office.cli exness --equity 1000 --risk-pct 0.5 --entry 2650 --
 python -m trading_office.cli exness --connect      # read-only: account + positions
 ```
 
-**Gold needs a real account size**: 1 lot XAUUSD = 100 oz, so the 0.01 lot minimum risks ~$18
-on an $18 stop — 1.8 % of a $1,000 account. The sizing check says so instead of rounding up.
-Setup, signing details and the sizing table: [docs/EXNESS.md](docs/EXNESS.md).
+**Gold needs a real account size.** 1 lot XAUUSD = 100 oz, so the venue minimum of 0.01 lot
+needs ~$883 of margin at 1:3 and risks ~$18 on an $18 stop. Under the repo's caps the first
+equity that can hold one lot step is **~$11,042** — the margin cap binds long before the risk
+budget does, and `exness --equity …` prints that number instead of rounding a size up.
+
+Gold is a **full market**, not a side car: `--market fx` runs the same four gates, the same
+risk plan (in lots), the same paper broker, the same approvals and the same API surface, and
+`/api/market/fx` + the **Gold / FX** tab show it with a measured bid/ask spread. Setup, signing
+details and the sizing table: [docs/EXNESS.md](docs/EXNESS.md).
 
 ## Autonomous mode (approve from Telegram)
 
@@ -347,7 +354,7 @@ trading-office doctor     # shows credential presence + whether state/ is sealed
 
 ```sh
 pip install pytest httpx
-python -m pytest -q           # 213 passed, entirely offline
+python -m pytest -q           # 243 passed, entirely offline
 ```
 
 The suite covers indicator maths, each filter's pass/block path, the no-trigger veto, the

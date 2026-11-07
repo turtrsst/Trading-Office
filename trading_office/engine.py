@@ -46,7 +46,7 @@ from typing import Any, Callable, Sequence
 from zoneinfo import ZoneInfo
 
 from . import costs, indicators as ind
-from .market import CryptoClient, IdxClient
+from .market import CryptoClient, FxClient, IdxClient
 from .market import demo
 from .config import Settings
 from .execution import ClosedTrade, PaperBroker, make_broker, order_from_plan
@@ -129,6 +129,8 @@ class TradingEngine:
                 "engine.equity_idr" if market == "idx" else "engine.equity_usdt", 1_000.0
             )
         )
+        if market == "fx":
+            equity = float(self.settings.get("engine.equity_fx", equity) or equity)
         self.broker = make_broker(self.settings.raw, market, equity, self.profile)
         self.mode = "live" if self.broker.__class__.__name__ == "CcxtBroker" else "paper"
         if self.mode == "paper" and not execute:
@@ -136,12 +138,18 @@ class TradingEngine:
 
         self.crypto: CryptoClient | None = None
         self.idx: IdxClient | None = None
+        self.fx: FxClient | None = None
         if market == "crypto":
             exec_cfg = self.settings.section("execution")
             self.crypto = CryptoClient(
                 exchange_id=str(exec_cfg.get("exchange_id", "bybit")),
                 symbols=self.symbols,
             )
+        elif market == "fx":
+            # market data is read-only: without a key the chart is synthetic and labelled so
+            from .market.fx_client import from_settings as fx_from_settings
+
+            self.fx = fx_from_settings(self.settings)
         else:
             self.idx = IdxClient(self.settings.section("idx"))
 
@@ -306,6 +314,23 @@ class TradingEngine:
                 "bid": tick.get("bid"),
                 "ask": tick.get("ask"),
             }
+        if self.fx is not None:
+            data = self.fx.candles(symbol, str(profile.get("timeframe", "15m")), 400)
+            htf = self.fx.htf_candles(symbol, str(profile.get("trend_timeframe", "4h")), 260)
+            tick = self.fx.quote(symbol)
+            return {
+                "bars": data["bars"],
+                "htf_bars": htf["bars"],
+                "quote": tick,
+                "source": data["source"],
+                "warnings": list(data.get("warnings", [])) + list(htf.get("warnings", []))
+                + list(tick.get("warnings", [])),
+                "data_age_s": None,
+                "stale": data["source"] != "exness",
+                "bid": tick.get("bid"),
+                "ask": tick.get("ask"),
+                "spread_bps": tick.get("spread_bps"),
+            }
         if self.idx is not None:
             interval = str(profile.get("timeframe", "1d"))
             candles = self.idx.candles(symbol, period="1y", interval=interval)
@@ -325,10 +350,17 @@ class TradingEngine:
                 "daily_value": quote.get("value"),
             }
         # synthetic fallback
-        bars = demo.crypto_bars(symbol, "15m", 400) if self.market == "crypto" else demo.idx_bars(symbol, "1d", 400)
+        if self.market == "crypto":
+            bars, factor = demo.crypto_bars(symbol, "15m", 400), 8
+        elif self.market == "fx":
+            bars, factor = demo.fx_bars(symbol, "15m", 400), 16
+        else:
+            bars, factor = demo.idx_bars(symbol, "1d", 400), 5
+        quote = (demo.crypto_quote(symbol) if self.market == "crypto"
+                 else demo.fx_quote(symbol) if self.market == "fx" else demo.idx_quote(symbol))
         return {
-            "bars": bars, "htf_bars": demo.htf_bars(symbol, self.market, 8 if self.market == "crypto" else 5, 60),
-            "quote": demo.crypto_quote(symbol) if self.market == "crypto" else demo.idx_quote(symbol),
+            "bars": bars, "htf_bars": demo.htf_bars(symbol, self.market, factor, 60),
+            "quote": quote,
             "source": "synthetic", "warnings": ["no market client configured"], "data_age_s": None, "stale": True,
         }
 
@@ -497,6 +529,8 @@ class TradingEngine:
             initial_stop=float(order.stop or plan.stop),
             opened_at=fill.at,
             bar_time=bar_time,
+            contract_size=float(self.profile.get("contract_size", 1.0) or 1.0)
+            if self.market == "fx" else 1.0,
             meta={
                 "reasons": payload.get("reasons", []),
                 "score": payload["score"],
@@ -1064,6 +1098,8 @@ class TradingEngine:
                 from .config import idx_tick_size
 
                 tick = idx_tick_size(price)
+            elif self.market == "fx":
+                tick = float(self.profile.get("price_step", 0.01) or 0.01)
             stop_before = position.stop
             decided = manage_position(
                 position,
@@ -1274,7 +1310,10 @@ class TradingEngine:
         re-derive them (and cannot disagree with the metrics).
         """
         points = []
-        equity = float(self.settings.get("engine.equity_idr" if self.market == "idx" else "engine.equity_usdt", 0))
+        equity = float(self.settings.get(
+            "engine.equity_idr" if self.market == "idx"
+            else "engine.equity_fx" if self.market == "fx"
+            else "engine.equity_usdt", 0))
         points.append({"ts": None, "equity": equity})
         for event in self.state.ledger(100_000):
             if event.get("event") == "trade_closed":
@@ -1388,7 +1427,7 @@ def _bars_since(earlier: str, later: str, timeframe: str) -> int:
 # --------------------------------------------------------------------------- CLI
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the Trading Office live engine.")
-    parser.add_argument("--market", choices=["crypto", "idx"], default="crypto")
+    parser.add_argument("--market", choices=["crypto", "idx", "fx"], default="crypto")
     parser.add_argument("--symbols", default="", help="comma-separated; defaults to the profile")
     parser.add_argument("--cycles", type=int, default=0, help="stop after N cycles (0 = forever)")
     parser.add_argument("--no-execute", action="store_true", help="scan only (dry run)")

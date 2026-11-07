@@ -35,7 +35,7 @@ def screener() -> Screener:
 
 # --------------------------------------------------------------------------- tool bodies
 def screen_market(
-    market: Literal["idx", "crypto"] = "idx",
+    market: Literal["idx", "crypto", "fx"] = "idx",
     limit: int = 15,
     symbols: str = "",
     deep: bool = True,
@@ -43,7 +43,8 @@ def screen_market(
     """Rank a market with the four-gate pipeline and return BUY/WATCH/SELL labels.
 
     Args:
-        market: "idx" for IDX/IHSG equities, "crypto" for perpetual futures.
+        market: "idx" for IDX/IHSG equities, "crypto" for perpetual futures, "fx" for
+            Exness CFDs (XAUUSD first).
         limit: how many symbols to scan (the most liquid first).
         symbols: optional comma-separated tickers to scan instead of the universe.
         deep: include bandarmology, foreign flow, KSEI ownership and corporate actions.
@@ -52,18 +53,18 @@ def screen_market(
     return screener().screen(market, symbols=wanted, limit=limit, deep_context=deep, with_risk=False)
 
 
-def analyse_symbol(market: Literal["idx", "crypto"] = "idx", symbol: str = "BBCA") -> dict[str, Any]:
+def analyse_symbol(market: Literal["idx", "crypto", "fx"] = "idx", symbol: str = "BBCA") -> dict[str, Any]:
     """Full reading for one symbol: market filter, signal score, risk plan, IDX context.
 
     Args:
-        market: "idx" or "crypto".
+        market: "idx", "crypto" or "fx".
         symbol: a ticker ("BBCA", "TLKM") or a ccxt symbol ("BTC/USDT:USDT").
     """
     return screener().analyse(market, symbol)
 
 
 def run_backtest(
-    market: Literal["idx", "crypto"] = "crypto",
+    market: Literal["idx", "crypto", "fx"] = "crypto",
     symbol: str = "BTC/USDT:USDT",
     oos: float = 0.3,
     bars: int = 900,
@@ -71,7 +72,7 @@ def run_backtest(
     """Walk-forward backtest on closed candles: select in-sample, report out-of-sample.
 
     Args:
-        market: "idx" or "crypto".
+        market: "idx", "crypto" or "fx".
         symbol: instrument to test.
         oos: fraction of the data kept untouched for out-of-sample validation.
         bars: how many historical bars to use.
@@ -85,7 +86,7 @@ def run_backtest(
     )
 
 
-def execution_costs(market: Literal["idx", "crypto"] = "crypto") -> dict[str, Any]:
+def execution_costs(market: Literal["idx", "crypto", "fx"] = "crypto") -> dict[str, Any]:
     """The fill model used by the backtest and the live engine.
 
     Returns latency, slippage coefficients and caps, the gap-rejection thresholds, the
@@ -105,7 +106,7 @@ def execution_costs(market: Literal["idx", "crypto"] = "crypto") -> dict[str, An
 
 
 def reconcile_state(
-    market: Literal["idx", "crypto"] = "crypto",
+    market: Literal["idx", "crypto", "fx"] = "crypto",
     adopt: bool = False,
     close_orphans: bool = False,
 ) -> dict[str, Any]:
@@ -164,7 +165,7 @@ def idx_corporate_actions(symbol: str = "BBCA") -> dict[str, Any]:
     return screener().idx.actions(symbol.upper())
 
 
-def market_overview(market: Literal["idx", "crypto"] = "idx") -> dict[str, Any]:
+def market_overview(market: Literal["idx", "crypto", "fx"] = "idx") -> dict[str, Any]:
     """IHSG indices and breadth (IDX) or tickers and spreads (crypto)."""
     from . import server
 
@@ -172,7 +173,7 @@ def market_overview(market: Literal["idx", "crypto"] = "idx") -> dict[str, Any]:
 
 
 def candles(
-    market: Literal["idx", "crypto"] = "idx", symbol: str = "BBCA", limit: int = 200
+    market: Literal["idx", "crypto", "fx"] = "idx", symbol: str = "BBCA", limit: int = 200
 ) -> dict[str, Any]:
     """Closed OHLCV candles plus indicator series (EMA, RSI, MACD, Bollinger, ATR)."""
     from . import server
