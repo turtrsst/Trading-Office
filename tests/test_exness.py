@@ -660,3 +660,92 @@ def test_the_cli_names_the_equity_the_smallest_lot_needs(capsys):
     assert "below the venue minimum" in out
     assert "11,04" in out               # equity required, thousands separator
     assert "margin" in out              # and which constraint binds
+
+
+# --------------------------------------------------------------------------- self-test
+def _selftest_env(monkeypatch, stub, seed: str = "22"):
+    monkeypatch.setenv("TO_EXNESS_API_KEY", "exnsk-selftest-secret-value")
+    monkeypatch.setenv("TO_EXNESS_PRIVATE_KEY", seed * 32)
+    monkeypatch.delenv("TO_EXNESS_PRIVATE_KEY_PATH", raising=False)
+    monkeypatch.setenv("TO_EXNESS_ACCOUNT_ID", "777")
+    monkeypatch.setenv("TO_EXNESS_GATEWAY_HOST", stub.base)
+
+
+def test_selftest_walks_the_read_only_surface_and_redacts_everything(venue, monkeypatch):
+    from trading_office import cli
+    from trading_office.config import Settings
+
+    signer, stub = venue
+    # the stub verifies signatures with its own key, so sign with that key
+    monkeypatch.setattr(exness.ExnessSigner, "from_seed_hex",
+                        classmethod(lambda cls, api_key, seed: signer), raising=True)
+    _selftest_env(monkeypatch, stub)
+    stub.candles = [{"time": "2026-11-06T12:30:00+00:00", "open": 2650.0, "high": 2651.0,
+                     "low": 2649.0, "close": 2650.5, "volume": 100}]
+
+    report = cli.exness_selftest(Settings.load(), transport=exness._default_transport)
+
+    names = [s["step"] for s in report["steps"]]
+    assert names == ["config", "private_key", "discovery", "account", "limits", "conditions",
+                     "snapshot", "candles", "sizing"]
+    assert all(s["status"] in ("ok", "warn") for s in report["steps"]), report["steps"]
+    assert report["verdict"] == "ok"
+    assert report["sizing"]["contract_size"] == 100.0
+    assert report["sizing"]["binding_constraint"] == "margin"
+
+    # nothing that could be a credential may appear anywhere in the report
+    dumped = json.dumps(report, default=str)
+    assert "exnsk-selftest-secret-value" not in dumped
+    assert "22" * 32 not in dumped
+    assert report["credentials"]["api_key"].startswith("exnsk-se")   # presence + length
+    assert report["credentials"]["private_key"].startswith("<set")   # never the seed
+    # a 3-digit test account is masked entirely; real ones show first/last two digits
+    assert report["credentials"]["account_id"] == "<set, 3 digits>"
+    assert "777" not in report["credentials"]["account_id"]
+
+
+def test_selftest_never_calls_a_mutating_endpoint(venue, monkeypatch):
+    from trading_office import cli
+    from trading_office.config import Settings
+
+    signer, stub = venue
+    monkeypatch.setattr(exness.ExnessSigner, "from_seed_hex",
+                        classmethod(lambda cls, api_key, seed: signer), raising=True)
+    _selftest_env(monkeypatch, stub)
+
+    cli.exness_selftest(Settings.load(), transport=exness._default_transport)
+
+    writes = [c for c in stub.calls if c["method"] in ("POST", "DELETE", "PATCH")]
+    assert writes == [], writes
+
+
+def test_selftest_reports_a_bad_key_shape_without_calling_the_venue(venue, monkeypatch):
+    from trading_office import cli
+    from trading_office.config import Settings
+
+    signer, stub = venue
+    _selftest_env(monkeypatch, stub)
+    monkeypatch.setenv("TO_EXNESS_PRIVATE_KEY", "not-a-hex-seed")
+
+    report = cli.exness_selftest(Settings.load(), transport=exness._default_transport)
+
+    assert report["verdict"] == "bad_private_key"
+    assert stub.calls == []                          # nothing was sent: fail before the network
+
+
+def test_selftest_explains_a_network_failure_instead_of_blaming_the_key(venue, monkeypatch):
+    from trading_office import cli
+    from trading_office.config import Settings
+
+    signer, stub = venue
+    monkeypatch.setattr(exness.ExnessSigner, "from_seed_hex",
+                        classmethod(lambda cls, api_key, seed: signer), raising=True)
+    _selftest_env(monkeypatch, stub)
+    monkeypatch.setenv("TO_EXNESS_GATEWAY_HOST", "http://127.0.0.1:9")   # nothing listens
+
+    report = cli.exness_selftest(Settings.load())
+
+    assert report["verdict"] == "discovery_failed"
+    failed = next(s for s in report["steps"] if s["step"] == "discovery")
+    assert "Connection refused" in failed["detail"]
+    assert "not the credentials" in failed["hint"]

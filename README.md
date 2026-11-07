@@ -248,7 +248,7 @@ trading_office/
   backtest/engine.py          bar-by-bar backtester + walk-forward
   cli.py                      terminal
 web/                          the web terminal (no build step, no frameworks)
-tests/                        243 unit + API tests, all offline
+tests/                        247 unit + API tests, all offline
 docs/                         strategy logic, API, MCP, operations
 scripts/make_demo_data.py     writes data/*.json for the backtester
 ```
@@ -286,6 +286,7 @@ up, and enforces a margin cap so leverage cannot decide the position size.
 ```bash
 python -m trading_office.cli exness --equity 1000 --risk-pct 0.5 --entry 2650 --stop 2632
 python -m trading_office.cli exness --connect      # read-only: account + positions
+python -m trading_office.cli exness --selftest     # redacted report, safe to paste
 ```
 
 **Gold needs a real account size.** 1 lot XAUUSD = 100 oz, so the venue minimum of 0.01 lot
@@ -354,7 +355,7 @@ trading-office doctor     # shows credential presence + whether state/ is sealed
 
 ```sh
 pip install pytest httpx
-python -m pytest -q           # 243 passed, entirely offline
+python -m pytest -q           # 247 passed, entirely offline
 ```
 
 The suite covers indicator maths, each filter's pass/block path, the no-trigger veto, the

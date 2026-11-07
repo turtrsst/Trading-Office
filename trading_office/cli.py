@@ -663,6 +663,238 @@ def cmd_trade(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def _redact(value: str, *, keep: int = 0) -> str:
+    """Show that a secret exists without showing it. Used by every line of the report."""
+    text = str(value or "")
+    if not text:
+        return "(missing)"
+    if keep <= 0:
+        return f"<set, {len(text)} chars>"
+    return f"{text[:keep]}…<{len(text)} chars>"
+
+
+def _mask_account(account_id: str) -> str:
+    """An account number is not a secret, but it is not public either.
+
+    Short ids are masked entirely: ``12***78`` for a 5+ digit account, and nothing usable for
+    anything shorter (a partial of three digits is most of a three-digit id).
+    """
+    text = str(account_id or "")
+    if not text:
+        return "(missing)"
+    if len(text) < 5:
+        return f"<set, {len(text)} digits>"
+    return f"{text[:2]}***{text[-2:]} ({len(text)} digits)"
+
+
+def _mask_host(url: str) -> str:
+    """Keep the shape (prefix/suffix/TLD) so a wrong host is still diagnosable."""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(str(url or "") if "//" in str(url or "") else f"https://{url}")
+    host = parsed.netloc or parsed.path
+    parts = host.split(".")
+    if len(parts) >= 2 and len(parts[0]) > 4:
+        parts[0] = parts[0][:3] + "…"
+    return ".".join(parts)
+
+
+def exness_selftest(settings: Settings, *, transport: Any = None) -> dict[str, Any]:
+    """Exercise the read-only surface and report what a human needs to paste.
+
+    Deliberately never touches a mutating endpoint: this report is meant to be shared, and a
+    diagnostic that can move money is a diagnostic nobody should paste. Credentials are shown
+    as presence + length only; the access point and account id are masked.
+    """
+    import time as _time
+
+    from .env import get
+    from .execution.exness import ExnessClient, ExnessError, ExnessSigner, FxInstrument
+
+    cfg = settings.get("execution.exness", {}) or {}
+    api_key = get(str(cfg.get("api_key_env") or "TO_EXNESS_API_KEY")) or ""
+    private = get(str(cfg.get("private_key_env") or "TO_EXNESS_PRIVATE_KEY")) or ""
+    key_path = get(str(cfg.get("private_key_path_env") or "TO_EXNESS_PRIVATE_KEY_PATH")) or ""
+    account_id = str(get(str(cfg.get("account_id_env") or "TO_EXNESS_ACCOUNT_ID")) or "")
+    gateway = str(get(str(cfg.get("gateway_env") or "TO_EXNESS_GATEWAY_HOST")) or "")
+    symbol = str((cfg.get("instrument") or {}).get("symbol") or "XAUUSD")
+
+    steps: list[dict[str, Any]] = []
+
+    def step(name: str, status: str, detail: str, **extra: Any) -> None:
+        steps.append({"step": name, "status": status, "detail": detail, **extra})
+
+    report: dict[str, Any] = {
+        "generated_at": _time.strftime("%Y-%m-%dT%H:%M:%S+00:00", _time.gmtime()),
+        "credentials": {
+            "api_key": _redact(api_key, keep=8),
+            "private_key": _redact(private or (f"file:{key_path}" if key_path else "")),
+            "account_id": _mask_account(account_id),
+            "gateway_host": _mask_host(gateway),
+        },
+        "steps": steps,
+    }
+
+    missing = [name for name, value in (
+        ("TO_EXNESS_API_KEY", api_key), ("TO_EXNESS_PRIVATE_KEY(_PATH)", private or key_path),
+        ("TO_EXNESS_ACCOUNT_ID", account_id), ("TO_EXNESS_GATEWAY_HOST", gateway)) if not value]
+    if missing:
+        step("config", "fail", "missing " + ", ".join(missing))
+        report["verdict"] = "not_configured"
+        report["next"] = ("set the missing variables in .env (see docs/EXNESS.md); "
+                          "the gateway host comes from the DNS widget in API Management")
+        return report
+    step("config", "ok", "all four variables present")
+
+    # 1. is the private key a usable Ed25519 key at all? (no network needed)
+    try:
+        if key_path:
+            from pathlib import Path
+
+            signer = ExnessSigner.from_pem(api_key, Path(key_path).expanduser().read_bytes())
+            shape = "PEM file"
+        else:
+            signer = ExnessSigner.from_seed_hex(api_key, private.strip())
+            shape = "hex seed"
+        step("private_key", "ok", f"parsed a valid Ed25519 {shape}")
+    except Exception as exc:  # noqa: BLE001 - the message is the diagnosis
+        step("private_key", "fail", f"{type(exc).__name__}: {exc}",
+             hint="the key must be the Ed25519 private key downloaded from the PA, "
+                  "not the API key and not an RSA key")
+        report["verdict"] = "bad_private_key"
+        return report
+
+    client = ExnessClient(signer=signer, account_id=account_id, gateway_host=gateway,
+                          transport=transport or None,
+                          timeout=float(cfg.get("timeout_s", 10) or 10))
+    report["audit"] = client.audit
+
+    def attempt(name: str, fn: Any) -> Any:
+        started = _time.time()
+        try:
+            out = fn()
+        except ExnessError as exc:
+            step(name, "fail", str(exc), code=exc.code,
+                 ms=round((_time.time() - started) * 1000))
+            return None
+        except Exception as exc:  # noqa: BLE001 - network/TLS failures belong in the report
+            step(name, "fail", f"{type(exc).__name__}: {exc}", ms=round((_time.time() - started) * 1000),
+                 hint="this is the connection, not the credentials: check DNS/egress to the "
+                      "gateway host (a sandbox with a host allowlist fails exactly here)")
+            return None
+        step(name, "ok", "", ms=round((_time.time() - started) * 1000))
+        return out
+
+    access_point = attempt("discovery", client.resolve_access_point)
+    if access_point:
+        steps[-1]["detail"] = f"access point {_mask_host(access_point)}"
+        report["access_point"] = _mask_host(access_point)
+    else:
+        report["verdict"] = "discovery_failed"
+        report["next"] = ("check the gateway host (DNS widget, not the PA URL) and that the key "
+                          "has the Trading scope; code 1001 = wrong key/signature, 403 = scope or IP")
+        return report
+
+    account = attempt("account", client.account)
+    if account:
+        steps[-1]["detail"] = (f"equity {account.get('equity')} {account.get('currency')} · "
+                              f"leverage 1:{account.get('leverage')} · "
+                              f"mode {account.get('trade_mode')} · "
+                              f"status {account.get('account_status', '?')}")
+    limits = attempt("limits", client.limits)
+    # a callable, not the result: attempt() is what times the call and catches the error
+    conditions = attempt("conditions", lambda: client.conditions(symbol))
+    instrument = FxInstrument.from_conditions(symbol, conditions or {})
+    if conditions is not None:
+        steps[-1]["detail"] = (f"{symbol}: min {instrument.volume_min:g} · max "
+                               f"{instrument.volume_max:g} · step {instrument.volume_step:g} · "
+                               f"contract {instrument.contract_size:g} · "
+                               f"tick {instrument.price_step:g}")
+    snapshot = attempt("snapshot", client.snapshot)
+    if snapshot is not None:
+        steps[-1]["detail"] = (f"{len(snapshot.get('positions') or [])} position(s), "
+                               f"{len(snapshot.get('orders') or [])} order(s)")
+
+    # one recent M15 candle: proves market data and the signed query string in one call
+    import datetime as _dt
+
+    start = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=6)).strftime(
+        "%Y-%m-%dT%H:%M:%S+00:00")
+    candles = attempt("candles", lambda: client.candles(symbol, "M15", start=start, count=8))
+    last = (candles or [{}])[-1] if candles else {}
+    if candles is not None:
+        steps[-1]["detail"] = (f"{len(candles)} closed {symbol} M15 candles, last "
+                               f"{last.get('time')} close {last.get('close')}")
+
+    # the sizing question, with this account's real rules
+    equity = 0.0
+    try:
+        equity = float((account or {}).get("equity") or 0.0)
+    except (TypeError, ValueError):
+        pass
+    if equity and last.get("close"):
+        from .execution.exness import min_viable_equity
+
+        entry = float(last["close"])
+        stop = entry - max(instrument.price_step, round(entry * 0.007, 2))
+        need = min_viable_equity(entry=entry, stop=stop, instrument=instrument,
+                                 risk_pct=float(settings.get("risk.risk_per_trade_pct", 1.0)),
+                                 max_margin_pct=float(settings.get(
+                                     "risk.max_margin_per_trade_pct", 8.0)),
+                                 leverage=float(settings.get(
+                                     "profiles.fx.leverage", 3) or 3))
+        report["sizing"] = {
+            "equity": equity,
+            "contract_size": instrument.contract_size,
+            "volume_min": instrument.volume_min,
+            "min_equity_for_one_step": need["equity_required"],
+            "binding_constraint": need["binding"],
+            "risk_at_min_volume": need["risk_at_minimum_lot"],
+        }
+        step("sizing", "ok" if equity >= need["equity_required"] else "warn",
+             f"min equity for {instrument.volume_min:g} lot ≈ "
+             f"{need['equity_required']:,.0f} ({need['binding']} binds); this account has "
+             f"{equity:,.2f}")
+
+    if limits is not None:
+        report["limits"] = {k: v for k, v in (limits.get("limits") or limits).items()
+                            if k in ("candles", "rest", "websocket")} or "present"
+    failed = [s for s in steps if s["status"] == "fail"]
+    report["verdict"] = "ok" if not failed else "partial"
+    report["next"] = (
+        "read-only checks passed — the next step is a demo account and 20 trades, not live"
+        if not failed else
+        "one or more reads failed: the `code` in the failing step says which "
+        "(1000 key, 1001 signature/clock, 1002 scope/IP, 429 quota)")
+    return report
+
+
+def cmd_exness_selftest(args: argparse.Namespace, settings: Settings) -> int:
+    """Print the redacted report. ``--json`` for pasting, plain text otherwise."""
+    report = exness_selftest(settings)
+    if args.json:
+        print(json.dumps(report, indent=2, default=str))
+    else:
+        print()
+        print(f"  Exness read-only self-test · {report['generated_at']}")
+        creds = report["credentials"]
+        for name, value in creds.items():
+            print(f"    {dim(name.replace('_', ' ')):26} {value}")
+        print()
+        marks = {"ok": green("OK  "), "warn": amber("WARN"), "fail": red("FAIL")}
+        for item in report["steps"]:
+            detail = item.get("detail") or ""
+            print(f"  {marks.get(item['status'], '?')}  {item['step']:<14} {dim(detail)}")
+            if item.get("hint"):
+                print(f"        {amber('→')} {dim(item['hint'])}")
+        print()
+        print(f"  verdict: {report['verdict']}")
+        print(dim(f"  {report['next']}"))
+        print(dim("  nothing here can place an order; secrets are shown as length only"))
+        print()
+    return 0 if report["verdict"] in ("ok", "partial") else 1
+
+
 def cmd_exness(args: argparse.Namespace, settings: Settings) -> int:
     """Check the Exness connection and answer the only question that matters first:
     can this account even *express* the risk the strategy wants?
@@ -673,6 +905,9 @@ def cmd_exness(args: argparse.Namespace, settings: Settings) -> int:
     on gold.
     """
     from .execution.exness import ExnessError, from_settings, lots_for_risk, min_viable_equity
+
+    if getattr(args, "selftest", False):
+        return cmd_exness_selftest(args, settings)
 
     cfg = (settings.get("execution.exness", {}) or {}).get("instrument", {}) or {}
     equity = float(args.equity or 0.0)
@@ -1052,6 +1287,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stop", type=float, default=0.0, help="planned stop price")
     p.add_argument("--connect", action="store_true",
                    help="also call the API (read-only: account + positions)")
+    p.add_argument("--selftest", action="store_true",
+                   help="read-only diagnostic report (discovery, account, limits, conditions, "
+                        "one gold candle) with every credential redacted — safe to paste")
     p.set_defaults(func=cmd_exness)
 
     p = sub.add_parser("approvals", help="list or decide queued trade requests")

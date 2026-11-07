@@ -82,7 +82,32 @@ TO_EXNESS_ACCOUNT_ID=12345678
 TO_EXNESS_GATEWAY_HOST=gw-....exness.com
 ```
 
-## First three commands
+## First four commands (the fourth is the one to paste)
+
+```bash
+# 4. Nothing is known until the API answers. This prints a redacted report:
+#    discovery → account → limits → instrument conditions → snapshot → one gold candle,
+#    plus the sizing number for this account. It cannot place an order.
+python -m trading_office.cli exness --selftest          # human readable
+python -m trading_office.cli --json exness --selftest   # same, for pasting into a chat/issue
+```
+
+The report shows credentials as **presence and length only** (`exnsk-de…<23 chars>`,
+`<set, 64 chars>`), masks the account id and the host, and never includes a signature. That is
+deliberate: a diagnostic you cannot share is a diagnostic nobody uses, and a diagnostic that
+can move money is one nobody should share.
+
+Reading the result:
+
+| Verdict | Meaning | What to do |
+| --- | --- | --- |
+| `not_configured` | a `TO_EXNESS_*` variable is missing | the step names which |
+| `bad_private_key` | the blob is not a usable Ed25519 key | re-download it from API Management; it is not the API key |
+| `discovery_failed` | the gateway host did not answer | check the DNS-widget host; `1001` = key/signature/clock, `1002` = scope or source IP, a TLS/DNS error means egress |
+| `partial` | some reads failed | the failing step carries the error `code` |
+| `ok` | every read succeeded | next step is a **demo** account and 20 trades |
+
+
 
 ```bash
 # 1. Sizing only -- no key needed. This is the question that decides whether the
