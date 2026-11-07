@@ -347,16 +347,33 @@ def test_live_without_a_token_raises_instead_of_trading_paper():
         gotrade.from_settings(Settings())
 
 
-def test_readiness_names_the_two_account_blockers_and_the_rules():
+def test_readiness_reports_the_gates_without_asserting_a_stale_observation():
     class Settings:
         def get(self, dotted, default=None):
             return default
 
-    out = readiness(Settings())
-    assert out["token_present"] is False
-    joined = " ".join(out["blocking"])
-    assert "ID document" in joined
-    assert "API access enabled" in joined
-    assert out["constraints"]["long_only"] is True
-    assert out["constraints"]["shortable"] is False
-    assert out["constraints"]["stop_loss_required"] is True
+    unknown = readiness(Settings())
+    assert unknown["token_present"] is False
+    assert "id_document" in unknown["unknown"]          # not observable from here
+    assert "api_access" in unknown["unknown"]           # granted by Gotrade
+    assert unknown["blocking"] == ["token: no TO_GOTRADE_TOKEN set"]
+
+    verified = readiness(Settings(), id_status="verified")
+    assert verified["items"][0] == {"item": "id_document", "state": "ok",
+                                    "detail": "ID reported current (config execution.gotrade.id_status)"}
+
+    expired = readiness(Settings(), id_status="expired")
+    assert expired["items"][0]["state"] == "blocked"
+    assert any("US trading stays restricted" in b for b in expired["blocking"])
+
+
+def test_the_constraints_are_declared_for_the_ui_and_the_docs():
+    class Settings:
+        def get(self, dotted, default=None):
+            return default
+
+    c = readiness(Settings())["constraints"]
+    assert c["long_only"] is True and c["shortable"] is False
+    assert c["stop_loss_required"] is True
+    assert c["tp_sl_rejected_in_extended_hours"] is True
+    assert c["market_data_endpoints_published"] is False

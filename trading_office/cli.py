@@ -675,7 +675,7 @@ def cmd_gotrade(args: argparse.Namespace, settings: Settings) -> int:
     """
     from .execution.gotrade import fee_for, readiness, round_trip_fee, shares_for_risk
 
-    report = readiness(settings)
+    report = readiness(settings, id_status=getattr(args, "id_status", None))
     cfg = settings.get("execution.gotrade", {}) or {}
     out: dict[str, Any] = {"readiness": report}
 
@@ -702,8 +702,11 @@ def cmd_gotrade(args: argparse.Namespace, settings: Settings) -> int:
     print()
     print(f"  Gotrade · entity {report['entity']} · token "
           f"{green('present') if report['token_present'] else amber('missing')}")
-    for item in report["blocking"]:
-        print(f"  {amber('BLOCKER')} {dim(item)}")
+    marks = {"ok": green("OK     "), "unknown": amber("UNKNOWN"), "blocked": red("BLOCKED"),
+             "missing": red("MISSING")}
+    for item in report.get("items", []):
+        print(f"  {marks.get(item['state'], '?')} {item['item']:<12} {dim(item['detail'])}")
+    print(dim("  (id_document: pass --id-status verified|expired to record what the app shows)"))
     if out.get("fees"):
         fees = out["fees"]
         print()
@@ -1361,6 +1364,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--risk-pct", type=float, default=1.0, help="risk per trade, percent of equity")
     p.add_argument("--entry", type=float, default=0.0, help="planned entry price")
     p.add_argument("--stop", type=float, default=0.0, help="planned stop price")
+    p.add_argument("--id-status", choices=["verified", "expired", "unknown"], default=None,
+                   help="what the app shows about your ID document (recorded in the report)")
     p.set_defaults(func=cmd_gotrade)
 
     p = sub.add_parser("approvals", help="list or decide queued trade requests")

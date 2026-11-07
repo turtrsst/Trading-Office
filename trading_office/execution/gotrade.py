@@ -425,28 +425,50 @@ def from_settings(settings: Any, *, transport: Callable[..., Any] | None = None)
     )
 
 
-def readiness(settings: Any) -> dict[str, Any]:
+def readiness(settings: Any, *, id_status: str | None = None) -> dict[str, Any]:
     """What is missing before a US bot could run — no secrets, no network.
 
-    Checks the things the API docs make blocking, so the answer is about accounts and
-    permissions rather than about code.
+    ``id_status`` is an observation, not an assumption: the app showed an expired-ID banner
+    once, and a report that keeps asserting it after it is fixed is worse than no report. Pass
+    ``verified`` / ``expired`` / ``unknown`` (config: ``execution.gotrade.id_status``).
+
+    The API-access item cannot be observed from here at all: it is granted by Gotrade, and the
+    only symptom is a 401 on a token that looks valid.
     """
     from ..env import get
 
     cfg = settings.get("execution.gotrade", {}) or {}
     token = get(str(cfg.get("token_env") or "TO_GOTRADE_TOKEN"))
     entity = str(cfg.get("entity") or "global")
+    state = str(id_status or cfg.get("id_status") or "unknown").lower()
+
+    items: list[dict[str, Any]] = []
+    if state == "expired":
+        items.append({"item": "id_document", "state": "blocked",
+                      "detail": "the app shows an expired ID: US trading stays restricted until "
+                                "it is replaced and verified"})
+    elif state == "verified":
+        items.append({"item": "id_document", "state": "ok",
+                      "detail": "ID reported current (config execution.gotrade.id_status)"})
+    else:
+        items.append({"item": "id_document", "state": "unknown",
+                      "detail": "not observable from here — check that the app no longer shows "
+                                "the expired-ID card, then set execution.gotrade.id_status"})
+    items.append({"item": "api_access", "state": "unknown",
+                  "detail": "granted by Gotrade, not by this code: request enablement from a "
+                            "representative; until then every call is 401, even with a valid token"})
+    items.append({"item": "token", "state": "ok" if token else "missing",
+                  "detail": "generated at Profile > API Key after enablement "
+                            "(1 active token, valid 1 year)" if token else
+                            "no TO_GOTRADE_TOKEN set"})
+
     return {
         "token_present": bool(token),
         "entity": entity,
         "base_url": str(cfg.get("base_url") or BASE_URLS.get(entity, BASE_URLS["global"])),
-        "blocking": [
-            "a valid/current ID document on the account: the app reports the ID as expired, "
-            "and US trading is restricted until it is replaced",
-            "API access enabled for the account (requested from a Gotrade representative); "
-            "without it every call returns 401 even with a valid token",
-            "a token generated at Profile > API Key after enablement (1 active token, 1 year)",
-        ],
+        "items": items,
+        "blocking": [f"{i['item']}: {i['detail']}" for i in items if i["state"] in ("blocked", "missing")],
+        "unknown": [i["item"] for i in items if i["state"] == "unknown"],
         "constraints": {
             "long_only": True,
             "shortable": False,

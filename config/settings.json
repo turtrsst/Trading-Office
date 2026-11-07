@@ -300,8 +300,10 @@
         "long_only": "the venue marks stocks shortable:false; side SELL only reduces a holding",
         "bracket": "take_profit/stop_loss ride on the entry order and are rejected in extended hours",
         "cash": "size from cash_available_for_trade; cash_balance still includes unsettled proceeds",
-        "market_data": "the published docs list market-data endpoints but not their paths; until they are confirmed, candles for `us` come from the synthetic provider and every row says so"
-      }
+        "market_data": "the published docs list market-data endpoints but not their paths; until they are confirmed, candles for `us` come from the synthetic provider and every row says so",
+        "id_status": "observation, not a guess: 'verified' only after the app stops showing the expired-ID card"
+      },
+      "id_status": "unknown"
     }
   },
   "idx": {

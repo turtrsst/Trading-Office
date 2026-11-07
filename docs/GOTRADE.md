@@ -11,11 +11,15 @@ documentation (`heygotrade.com/api-key/`) plus what the app itself reports about
 | Check | State | What it means |
 | --- | --- | --- |
 | REST API documented | yes | orders, positions, balance, cancel, TP/SL on the entry order |
-| Adapter + tests | done | `trading_office/execution/gotrade.py`, offline stub, 20 tests |
-| **ID document** | **expired** | the app shows "Your ID has expired" — US trading stays restricted until it is replaced |
-| **API access** | **not enabled** | the docs require requesting it from a Gotrade representative; without it every call is `401`, even with a valid token |
+| Adapter + tests | done | `trading_office/execution/gotrade.py`, offline stub, 21 tests |
+| **ID document** | **no longer shown as expired** | the banner disappeared from the home screen; record it with `--id-status verified` once it stays gone |
+| **API access** | **not enabled** | the docs require requesting it from a Gotrade representative; without it every call is `401`, even with a valid token. Not observable from this repo — only a 401 reveals it |
 | API token | not created | Profile → API Key, **1 active token**, valid **1 year**, generating a new one revokes the old |
 | Balance | $112.28 | see the fee arithmetic below before expecting this to trade |
+
+The readiness report treats the ID as an **observation, not an assumption**: `id_status` is
+`unknown` until someone records what the app shows, because a status page that keeps repeating
+a fixed problem is a status page nobody believes.
 
 `trading-office gotrade` prints this list, so the answer is never guesswork.
 
